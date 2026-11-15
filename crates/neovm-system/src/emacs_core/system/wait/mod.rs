@@ -18,6 +18,9 @@ use super::process::{
 };
 use crate::emacs_core::timer::TimerContextExt;
 use neovm_eval::emacs_core::eval::GnuTimerTimestamp;
+use neovm_eval::emacs_core::eval::data::process_state::{
+    process_has_observable_child_status, process_has_readable_process_io,
+};
 use neovm_eval::emacs_core::reader::KeyboardInputRuntime;
 use neovm_value::error::Flow;
 
@@ -1098,6 +1101,66 @@ enum WaitBlock {
     Sleep,
 }
 
+/// How long a wait may block while a live process has a change that no wait
+/// source reports.
+///
+/// GNU blocks for exactly the next timer or the caller's deadline
+/// (`wait_reading_process_output`, src/process.c:5336, its `pselect` at
+/// :5808): a child's status change wakes that `pselect` through SIGCHLD's
+/// self-pipe (`child_signal_notify`, :7616-7650), and every other process
+/// change is a descriptor in the same mask.  This port has no SIGCHLD wake,
+/// so the few changes it cannot see as a descriptor are found by re-running
+/// the wait's status walk this often.
+const PROCESS_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Whether this block must end within [`PROCESS_STATUS_POLL_INTERVAL`] so a
+/// live process's change is not left waiting for the caller's whole timeout.
+///
+/// The block itself reports every listening socket and connection, on unix
+/// every pipe and serial-port descriptor, a finished asynchronous DNS lookup
+/// (its thread notifies the poller), and a cross-thread notification.
+/// It does not report, and so the poll is kept for:
+///
+/// * a running or stopped child: a native exit source exists only on some
+///   platforms (`pidfd` on Linux), and none reports a stop or a continue,
+///   which GNU learns from SIGCHLD;
+/// * a TLS connection: plaintext the session already decrypted makes no
+///   descriptor readable (GNU checks `emacs_gnutls_record_check_pending`
+///   before its `pselect` and clobbers the timeout, src/process.c:5743-5769);
+/// * a pipe reader off unix: `register_child_stdout_with_poller` leaves it
+///   to the wait pass there, as GNU's w32 reader thread is not ported;
+/// * a status the wait has recorded but not yet notified;
+/// * every live process when this block does not watch process sources at
+///   all (no poller, or the host-input channel is the block).
+fn process_change_needs_status_poll(
+    context: &neovm_eval::emacs_core::eval::Context,
+    request: &WaitRequest,
+    timeout: Duration,
+) -> bool {
+    if timeout.is_zero() {
+        return false;
+    }
+    let processes = context.processes();
+    // `wait_block` reads only whether `timeout` is zero, handled above, so
+    // the block chosen here is the one the capped wait will use.
+    let block_watches_processes = matches!(
+        context.wait_block(request, timeout),
+        WaitBlock::Poller(
+            ProcessWaitBackendInterest::NotificationsAndProcesses
+                | ProcessWaitBackendInterest::ProcessesOnly
+        )
+    );
+    if !block_watches_processes {
+        return !processes.live_process_ids().is_empty();
+    }
+    processes.processes.values().any(|process| {
+        process.status_notify_pending
+            || process_has_observable_child_status(process)
+            || (cfg!(not(unix)) && process.live_io.child_stdout.is_some())
+            || (process.live_io.tls_stream.is_some() && process_has_readable_process_io(process))
+    })
+}
+
 /// Stage-4 W5/E13 upper extension trait over the eval-owned type.
 #[doc(hidden)]
 pub trait WaitContextExt {
@@ -1902,8 +1965,8 @@ impl WaitContextExt for neovm_eval::emacs_core::eval::Context {
                 shortened_by_timer = true;
             }
 
-            if !self.processes().live_process_ids().is_empty() {
-                timeout = timeout.min(Duration::from_millis(100));
+            if process_change_needs_status_poll(self, request, timeout) {
+                timeout = timeout.min(PROCESS_STATUS_POLL_INTERVAL);
             }
         }
         if request.services_process_output()

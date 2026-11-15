@@ -16928,6 +16928,169 @@ fn process_only_wait_entry_for_test(
     Ok(entry)
 }
 
+/// Runs one `accept-process-output nil SECS` style wait (timers allowed) and
+/// returns the timeout of its first blocking backend entry, plus the outcome.
+/// `during_block` runs on the waiting thread just before that entry blocks.
+#[cfg(unix)]
+fn first_blocking_wait_timeout(
+    eval: &mut Context,
+    wait: Duration,
+    during_block: impl FnOnce() + Send + 'static,
+) -> (Duration, ProcessOutputWaitOutcome) {
+    let (entry_sender, entry_receiver) = std::sync::mpsc::channel();
+    eval.processes_mut()
+        .before_next_backend_wait_for_test(move |entry| {
+            let _ = entry_sender.send(entry.requested_timeout());
+            during_block();
+        });
+    let outcome = eval
+        .wait_for_process_output(ProcessOutputWaitRequest::new(
+            ProcessOutputWaitTiming::For(wait),
+            None,
+            false,
+            true,
+        ))
+        .expect("process wait");
+    let timeout = entry_receiver
+        .try_recv()
+        .expect("the wait blocked on the backend");
+    (timeout, outcome)
+}
+
+/// GNU's wait blocks for the caller's timeout or the next timer, whichever is
+/// sooner (src/process.c:5336); a listening socket is one more descriptor in
+/// its `pselect` mask, not a reason to wake.  `server-start` makes one in
+/// every daemon, so a 100 ms bound here woke an idle session ten times a
+/// second for as long as it ran.
+#[test]
+#[cfg(unix)]
+fn a_live_listener_leaves_an_idle_wait_its_own_timeout() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::eval_hook_installers::new_context();
+    eval.eval_str(
+        r#"(make-network-process :name "idle-wait-listener" :server t
+                                 :service t :host 'local)"#,
+    )
+    .expect("listening socket");
+    assert!(
+        !eval.processes().live_process_ids().is_empty(),
+        "the listener is a live process"
+    );
+
+    let (timeout, outcome) =
+        first_blocking_wait_timeout(&mut eval, Duration::from_millis(400), || {});
+
+    assert!(
+        timeout > Duration::from_millis(300),
+        "a live listener and no timer must leave the 400ms wait its own \
+         timeout, but the block was bounded to {timeout:?}"
+    );
+    assert_eq!(outcome, ProcessOutputWaitOutcome::NoProcessActivity);
+}
+
+/// The listener must not hide a timer: the block still ends at the timer, and
+/// the timer runs inside the same wait.
+#[test]
+#[cfg(unix)]
+fn a_timer_still_bounds_a_wait_beside_a_live_listener() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::eval_hook_installers::new_context();
+    eval.eval_str(
+        r#"(progn
+             (make-network-process :name "timer-wait-listener" :server t
+                                   :service t :host 'local)
+             (setq neo-idle-timer-ran nil)
+             (fset 'neo-idle-timer-callback
+                   (lambda () (setq neo-idle-timer-ran t)))
+             (fset 'timer-event-handler
+                   (lambda (timer)
+                     (setq timer-list (delq timer timer-list))
+                     (apply (aref timer 5) (aref timer 6)))))"#,
+    )
+    .expect("listener and timer handler");
+    eval.set_variable(
+        "timer-list",
+        Value::list(vec![gnu_timer_after(
+            Duration::from_millis(30),
+            "neo-idle-timer-callback",
+        )]),
+    );
+
+    let (timeout, _outcome) =
+        first_blocking_wait_timeout(&mut eval, Duration::from_millis(400), || {});
+
+    assert!(
+        timeout <= Duration::from_millis(30),
+        "the 30ms timer must bound the block, got {timeout:?}"
+    );
+    assert_eq!(
+        eval.eval_symbol("neo-idle-timer-ran").expect("timer flag"),
+        Value::T,
+        "the timer must run inside the wait"
+    );
+}
+
+/// A child's status still reaches the wait that is running when it changes:
+/// the sentinel of a child that exits during an idle wait runs inside that
+/// wait.  With a nil PROCESS, `accept-process-output` "should not be expected
+/// to return before the timeout expires" (its docstring), so the wait is
+/// kept short.
+#[test]
+#[cfg(unix)]
+fn a_child_exiting_during_an_idle_wait_runs_its_sentinel_in_that_wait() {
+    crate::test_utils::init_test_tracing();
+    let sh = find_bin("sh");
+    let mut eval = crate::emacs_core::eval_hook_installers::new_context();
+    eval.eval_str(
+        r#"(make-network-process :name "child-wait-listener" :server t
+                                 :service t :host 'local)"#,
+    )
+    .expect("listening socket");
+    let child = eval.processes_mut().create_process_lisp(
+        LispString::from_utf8("idle-wait-child"),
+        Value::NIL,
+        LispString::from_utf8(&sh),
+        vec![
+            LispString::from_utf8("-c"),
+            LispString::from_utf8("IFS= read -r release; exit 7"),
+        ],
+        crate::emacs_core::process::ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    eval.processes_mut()
+        .spawn_child(child, false)
+        .expect("spawn child");
+    eval.eval_str(
+        r#"(progn
+             (setq neo-idle-child-event nil)
+             (set-process-sentinel
+              (get-process "idle-wait-child")
+              (lambda (_p event) (setq neo-idle-child-event event))))"#,
+    )
+    .expect("sentinel");
+    let mut child_input = eval
+        .processes()
+        .get(child)
+        .expect("owned child")
+        .live_io
+        .child
+        .stdin()
+        .expect("child gate input")
+        .try_clone()
+        .expect("clone the gate-input descriptor");
+
+    let (_timeout, _outcome) =
+        first_blocking_wait_timeout(&mut eval, Duration::from_millis(500), move || {
+            std::io::Write::write_all(&mut child_input, b"release\n").expect("release child");
+        });
+
+    assert_eq!(
+        eval.eval_symbol("neo-idle-child-event")
+            .expect("sentinel event"),
+        Value::string("exited abnormally with code 7\n"),
+        "the sentinel must run inside the wait the child exited in"
+    );
+}
+
 /// A signal arriving on another thread must wake a real idle evaluator poll,
 /// not wait out its timeout. This exercises the registered self-pipe; EINTR
 /// alone is swallowed by polling. USR1 uses the same wake as TERM/HUP without
