@@ -253,6 +253,21 @@ impl ChildCommand {
         command.spawn().map(SpawnedChild::from_std)
     }
 
+    /// Spawn the child on the pseudoterminal whose slave is at `slave`: in
+    /// its own session with the slave as controlling terminal, stdin and
+    /// stdout, and as stderr unless [`Self::stderr`] named another
+    /// descriptor (GNU `emacs_spawn` with `pty_name`, src/callproc.c).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn spawn_on_pty(&mut self, slave: &Path) -> io::Result<SpawnedChild> {
+        debug_assert!(
+            self.stdin.is_none() && self.stdout.is_none(),
+            "a pty child's stdin and stdout are the slave"
+        );
+        let stderr = self.stderr.take().unwrap_or(ChildStdio::Inherit);
+        super::retain_child_exit_status()?;
+        posix::spawn_on_pty(self, slave, stderr)
+    }
+
     /// The same child as a `std::process::Command` that will `fork`, with
     /// the session isolation already installed.  For children that need
     /// post-fork setup `posix_spawn` cannot express (a pty as controlling
@@ -770,7 +785,20 @@ mod posix {
         stdout: ChildStdio,
         stderr: ChildStdio,
     ) -> io::Result<SpawnedChild> {
-        engine::spawn(command, stdin, stdout, stderr)
+        engine::spawn(
+            command,
+            engine::StdinStdout::Separate(stdin, stdout),
+            stderr,
+        )
+    }
+
+    pub(super) fn spawn_on_pty(
+        command: &ChildCommand,
+        slave: &Path,
+        stderr: ChildStdio,
+    ) -> io::Result<SpawnedChild> {
+        let slave = engine::StdinStdout::pty_slave(slave)?;
+        engine::spawn(command, slave, stderr)
     }
 
     mod engine {
@@ -792,6 +820,22 @@ mod posix {
             Inherit,
             Null,
             Dup(RawFd),
+        }
+
+        /// Where the child's stdin and stdout come from.
+        pub(super) enum StdinStdout {
+            /// Each as given.
+            Separate(ChildStdio, ChildStdio),
+            /// The pseudoterminal slave with this name, opened by the child
+            /// in its new session so that it becomes the controlling
+            /// terminal.  An inherited stderr is the slave too.
+            PtySlave(CString),
+        }
+
+        impl StdinStdout {
+            pub(super) fn pty_slave(slave: &Path) -> io::Result<Self> {
+                c_string(slave.as_os_str(), "pty slave name").map(Self::PtySlave)
+            }
         }
 
         fn slot(stdio: ChildStdio, child_reads: bool) -> io::Result<Slot> {
@@ -825,6 +869,31 @@ mod posix {
                     }
                 }
             })
+        }
+
+        impl Slot {
+            /// Move a dup source the editor holds as 0, 1 or 2 (it runs with
+            /// that standard descriptor closed) above 2, so that the file
+            /// actions that set up the child's 0 and 1 do not overwrite it.
+            fn move_above_stdio(&mut self) -> io::Result<()> {
+                let SlotAction::Dup(source) = self.action else {
+                    return Ok(());
+                };
+                if source > libc::STDERR_FILENO {
+                    return Ok(());
+                }
+                // SAFETY: plain FFI on a descriptor this slot owns.
+                let moved =
+                    unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
+                if moved < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: `fcntl` just returned `moved`, owned by nothing else;
+                // the old source is closed when its owner is replaced.
+                self._child_end = Some(unsafe { OwnedFd::from_raw_fd(moved) });
+                self.action = SlotAction::Dup(moved);
+                Ok(())
+            }
         }
 
         #[cfg(target_os = "linux")]
@@ -909,6 +978,25 @@ mod posix {
                 }
             }
 
+            fn open(
+                &mut self,
+                target: RawFd,
+                path: &CString,
+                flags: libc::c_int,
+            ) -> io::Result<()> {
+                // SAFETY: `path` is a valid NUL-terminated C string that
+                // outlives the spawn.
+                check(unsafe {
+                    libc::posix_spawn_file_actions_addopen(
+                        &mut self.0,
+                        target,
+                        path.as_ptr(),
+                        flags,
+                        0,
+                    )
+                })
+            }
+
             fn chdir(&mut self, dir: &CString) -> io::Result<()> {
                 // SAFETY: `dir` is a valid NUL-terminated C string that outlives
                 // the spawn.
@@ -927,15 +1015,35 @@ mod posix {
             }
         }
 
+        /// GNU `emacs_posix_spawn_init_attributes`'s default dispositions:
+        /// the signals the editor ignores.
+        const GNU_DEFAULT_SIGNALS: &[libc::c_int] =
+            &[libc::SIGINT, libc::SIGQUIT, libc::SIGPIPE, libc::SIGPROF];
+
+        /// A pty child whose stderr is the slave too: GNU's, plus SIGCHLD,
+        /// SIGHUP, SIGTERM and SIGALRM, which `portable_pty`'s spawn (this
+        /// child's path off glibc Linux) also resets.  A pty child with a
+        /// separate stderr keeps [`GNU_DEFAULT_SIGNALS`], as GNU's `vfork`
+        /// child does; it never went through `portable_pty`.
+        const PTY_DEFAULT_SIGNALS: &[libc::c_int] = &[
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGPIPE,
+            libc::SIGPROF,
+            libc::SIGCHLD,
+            libc::SIGHUP,
+            libc::SIGTERM,
+            libc::SIGALRM,
+        ];
+
         /// Owner of a `posix_spawnattr_t` carrying GNU's attribute set.
         struct Attributes(libc::posix_spawnattr_t);
 
         impl Attributes {
             /// GNU `emacs_posix_spawn_init_attributes`: own session, default
-            /// dispositions for the signals the editor ignores (SIGINT, SIGQUIT,
-            /// SIGPIPE, SIGPROF, and SIGCHLD on macOS), and an empty signal
-            /// mask in the child.
-            fn gnu() -> io::Result<Self> {
+            /// dispositions for `default_signals` (plus SIGCHLD on macOS), and
+            /// an empty signal mask in the child.
+            fn gnu(default_signals: &[libc::c_int]) -> io::Result<Self> {
                 let mut attributes = std::mem::MaybeUninit::<libc::posix_spawnattr_t>::uninit();
                 // SAFETY: `init` fully initializes the out-pointer on success.
                 check(unsafe { libc::posix_spawnattr_init(attributes.as_mut_ptr()) })?;
@@ -955,7 +1063,7 @@ mod posix {
                 // through valid pointers; both sets are then fully initialized.
                 unsafe {
                     libc::sigemptyset(defaults.as_mut_ptr());
-                    for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGPIPE, libc::SIGPROF] {
+                    for &signal in default_signals {
                         libc::sigaddset(defaults.as_mut_ptr(), signal);
                     }
                     // GNU's `DARWIN_OS` workaround: macOS was seen delivering
@@ -1037,8 +1145,7 @@ mod posix {
 
         pub(super) fn spawn(
             command: &ChildCommand,
-            stdin: ChildStdio,
-            stdout: ChildStdio,
+            stdin_stdout: StdinStdout,
             stderr: ChildStdio,
         ) -> io::Result<SpawnedChild> {
             // The child's variables: the exact list itself when nothing was
@@ -1099,18 +1206,43 @@ mod posix {
                 .map(|dir| c_string(dir.as_os_str(), "working directory"))
                 .transpose()?;
 
-            let mut stdin = slot(stdin, true)?;
-            let mut stdout = slot(stdout, false)?;
             let mut stderr = slot(stderr, false)?;
-
             let mut actions = FileActions::new()?;
-            actions.apply(libc::STDIN_FILENO, &stdin.action)?;
-            actions.apply(libc::STDOUT_FILENO, &stdout.action)?;
-            actions.apply(libc::STDERR_FILENO, &stderr.action)?;
+            // `_slave` keeps a pty slave name alive until `posix_spawn` has
+            // run its file actions.
+            let (mut stdin, mut stdout, attributes, _slave) = match stdin_stdout {
+                StdinStdout::Separate(stdin, stdout) => {
+                    let stdin = slot(stdin, true)?;
+                    let stdout = slot(stdout, false)?;
+                    actions.apply(libc::STDIN_FILENO, &stdin.action)?;
+                    actions.apply(libc::STDOUT_FILENO, &stdout.action)?;
+                    actions.apply(libc::STDERR_FILENO, &stderr.action)?;
+                    (stdin, stdout, Attributes::gnu(GNU_DEFAULT_SIGNALS)?, None)
+                }
+                StdinStdout::PtySlave(slave) => {
+                    // No `O_NOCTTY`: the child has just become a session
+                    // leader, so this open makes the slave its controlling
+                    // terminal.  glibc runs the file actions after `setsid`.
+                    stderr.move_above_stdio()?;
+                    actions.open(libc::STDIN_FILENO, &slave, libc::O_RDWR)?;
+                    let tty = SlotAction::Dup(libc::STDIN_FILENO);
+                    actions.apply(libc::STDOUT_FILENO, &tty)?;
+                    let (stderr_action, default_signals) = match &stderr.action {
+                        SlotAction::Inherit => (&tty, PTY_DEFAULT_SIGNALS),
+                        other => (other, GNU_DEFAULT_SIGNALS),
+                    };
+                    actions.apply(libc::STDERR_FILENO, stderr_action)?;
+                    (
+                        slot(ChildStdio::Inherit, true)?,
+                        slot(ChildStdio::Inherit, false)?,
+                        Attributes::gnu(default_signals)?,
+                        Some(slave),
+                    )
+                }
+            };
             if let Some(cwd) = &cwd {
                 actions.chdir(cwd)?;
             }
-            let attributes = Attributes::gnu()?;
 
             let mut argv_ptrs: Vec<*mut libc::c_char> =
                 argv.iter().map(|arg| arg.as_ptr().cast_mut()).collect();
