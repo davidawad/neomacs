@@ -413,3 +413,133 @@ fn secondary_tty_restores_modes_even_when_leaving_screen_fails() {
     drop(device);
     pty.assert_modes(&original);
 }
+
+/// Opens a secondary session on a fresh PTY sized `columns` x `rows`; the
+/// returned slave keeps the PTY state alive (macOS resets it on last close).
+#[cfg(unix)]
+fn open_sized_secondary_tty(
+    context: &mut neovm_core::emacs_core::Context,
+    columns: u16,
+    rows: u16,
+) -> (super::SecondaryTtySession, std::fs::File, std::fs::File) {
+    use neovm_core::emacs_core::eval::QuitRequest;
+    use std::fs::{File, OpenOptions};
+
+    let master = File::from(
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .expect("posix_openpt failed"),
+    );
+    rustix::pty::grantpt(&master).expect("grantpt failed");
+    rustix::pty::unlockpt(&master).expect("unlockpt failed");
+    let slave_name = rustix::pty::ptsname(&master, Vec::new())
+        .expect("ptsname_r failed")
+        .to_string_lossy()
+        .into_owned();
+    let slave = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_name)
+        .expect("open slave");
+    set_winsize(&slave, columns, rows);
+    let request = neovm_core::emacs_core::terminal::pure::TtyFrameOpenRequest::new(
+        7,
+        neovm_core::window::FrameId(123),
+        slave_name,
+        "xterm-256color".to_string(),
+    )
+    .expect("valid request");
+    let input = neovm_core::host_input::HostInputPublisher::install(context);
+    let (session, _, _) = super::SecondaryTtySession::open(&request, input, QuitRequest::new())
+        .expect("open secondary TTY");
+    (session, master, slave)
+}
+
+#[cfg(unix)]
+fn set_winsize(slave: &std::fs::File, columns: u16, rows: u16) {
+    rustix::termios::tcsetwinsize(
+        slave,
+        rustix::termios::Winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .expect("set PTY size");
+}
+
+/// A client's resize reaches the daemon as SIGWINCH (the client forwards its
+/// own, as GNU's emacsclient does), and the reader publishes the new size.
+#[cfg(unix)]
+#[test]
+fn secondary_tty_reader_publishes_the_size_a_sigwinch_reports() {
+    use std::time::Duration;
+
+    let mut context = neovm_core::emacs_core::eval_hook_installers::new_context();
+    let (session, _master, slave) = open_sized_secondary_tty(&mut context, 119, 37);
+
+    set_winsize(&slave, 100, 30);
+    // SAFETY: raise only queues a signal for this thread; signal-hook's
+    // handler, installed by the session, is async-signal-safe.
+    assert_eq!(unsafe { libc::raise(libc::SIGWINCH) }, 0);
+    let event = context
+        .receive_host_input_for_test(Duration::from_secs(2))
+        .expect("resize event");
+    assert!(
+        matches!(
+            event,
+            neovm_core::keyboard::InputEvent::Resize {
+                width: 100,
+                height: 30,
+                emacs_frame_id: 123,
+                ..
+            }
+        ),
+        "unexpected event {event:?}"
+    );
+    drop(session);
+}
+
+/// An idle client terminal costs the daemon no wakeups: its reader blocks on
+/// the terminal and its wake socket, so nothing runs until input, a resize or
+/// a stop arrives.  Before, the reader woke 20 times a second to re-read the
+/// window size and check its stop flag.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_idle_secondary_tty_reader_does_not_wake() {
+    use std::time::Duration;
+
+    fn reader_context_switches() -> u64 {
+        for task in std::fs::read_dir("/proc/self/task").expect("task list") {
+            let task = task.expect("task entry").path();
+            let Ok(comm) = std::fs::read_to_string(task.join("comm")) else {
+                continue;
+            };
+            if comm.trim_end() != "tty-input-123" {
+                continue;
+            }
+            let status = std::fs::read_to_string(task.join("status")).expect("task status");
+            return status
+                .lines()
+                .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                .and_then(|count| count.trim().parse().ok())
+                .expect("voluntary_ctxt_switches");
+        }
+        panic!("no tty-input-123 reader thread");
+    }
+
+    let mut context = neovm_core::emacs_core::eval_hook_installers::new_context();
+    let (session, _master, _slave) = open_sized_secondary_tty(&mut context, 80, 24);
+    // Let the reader reach its blocking poll.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let before = reader_context_switches();
+    std::thread::sleep(Duration::from_secs(1));
+    let woke = reader_context_switches() - before;
+
+    assert!(
+        woke <= 2,
+        "an idle reader blocked {woke} times in one second; it must sleep until it has work"
+    );
+    drop(session);
+}

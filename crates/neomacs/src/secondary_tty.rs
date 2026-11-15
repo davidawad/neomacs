@@ -293,7 +293,67 @@ struct SecondaryTtySession {
     #[cfg(unix)]
     paused: Arc<AtomicBool>,
     #[cfg(unix)]
+    wake: ReaderWake,
+    #[cfg(unix)]
     reader: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The write end of one input reader's wake socket.
+///
+/// The reader blocks in `poll` on its terminal and the read end with no
+/// timeout, so everything else it must notice arrives as a byte here: a stop
+/// or a pause change from this session, and SIGWINCH, which signal-hook
+/// writes from the handler.  GNU takes window-size changes from SIGWINCH
+/// (`handle_window_change_signal`, src/dispnew.c:6611-6650), re-reading every
+/// tty's size because it cannot tell which one changed; `emacsclient`
+/// forwards its own SIGWINCH to the server (lib-src/emacsclient.c:1437-1441).
+///
+/// This is not an `os_signal` disposition: those are drained on the Lisp
+/// thread at `maybe_quit`, while the size this wake asks for is read by the
+/// reader thread itself, which the Lisp thread never has to see.
+#[cfg(unix)]
+struct ReaderWake {
+    socket: std::os::unix::net::UnixStream,
+    resize_signal: signal_hook::SigId,
+}
+
+#[cfg(unix)]
+impl ReaderWake {
+    /// The wake writer and the read end the reader thread polls.
+    fn open() -> Result<(Self, std::os::unix::net::UnixStream), String> {
+        let (socket, reader_end) = std::os::unix::net::UnixStream::pair()
+            .map_err(|error| format!("cannot create TTY input wake socket: {error}"))?;
+        for end in [&socket, &reader_end] {
+            end.set_nonblocking(true)
+                .map_err(|error| format!("cannot configure TTY input wake socket: {error}"))?;
+        }
+        let signal_end = socket
+            .try_clone()
+            .map_err(|error| format!("cannot create TTY input wake socket: {error}"))?;
+        let resize_signal =
+            signal_hook::low_level::pipe::register(signal_hook::consts::SIGWINCH, signal_end)
+                .map_err(|error| format!("cannot watch terminal size changes: {error}"))?;
+        Ok((
+            Self {
+                socket,
+                resize_signal,
+            },
+            reader_end,
+        ))
+    }
+
+    fn wake(&self) {
+        use std::io::Write as _;
+        // A full socket already holds a wake the reader has not consumed.
+        let _ = (&self.socket).write(&[0]);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReaderWake {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.resize_signal);
+    }
 }
 
 /// One opened terminal and the mode snapshot required to put it back exactly
@@ -451,6 +511,7 @@ impl SecondaryTtySession {
             .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
             .open(request.device())
             .map_err(|error| format!("cannot open input for {}: {error}", request.device()))?;
+        let (wake, reader_wake) = ReaderWake::open()?;
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let reader_stop = Arc::clone(&stop);
@@ -461,6 +522,7 @@ impl SecondaryTtySession {
             .spawn(move || {
                 read_secondary_tty(
                     input,
+                    reader_wake,
                     target,
                     size,
                     input_tx,
@@ -477,6 +539,7 @@ impl SecondaryTtySession {
                 rif,
                 stop,
                 paused,
+                wake,
                 reader: Some(reader),
             },
             size,
@@ -486,6 +549,7 @@ impl SecondaryTtySession {
 
     fn suspend(&mut self) -> Result<(), String> {
         self.paused.store(true, Ordering::Release);
+        self.wake.wake();
         self.device.suspend()
     }
 
@@ -496,6 +560,7 @@ impl SecondaryTtySession {
         self.device.resume()?;
         self.rif.force_redraw();
         self.paused.store(false, Ordering::Release);
+        self.wake.wake();
         Ok(())
     }
 
@@ -516,6 +581,7 @@ impl SecondaryTtySession {
 impl Drop for SecondaryTtySession {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.wake();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -585,6 +651,7 @@ impl From<&TtyFrameOpenRequest> for SecondaryTtyInputTarget {
 #[cfg(unix)]
 fn read_secondary_tty(
     input: std::fs::File,
+    wake: std::os::unix::net::UnixStream,
     target: SecondaryTtyInputTarget,
     initial_size: TtyFrameSize,
     input_tx: HostInputPublisher,
@@ -593,7 +660,6 @@ fn read_secondary_tty(
     paused: Arc<AtomicBool>,
 ) {
     use std::os::fd::AsRawFd;
-    use std::time::Duration;
 
     let fd = input.as_raw_fd();
     let mut last_size = initial_size;
@@ -615,29 +681,41 @@ fn read_secondary_tty(
         ) != super::input_bridge::HostInputDelivery::ReceiverClosed
     };
     while !stop.load(Ordering::Acquire) {
-        if paused.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-        if !publish_resize(&mut last_size) {
+        let paused_now = paused.load(Ordering::Acquire);
+        if !paused_now && !publish_resize(&mut last_size) {
             return;
         }
 
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: input owns fd for this loop, and pollfd is one initialized
-        // record whose address remains valid for the blocking call.
-        let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
+        // While paused only the wake socket is watched: `poll` ignores a
+        // negative descriptor.
+        let mut pollfds = [
+            libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if paused_now { -1 } else { fd },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: input and wake own their fds for this loop, and pollfds is
+        // an initialized array whose address and length stay valid for the
+        // blocking call.
+        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
         if result < 0 {
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                 return;
             }
             continue;
         }
-        if result == 0 || pollfd.revents & libc::POLLIN == 0 {
+        if pollfds[0].revents != 0 {
+            drain_wake(&wake);
+            continue;
+        }
+        let pollfd = pollfds[1];
+        if pollfd.revents & libc::POLLIN == 0 {
             if pollfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
                 let _ = publish_input(
                     &input_tx,
@@ -698,6 +776,14 @@ fn read_secondary_tty(
             return;
         }
     }
+}
+
+/// Consume every pending wake byte; the reader re-checks its state once.
+#[cfg(unix)]
+fn drain_wake(mut wake: &std::os::unix::net::UnixStream) {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 64];
+    while matches!(wake.read(&mut bytes), Ok(read) if read > 0) {}
 }
 
 #[cfg(unix)]
