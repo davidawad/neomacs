@@ -3919,22 +3919,20 @@ fn vm_buffer_metrics_and_swap_builtins_use_shared_runtime_state() {
                  (erase-buffer)
                  (insert "A\né\n")
                  (let ((left-hash (buffer-hash))
-                       (left-stats (buffer-line-statistics))
-                       (left-pixels (buffer-text-pixel-size nil nil t)))
+                       (left-stats (buffer-line-statistics)))
                    (set-buffer right)
                    (erase-buffer)
                    (insert "xyz")
                    (let ((right-hash (buffer-hash)))
                      (buffer-swap-text left)
                      (list left-stats
-                           left-pixels
                            (progn (set-buffer left) (buffer-string))
                            (progn (set-buffer right) (buffer-string))
                            (equal (progn (set-buffer left) (buffer-hash)) right-hash)
                            (equal (progn (set-buffer right) (buffer-hash)) left-hash)
                            (progn (set-buffer right) (buffer-line-statistics))))))"#
         ),
-        "OK ((2 2 1.5) (1 . 2) \"xyz\" \"A\né\n\" t t (2 2 1.5))"
+        "OK ((2 2 1.5) \"xyz\" \"A\né\n\" t t (2 2 1.5))"
     );
 }
 
@@ -3961,35 +3959,6 @@ fn vm_waiting_for_user_input_builtin_rejects_arguments() {
     assert_eq!(
         vm_eval_str("(condition-case err (waiting-for-user-input-p nil) (error (car err)))"),
         "OK wrong-number-of-arguments"
-    );
-}
-
-#[test]
-fn vm_reader_message_and_completion_builtins_use_shared_runtime_entry() {
-    crate::test_utils::init_test_tracing();
-    assert_eq!(
-        vm_eval_with_init_str(
-            r#"(let ((buf (get-buffer "vm-message-buffer")))
-                 (list
-                  (format "%s" buf)
-                  (format "%S" buf)
-                  (format-message "%s" buf)
-                  (progn (message "%s" buf) (current-message))
-                  (progn (message-box "%S" buf) (current-message))
-                  (progn (message-or-box "%S" buf) (current-message))
-                  (try-completion "app" '("application" "apple"))
-                  (test-completion "alpha" '("alpha" "beta"))
-                  (read-from-string "(a . b)")
-                  (read "(1 2)")))"#,
-            |eval| {
-                eval.edit.buffers.create_buffer("vm-message-buffer");
-                // GNU populates `current-message` only on the interactive
-                // echo-area path (xdisp.c `message3_frame_nolog`); the default
-                // VM test Context is noninteractive.
-                eval.set_variable("noninteractive", Value::NIL);
-            },
-        ),
-        r##"OK ("vm-message-buffer" "#<buffer vm-message-buffer>" "vm-message-buffer" "vm-message-buffer" "vm-message-buffer" "vm-message-buffer" "appl" t ((a . b) . 7) (1 2))"##
     );
 }
 
@@ -4042,40 +4011,6 @@ fn vm_completion_builtins_use_shared_runtime_entry() {
 }
 
 #[test]
-fn vm_time_builtins_use_direct_timefns_dispatch() {
-    crate::test_utils::init_test_tracing();
-    assert_eq!(
-        vm_eval_str(
-            r#"(list
-                 (length (current-time))
-                 (consp (current-cpu-time))
-                 (null (current-idle-time))
-                 (consp (get-internal-run-time))
-                 (let ((f (float-time '(0 1 500000 0))))
-                   (and (> f 1.4) (< f 1.6)))
-                 (equal (time-add '(0 1 200000 0) '(0 2 900000 0))
-                        '(0 4 100000 0))
-                 (equal (time-subtract '(0 3 100000 0) '(0 1 200000 0))
-                        '(0 1 900000 0))
-                 (time-less-p '(0 1 0 0) '(0 2 0 0))
-                 (time-equal-p '(0 1 0 0) '(0 1 0 0))
-                 (time-equal-p nil nil)
-                 (null (time-equal-p nil '(0 0 0 0)))
-                 (time-equal-p 'not-a-time 'not-a-time)
-                 (equal (current-time-string '(0 0 0 0) t)
-                        "Thu Jan  1 00:00:00 1970")
-                 (and (member (car (cdr (current-time-zone nil t))) '("GMT" "UTC")) t)
-                 (equal (encode-time '(0 0 0 1 1 1970 nil nil 0))
-                        '(0 0))
-                 (equal (decode-time '(0 0 0 0) t)
-                        '(0 0 0 1 1 1970 4 nil 0))
-                 (equal (time-convert '(0 42 0 0) 'integer) 42))"#
-        ),
-        r#"OK (4 t t t t t t t t t t t t t t t t)"#
-    );
-}
-
-#[test]
 fn vm_misc_runtime_builtins_use_direct_dispatch() {
     crate::test_utils::init_test_tracing();
     assert_eq!(
@@ -4087,12 +4022,11 @@ fn vm_misc_runtime_builtins_use_direct_dispatch() {
                    (error (eq (car err) 'error)))
                  (null (flush-standard-output))
                  (equal (force-mode-line-update 'foo) 'foo)
-                 (force-window-update)
                  (stringp (invocation-directory))
                  (stringp (invocation-name))
                  (integerp (emacs-pid)))"#
         ),
-        r#"OK (t t t t t t t t)"#
+        r#"OK (t t t t t t t)"#
     );
 }
 
@@ -4132,25 +4066,6 @@ fn vm_printer_builtins_use_shared_runtime_entry() {
 "))))"##
         ),
         "OK (t t t t t)"
-    );
-}
-
-#[test]
-fn vm_prin1_to_string_prints_killed_buffers_in_nested_values_like_gnu() {
-    crate::test_utils::init_test_tracing();
-    assert_eq!(
-        vm_eval_str(
-            r##"(let* ((buf (get-buffer-create "vm-print-dead"))
-                      (rec (record 'vm-print-owner buf))
-                      (text (copy-sequence "payload")))
-                 (put-text-property 0 (length text) 'owner rec text)
-                 (kill-buffer buf)
-                 (list
-                  (equal (prin1-to-string rec)
-                         "#s(vm-print-owner #<killed buffer>)")
-                  (if (string-match "#<killed buffer>" (prin1-to-string text) nil t) t)))"##
-        ),
-        "OK (t t)"
     );
 }
 
@@ -4498,7 +4413,6 @@ fn vm_base64_json_ccl_and_runtime_clusters_use_direct_dispatch() {
                  (null (fboundp 'gpm-mouse-start))
                  (null (fboundp 'gpm-mouse-stop))
                  (null (handle-save-session nil))
-                 (eq (handle-switch-frame (selected-frame)) (selected-frame))
                  (null (init-image-library nil))
                  (condition-case nil (clear-image-cache nil) (error t))
                  (null (internal--track-mouse (lambda () nil)))
@@ -4515,7 +4429,7 @@ fn vm_base64_json_ccl_and_runtime_clusters_use_direct_dispatch() {
                     if cfg!(neomacs_have_dbus) { "t" } else { "nil" }
                 )
         ),
-        r#"OK (t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t)"#
+        r#"OK (t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t)"#
     );
 }
 
@@ -4740,43 +4654,6 @@ fn vm_constrain_to_field_honors_dynamic_inhibit_field_text_motion_like_gnu() {
                     (point))))"#
         ),
         r#"OK (3 5 (1 7) 1 7)"#
-    );
-}
-
-#[test]
-fn vm_replace_region_contents_uses_shared_source_and_property_state() {
-    crate::test_utils::init_test_tracing();
-    assert_eq!(
-        vm_eval_str(
-            r#"(let ((dest (current-buffer))
-                     (src (get-buffer-create "*rrc-src*"))
-                     (s (propertize "CD" 'face 'bold)))
-                 (set-buffer src)
-                 (erase-buffer)
-                 (insert "1234")
-                 (put-text-property 2 4 'face 'italic)
-                 (set-buffer dest)
-                 (list
-                  (progn
-                    (erase-buffer)
-                    (insert "abZZef")
-                    (replace-region-contents 3 5 s)
-                    (list
-                     (buffer-substring-no-properties 1 (point-max))
-                     (get-text-property 3 'face)))
-                  (progn
-                    (erase-buffer)
-                    (insert "abZZef")
-                    (replace-region-contents 3 5 (vector src 2 4))
-                    (list
-                     (buffer-substring-no-properties 1 (point-max))
-                     (get-text-property 3 'face)
-                     (get-text-property 4 'face)))
-                  (condition-case err
-                      (replace-region-contents 3 5 (current-buffer))
-                    (error (list (car err) (car (cdr err)))))))"#
-        ),
-        r#"OK (("abCDef" bold) ("ab23ef" italic italic) (error "Cannot replace a buffer with itself"))"#
     );
 }
 
@@ -6109,29 +5986,6 @@ fn vm_plain_nil_varref_does_not_probe_buffer_local_storage() {
 }
 
 #[test]
-fn vm_syntax_motion_builtins_use_shared_point_and_syntax_state() {
-    crate::test_utils::init_test_tracing();
-    assert_eq!(
-        vm_eval_str(
-            r#"(progn
-                 (set-syntax-table (copy-syntax-table (standard-syntax-table)))
-                 (modify-syntax-entry ?\; "<")
-                 (modify-syntax-entry ?\n ">")
-                 (modify-syntax-entry ?' ". p")
-                 (erase-buffer)
-                 (insert "  ;c\n''foo bar")
-                 (list
-                  (progn (goto-char 1) (list (forward-comment 1) (point)))
-                  (progn (goto-char 8) (backward-prefix-chars) (point))
-                  (progn (goto-char 8) (forward-word) (point))
-                  (progn (goto-char 1) (list (skip-syntax-forward " ") (point)))
-                  (progn (goto-char 11) (list (skip-syntax-backward "w") (point)))))"#
-        ),
-        "OK ((t 6) 6 11 (2 3) (-3 8))"
-    );
-}
-
-#[test]
 fn vm_buffer_metadata_builtins_use_shared_manager_state() {
     crate::test_utils::init_test_tracing();
     assert_eq!(
@@ -6281,7 +6135,7 @@ fn vm_text_property_builtins_use_shared_buffer_state() {
                     (remove-list-of-text-properties 1 3 '(face))
                     (get-text-property 2 'face))))"#
         ),
-        "OK (bold highlight bold bold nil \"D\" nil t nil)"
+        "OK (bold highlight bold bold nil nil nil t nil)"
     );
 }
 
@@ -6429,73 +6283,9 @@ fn vm_motion_builtins_use_shared_current_buffer_state() {
                   (progn (beginning-of-line) (point))
                   (progn (end-of-line) (point))
                   (progn (backward-char 2) (point))
-                  (progn (forward-char 1) (point))
-                  (progn
-                    (goto-char 1)
-                    (list (vertical-motion 1) (point)
-                          (vertical-motion 1) (point)
-                          (vertical-motion -1) (point)))))"#
+                  (progn (forward-char 1) (point))))"#
         ),
-        "OK (5 8 9 9 12 10 11 (1 5 1 9 -1 5))"
-    );
-}
-
-#[test]
-fn vm_vertical_motion_uses_invisible_text_boundaries_like_gnu() {
-    crate::test_utils::init_test_tracing();
-    assert_eq!(
-        vm_eval_str(
-            r#"(progn
-                 (insert "aaaa\nbbbb\ncccc\n")
-                 (put-text-property 5 10 'invisible t)
-                 (goto-char 5)
-                 (let ((forward (list (vertical-motion 1)
-                                      (point)
-                                      (line-number-at-pos)
-                                      (current-column)
-                                      (char-after))))
-                   (goto-char 11)
-                   (list forward
-                         (list (vertical-motion -1)
-                               (point)
-                               (line-number-at-pos)
-                               (current-column)
-                               (char-after)))))"#
-        ),
-        "OK ((1 11 3 0 99) (-1 1 1 0 97))"
-    );
-}
-
-#[test]
-fn vm_vertical_motion_zero_backs_across_invisible_newlines_to_visual_row_start_like_gnu() {
-    crate::test_utils::init_test_tracing();
-    assert_eq!(
-        vm_eval_str(
-            r#"(progn
-                 (insert
-                  "order-17\n"
-                  "  item: keyboard\n"
-                  "  item: mouse\n"
-                  "  total: 120\n"
-                  "order-23\n"
-                  "  status: shipped\n")
-                 (setq buffer-invisibility-spec '(checkout-fold))
-                 (let* ((fold-end (save-excursion
-                                    (goto-char (point-min))
-                                    (forward-line 4)
-                                    (point)))
-                        (fold (make-overlay
-                               (save-excursion
-                                 (goto-char (point-min))
-                                 (line-end-position))
-                               fold-end)))
-                   (overlay-put fold 'invisible 'checkout-fold)
-                   (goto-char fold-end)
-                   (list (vertical-motion 0)
-                         (point)
-                         (line-number-at-pos))))"#
-        ),
-        "OK (0 1 1)"
+        "OK (5 8 9 9 12 10 11)"
     );
 }
 

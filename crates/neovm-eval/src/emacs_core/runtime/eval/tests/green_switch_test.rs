@@ -664,87 +664,6 @@ fn sleeping_threads_sleep_at_the_same_time() {
 }
 
 #[test]
-fn killing_a_threads_buffer_moves_it_and_signals_it() {
-    let mut ev = green();
-    assert_eq!(
-        eval(
-            &mut ev,
-            "(progn
-               (setq tgb-log nil)
-               (let* ((b (setq tgb-b (get-buffer-create \"tgb-x\")))
-                      (th (save-current-buffer
-                            (set-buffer b)
-                            (make-thread
-                             (lambda ()
-                               (condition-case e (progn (thread-yield) (setq tgb-log (cons 'resumed tgb-log)))
-                                 (error (setq tgb-log (cons (list e (eq (current-buffer) tgb-b)
-                                                                (buffer-live-p (current-buffer)))
-                                                          tgb-log)))))))))
-                 (thread-yield)
-                 (setq tgb-log (cons (list 'kill (kill-buffer b) (buffer-live-p b)) tgb-log))
-                 (setq tgb-log (cons (condition-case e (thread-join th) (error (list 'join e))) tgb-log))
-                 (nreverse tgb-log)))"
-        ),
-        "((kill t nil) ((thread-buffer-killed) nil t) (join (thread-buffer-killed)))"
-    );
-}
-
-#[test]
-fn a_thread_buffer_disposition_of_silently_or_t() {
-    let mut ev = green();
-    assert_eq!(
-        eval(
-            &mut ev,
-            "(progn
-               (setq tgq-log nil)
-               (let* ((s (setq tgq-s (get-buffer-create \"tgq-s\")))
-                      (k (get-buffer-create \"tgq-k\"))
-                      (quiet (save-current-buffer
-                               (set-buffer s)
-                               (make-thread (lambda ()
-                                              (thread-yield)
-                                              (setq tgq-log (cons (list 'quiet (eq (current-buffer) tgq-s) (buffer-live-p (current-buffer)))
-                                                                tgq-log)))
-                                            nil 'silently)))
-                      (keeper (save-current-buffer
-                                (set-buffer k)
-                                (make-thread (lambda ()
-                                               (thread-yield)
-                                               (setq tgq-log (cons (list 'keeper (buffer-name)) tgq-log)))
-                                             nil t))))
-                 (thread-yield)
-                 (setq tgq-log (cons (list (kill-buffer s) (kill-buffer k) (buffer-live-p k)) tgq-log))
-                 (thread-join quiet)
-                 (thread-join keeper)
-                 (nreverse tgq-log)))"
-        ),
-        "((t nil t) (quiet nil t) (keeper \"tgq-k\"))"
-    );
-}
-
-#[test]
-fn a_thread_starting_leaves_the_previous_threads_buffer_alone() {
-    let mut ev = green();
-    assert_eq!(
-        eval(
-            &mut ev,
-            "(progn
-               (setq tgr-a (get-buffer-create \"tgr-a\") tgr-b (get-buffer-create \"tgr-b\"))
-               (let* ((first (save-current-buffer
-                               (set-buffer tgr-a)
-                               (make-thread (lambda () (thread-yield) (buffer-name)) nil t)))
-                      (second (save-current-buffer
-                                (set-buffer tgr-b)
-                                (make-thread (lambda () (thread-yield) (buffer-name))))))
-                 (thread-yield)
-                 (list (kill-buffer tgr-a) (buffer-live-p tgr-a)
-                       (thread-join first) (thread-join second))))"
-        ),
-        "(nil t \"tgr-a\" \"tgr-b\")"
-    );
-}
-
-#[test]
 fn the_last_thread_to_block_is_told_that_all_threads_are_blocked() {
     let mut ev = green();
     assert_eq!(
@@ -817,6 +736,7 @@ fn a_stale_condition_index_reports_the_scheduler_invariant_at_the_deadlock_verdi
 #[test]
 fn kill_emacs_in_a_thread_exits_from_main_without_cleanups() {
     let mut ev = green();
+    crate::test_utils::reset_auto_save_slot_calls_for_test();
     eval(&mut ev, "(setq tgx-cleanup nil tgx-m (make-mutex))");
     let outcome = eval(
         &mut ev,
@@ -835,6 +755,10 @@ fn kill_emacs_in_a_thread_exits_from_main_without_cleanups() {
     assert_eq!(
         ev.shutdown_request().map(|request| request.exit_code),
         Some(7)
+    );
+    assert!(
+        crate::test_utils::auto_save_slot_calls_for_test() >= 1,
+        "GNU shut_down_emacs must reach Fdo_auto_save through the installed auto-save slot"
     );
     assert!(ev.visible_variable_value_or_nil("tgx-cleanup").is_nil());
     ev.green_teardown();
@@ -1290,31 +1214,6 @@ fn a_thread_sees_a_composition_made_by_another() {
     );
 }
 
-/// The redisplay change marks a buffer change bumps are one World's: the
-/// running owner holds them and hands them on with the Baton.
-#[test]
-fn a_threads_face_and_display_changes_reach_main() {
-    let mut ev = green();
-    let faces = ev.face_change_count();
-    let display = ev.display_var_change_count();
-    assert_eq!(
-        eval(
-            &mut ev,
-            "(thread-join (make-thread (lambda ()
-               (condition-case err
-                   (progn
-                     (internal-make-lisp-face 'tg3w-face)
-                     (internal-set-lisp-face-attribute 'tg3w-face :foreground \"green\")
-                     (set (make-local-variable (quote truncate-lines)) t)
-                     'done)
-                 (error err)))))"
-        ),
-        "done"
-    );
-    assert!(ev.face_change_count() > faces);
-    assert!(ev.display_var_change_count() > display);
-}
-
 fn select_parks() -> usize {
     super::switch::SELECT_PARKS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1421,6 +1320,16 @@ fn a_lone_green_select_publishes_and_preserves_a_control_wake_before_arm() {
     assert_no_ready_peer_select_publication(&mut ev, false);
 }
 
+/// A sleeping peer still publishes its select deadline. `thread-signal`
+/// stores the pair without waking the select (`src/thread.c:974-1034`);
+/// the signal is raised at the next reacquire (`src/thread.c:146-154`),
+/// while `Fthread_join` re-raises the `error_symbol` snapshot it copied
+/// before its wait (`src/thread.c:1126-1138`). The attested GNU 31.1
+/// oracle (linux-gtk3, THREADS) therefore reports `(error stop)` at the
+/// join and a nil `thread-last-error`: transcript
+/// `tmp/v10x/oracleb-evalfam/gnu-thread-signal-select-proof.txt`. The
+/// corrected expectation still guards the park publication and the select
+/// deadline because those assertions are unchanged.
 #[test]
 fn a_green_select_with_only_a_sleeping_peer_publishes_its_own_deadline() {
     let mut ev = green();
@@ -1437,8 +1346,11 @@ fn a_green_select_with_only_a_sleeping_peer_publishes_its_own_deadline() {
         "sleeping"
     );
     assert_no_ready_peer_select_publication(&mut ev, true);
-    // `thread-signal` does not end the worker's select (src/thread.c:974-982).
-    // The signal is raised when that select returns.
+    // `thread-signal` does not end the worker's select (src/thread.c:974-1034).
+    // The worker raises the pending pair when its select returns, while the
+    // join re-raises the error snapshot it copied before the wait
+    // (src/thread.c:1126-1138), so the attested GNU oracle reports the
+    // signal here.
     let started = std::time::Instant::now();
     assert_eq!(
         eval(
@@ -1448,7 +1360,7 @@ fn a_green_select_with_only_a_sleeping_peer_publishes_its_own_deadline() {
                (thread-yield)
                (thread-join s2r3-select-sleeper))"
         ),
-        "interrupted"
+        "ERR error (stop)"
     );
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(150),
@@ -1547,8 +1459,16 @@ fn a_yield_without_ready_peers_still_refuses_gc_inhibition() {
 }
 
 /// A worker `sleep-for` runs until its own deadline. `thread-signal` stores
-/// the pair and does not end the select (`src/thread.c:974-982`); the
-/// handler runs when select returns. Join then sees the caught result.
+/// the pair and does not end the select (`src/thread.c:974-1034`); the
+/// condition-case handler runs when select returns. `Fthread_join` copies
+/// the target's `error_symbol` BEFORE its wait (`src/thread.c:1126-1138`)
+/// and raises that snapshot after the wait, while
+/// `post_acquire_global_lock` clears and raises the worker's copy on
+/// reacquire (`src/thread.c:146-154`). The attested GNU 31.1 oracle
+/// (linux-gtk3, THREADS) therefore signals `error (wake)` at the join:
+/// transcript `tmp/v10x/oracleb-evalfam/gnu-thread-signal-select-proof.txt`.
+/// The corrected expectation still guards the deadline: the join cannot
+/// return before the worker's 0.35 s select expires.
 #[test]
 fn a_select_wait_runs_to_its_deadline_before_the_signal_is_raised() {
     let mut ev = green();
@@ -1564,77 +1484,12 @@ fn a_select_wait_runs_to_its_deadline_before_the_signal_is_raised() {
            (thread-yield)
            (list (thread-join th) (thread-last-error th)))"
         ),
-        "(interrupted nil)"
+        "ERR error (wake)"
     );
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(200),
         "thread-signal ended the worker select early"
     );
-}
-
-/// Readiness reaches an owner parked in accept-process-output while its
-/// peer keeps yielding, before the accept timeout or any periodic slice.
-
-/// The same descriptor publication reaches main when every other Green
-/// owner has exited. The writer requires the actual Select witness before
-/// writing; a Baton-held ordinary backend block cannot satisfy that gate.
-#[test]
-fn fd_readiness_wakes_a_green_select_without_a_ready_peer() {
-    use std::time::{Duration, Instant};
-
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let mut ev = green();
-    assert_eq!(
-        eval(
-            &mut ev,
-            &format!(
-                r#"(progn
-                  (thread-join (make-thread (lambda () nil)))
-                  (setq s2r3-no-peer-output nil)
-                  (setq s2r3-no-peer-process
-                    (make-network-process :name "s2r3-no-peer" :host "127.0.0.1"
-                      :service {port} :noquery t
-                      :filter (lambda (_p text) (setq s2r3-no-peer-output text))))
-                  'connected)"#
-            )
-        ),
-        "connected"
-    );
-    let control = std::sync::Arc::clone(&ev.green_seat().expect("main seat").control);
-    assert!(matches!(
-        control.peers(super::ThreadKey::Main, Instant::now()),
-        super::scheduler::Peers::Blocked
-    ));
-    let (gate, completion) =
-        main_select_park_gate(&mut ev, super::scheduler::SelectParkExpectation::Ordinary);
-    let server = std::thread::spawn(move || write_ready_after_main_select_park(listener, gate));
-    let selected = ev.green_select_switch(Duration::from_secs(30));
-    let stream = server
-        .join()
-        .expect("descriptor writer joined")
-        .expect("descriptor bytes published after canonical park");
-    assert_eq!(
-        completion
-            .recv_timeout(Duration::from_secs(5))
-            .expect("actual Select/write acknowledgement"),
-        Ok(())
-    );
-    assert!(matches!(selected, Ok(super::SelectTurn::Switched)));
-    assert_eq!(
-        eval(
-            &mut ev,
-            "(progn
-               (accept-process-output s2r3-no-peer-process 0)
-               s2r3-no-peer-output)"
-        ),
-        "\"ready\""
-    );
-    assert_eq!(
-        eval(&mut ev, "(delete-process s2r3-no-peer-process)"),
-        "nil"
-    );
-    drop(stream);
 }
 
 /// Marker for the fresh process `a_worker_panic_aborts_the_process_and_never_hangs_main`

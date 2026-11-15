@@ -134,6 +134,20 @@ pub mod authority {
         crate::emacs_core::eval::Context::run_gui_service_keeps_deadline_and_pending_input_order_fixture(make_context);
     }
 
+    /// AutoSaveHooks observation fence: route the calling thread's
+    /// `Fdo_auto_save` upcalls (the shutdown and command-loop auto-save
+    /// boundaries) to `body` until the returned guard drops. Installing a
+    /// body is a write to a test-only static, so the fence is the only
+    /// cross-crate route; the original stays pub(crate). Opt-in, owned
+    /// thread: other threads keep the installed canonical body.
+    pub fn auto_save_body_scope_for_test(
+        body: crate::emacs_core::eval::auto_save_hooks::DoAutoSave,
+    ) -> impl Drop {
+        crate::emacs_core::eval::auto_save_hooks::test_body_override::install_for_current_thread(
+            body,
+        )
+    }
+
     /// P1-CLASSES-ALL-CRATES FENCE: reset the symbol writer thread-locals.
     /// A reset is a write (N2), so the fence is the only cross-crate route.
     pub fn reset_symbols_thread_locals_for_test() {
@@ -1032,6 +1046,26 @@ pub mod authority {
         Box<dyn Fn() + Send>,
     ) {
         context.arm_main_connect_select_park_for_test(process)
+    }
+
+    /// Fence delegate: arm the next Main select park as an ordinary park.
+    /// Same channel contract as the connect arm above.
+    pub fn arm_main_ordinary_select_park_for_test(
+        context: &mut crate::emacs_core::eval::Context,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<Result<(), String>>,
+        Box<dyn Fn() + Send>,
+    ) {
+        context.arm_main_ordinary_select_park_for_test()
+    }
+
+    /// Fence delegate: whether Main's scheduler peer set reads Blocked.
+    pub fn main_select_peers_blocked_for_test(
+        context: &mut crate::emacs_core::eval::Context,
+    ) -> bool {
+        context.main_select_peers_blocked_for_test()
     }
 
     /// Fence delegates for the JIT tiering test knobs (writes to the

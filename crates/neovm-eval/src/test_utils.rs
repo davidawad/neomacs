@@ -401,6 +401,21 @@ mod unit_runtime {
     /// does not need the w32 symbol block, so this slot is a no-op here.
     fn boot_register_platform_bootstrap_vars(_obarray: &mut neovm_value::symbol::Obarray) {}
 
+    /// The unit runtime's startup-frame seed. Eval cannot name the display
+    /// module and this runtime holds no frame record, so seeding is an
+    /// exact no-op: the premise below refuses the fold the moment a frame
+    /// ever exists here, and the returned id is unobservable (every caller
+    /// discards it; the frame manager stays empty), so GNU's
+    /// `buffer_window_count == 0' branch of `force-mode-line-update'
+    /// follows by construction (buffer.c:1540-1545).
+    fn boot_seed_batch_startup_frame(ctx: &mut Context) -> neovm_value::display_vocab::FrameId {
+        assert!(
+            ctx.frame_manager().frames.is_empty(),
+            "ABSENT layer: the eval unit runtime cannot seed a startup frame over existing frames; run this test in core"
+        );
+        neovm_value::display_vocab::FrameId(0)
+    }
+
     /// Walk the canonical production registration plan. Eval-owned steps call
     /// the same registrars production calls; the event step runs the same
     /// production initialization through the same wrapper core uses; upper
@@ -558,7 +573,7 @@ mod unit_runtime {
             s::boot_install_host_environment_snapshot,
             s::boot_shell_file_name_install,
             s::boot_shell_file_name_install_dump_default,
-            s::boot_seed_batch_startup_frame,
+            boot_seed_batch_startup_frame,
             boot_register_core_bootstrap_vars,
             boot_register_platform_bootstrap_vars,
             s::boot_init_frame_lisp_faces,
@@ -605,9 +620,16 @@ mod unit_runtime {
             s::command_unwind_minibuffer_session,
             s::command_unwind_minibuffer_buffer,
             s::command_get_char_property,
-            s::command_try_completion,
-            s::command_all_completions,
-            s::command_test_completion,
+            // The real completion seam trio, not stand-ins: these are the
+            // same functions core publishes (`minibuffer::*` re-exports them)
+            // and production registers as `try-completion`,
+            // `all-completions`, and `test-completion`.
+            crate::emacs_core::eval::data::minibuffer_entry::builtin_try_completion,
+            crate::emacs_core::eval::data::minibuffer_entry::builtin_all_completions,
+            // The real completion seam, not a stand-in: this is the same
+            // function core publishes (`minibuffer::builtin_test_completion`
+            // re-exports it) and production registers as `test-completion`.
+            crate::emacs_core::eval::data::minibuffer_entry::builtin_test_completion,
             s::command_menu_bar_top_level_items,
             s::command_key_binding,
             s::command_where_is_internal,
@@ -630,19 +652,57 @@ mod unit_runtime {
         s::sqlite_reset,
     );
 
+    /// Documented no-op process shutdown for the eval unit runtime.
+    ///
+    /// Process creation is a system-layer primitive, so a well-formed unit
+    /// runtime has an empty live process table and GNU's `shut_down_emacs`
+    /// "shut down every process" fold is exact. The premise is asserted: if a
+    /// test ever seats a live process here, the no-op would silently skip
+    /// real teardown, so it refuses instead. Production installs the real
+    /// system body.
+    fn unit_process_shutdown_noop(ctx: &mut Context) -> Result<(), neovm_value::error::Flow> {
+        let live = ctx.processes().live_process_ids();
+        assert!(
+            live.is_empty(),
+            "ABSENT layer: unit process table is not empty ({live:?}); run this test in core"
+        );
+        Ok(())
+    }
+
     static PROCESS: ProcessHooks = ProcessHooks::new(
         s::process_unlink,
         s::process_delete,
-        s::process_shutdown,
+        unit_process_shutdown_noop,
         s::process_open_channel,
         s::process_print_handle,
         s::process_wait_notifier,
         s::process_terminate_and_defer_reaping,
     );
 
+    /// The eval unit runtime has no OS-signal INSTALLATION: `unit_harness`
+    /// never runs core's `os_signal::install`, so there is no signal handler,
+    /// no signal self-pipe, no command loop, and no SIGINT/SIGTERM delivery
+    /// path into this evaluator. GNU's exact answer for those states is "no
+    /// signal pending" -- the OS-signal bit of `ASYNC_ATTENTION` (the same
+    /// process-wide state `system::os_signal::pending` reads) is clear when
+    /// no handler can raise it.
+    ///
+    /// A raised bit is outside the covered states: this runtime has no drain
+    /// path (the drain slot is ABSENT), so it refuses loudly instead of
+    /// answering false for a genuinely pending signal.
+    fn unit_os_signal_pending() -> bool {
+        assert!(
+            !neovm_value::quit::ASYNC_ATTENTION.is_raised(neovm_value::quit::AsyncSource::OsSignal),
+            "ABSENT-LAYER system::input.os_signal_pending: the unit runtime has no \
+             OS-signal install or drain path, so a real pending signal cannot be \
+             answered here"
+        );
+        false
+    }
+
     static INPUT: InputHooks = InputHooks::new(
         s::input_interrupt_for_input_event_if_requested,
-        s::input_os_signal_pending,
+        unit_os_signal_pending,
         s::input_take_termination_signal,
         s::input_drain_pending_os_signals,
         SignalWakeSource::SelfPipe {
@@ -663,6 +723,92 @@ mod unit_runtime {
     );
 
     static BUFFER_KILL: BufferKillHooks = BufferKillHooks::new(s::buffer_kill_before);
+
+    /// Documented no-op auto-save body for the eval unit runtime.
+    ///
+    /// The no-op is exact only while the runtime has no auto-save candidate
+    /// buffer: a buffer whose `buffer-auto-save-file-name` is a string and
+    /// which was modified since its last auto-save. The unit runtime CAN make
+    /// such a buffer, and GNU would then call the system auto-save body, so
+    /// the premise is asserted rather than silently folded. The counter is
+    /// test-only evidence that the shutdown and command-loop seams actually
+    /// reach this slot.
+    static AUTO_SAVE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// True when any live buffer meets GNU's auto-save candidate test
+    /// (`STRINGP (auto_save_file_name)` and modified since the last
+    /// auto-save; indirect buffers are skipped by `Fdo_auto_save`).
+    fn auto_save_candidate_exists(ctx: &Context) -> bool {
+        ctx.edit.buffers.buffer_list().into_iter().any(|id| {
+            let Some(buffer) = ctx.edit.buffers.get(id) else {
+                return false;
+            };
+            buffer.auto_save_file_name_value().is_string()
+                && buffer.base_buffer().is_none()
+                && buffer.autosave_modified_tick() < buffer.modified_tick()
+        })
+    }
+
+    fn unit_auto_save_noop(ctx: &mut Context, _no_message: Value, _current: Value) -> EvalResult {
+        if auto_save_candidate_exists(ctx) {
+            panic!(
+                "ABSENT layer: do-auto-save has a candidate buffer in the eval unit runtime; run this test in core"
+            );
+        }
+        AUTO_SAVE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Value::NIL)
+    }
+
+    /// Number of times the unit auto-save slot was entered (test evidence).
+    pub(crate) fn auto_save_slot_calls_for_test() -> usize {
+        AUTO_SAVE_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Reset the unit auto-save slot counter before a seam assertion.
+    pub(crate) fn reset_auto_save_slot_calls_for_test() {
+        AUTO_SAVE_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    static AUTO_SAVE: crate::emacs_core::eval::auto_save_hooks::AutoSaveHooks =
+        crate::emacs_core::eval::auto_save_hooks::AutoSaveHooks::new(unit_auto_save_noop);
+
+    /// A buffer the unit runtime made file-visiting and modified must refuse
+    /// the "empty fold" no-op: its premise (no auto-save candidate) is false,
+    /// so GNU would have called the system body. The test proves the ABSENT
+    /// panic rather than a silent nil.
+    #[test]
+    fn unit_auto_save_slot_refuses_a_candidate_buffer() {
+        let mut context = Context::new(unit_runtime());
+        context
+            .eval_str("(setq unit-auto-save-b (get-buffer-create \"unit-auto-save-candidate\"))")
+            .expect("candidate buffer");
+        let buffer = context
+            .eval_str("unit-auto-save-b")
+            .expect("candidate buffer value");
+        let id = buffer.as_buffer_id().expect("candidate buffer object");
+        context
+            .edit
+            .buffers
+            .get_mut(id)
+            .expect("candidate buffer live")
+            .set_auto_save_file_name_value(Value::string("unit-auto-save-candidate.auto"));
+        context
+            .eval_str("(save-current-buffer (set-buffer unit-auto-save-b) (insert \"x\"))")
+            .expect("candidate buffer mutation");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unit_auto_save_noop(&mut context, Value::T, Value::NIL)
+        }));
+        let payload = outcome.expect_err("a candidate buffer must refuse the unit no-op");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("");
+        assert!(
+            message.contains("ABSENT layer"),
+            "unexpected panic message: {message}"
+        );
+    }
 
     static KMACRO: KmacroHooks = KmacroHooks::new(
         s::kmacro_start,
@@ -706,12 +852,42 @@ mod unit_runtime {
     static PERF: PerfHooks =
         PerfHooks::new(s::perf_record, s::perf_reset, PERF_CARRIER_FINGERPRINT);
 
+    /// The eval unit runtime's deadline wait: one Green select slice; with no
+    /// Green seat, block the OS thread to the shared timer deadline. There is
+    /// no process-output backend below eval to service here.
+    fn unit_wait_for_duration_until_timer_deadline(
+        ctx: &mut Context,
+        duration: std::time::Duration,
+        timer_deadline: crate::emacs_core::eval::GnuTimerTimestamp,
+    ) -> Result<(), neovm_value::error::Flow> {
+        match ctx.green_select_switch(duration)? {
+            crate::emacs_core::eval::SelectTurn::Switched => Ok(()),
+            crate::emacs_core::eval::SelectTurn::Block(wait_time) => {
+                let now = crate::emacs_core::eval::GnuTimerTimestamp::now();
+                if timer_deadline > now {
+                    let sleep_for = wait_time.min(timer_deadline.duration_until(now));
+                    // GNU `thread_select` (src/thread.c:613-643) releases the
+                    // global lock before the timeout block, and
+                    // `post_acquire_global_lock` (:141-154) delivers a pending
+                    // thread-signal when the select returns.
+                    ctx.sim_release_point(crate::emacs_core::threads::SimReleasePoint::Select)?;
+                    if !sleep_for.is_zero() {
+                        std::thread::sleep(sleep_for);
+                    }
+                    ctx.deliver_pending_sim_signal()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     static WAIT: WaitServiceHooks = WaitServiceHooks {
         service_input_pending_with_timers: s::wait_service_input_pending_with_timers,
         service_read_char_preliminary_redisplay: s::wait_service_read_char_preliminary_redisplay,
         service_timers_without_redisplay: s::wait_service_timers_without_redisplay,
         wait_for_command_input_with_idle_policy: s::wait_for_command_input_with_idle_policy,
         wait_for_resize_ack_until: s::wait_for_resize_ack_until,
+        wait_for_duration_until_timer_deadline: unit_wait_for_duration_until_timer_deadline,
     };
 
     static TIMER: TimerServiceHooks = TimerServiceHooks {
@@ -745,6 +921,7 @@ mod unit_runtime {
         &CALL_INTERACTIVELY,
         &CASE_TABLES,
         &BUFFER_KILL,
+        &AUTO_SAVE,
         &KMACRO,
         &DISPLAY_QUERY,
         false,
@@ -875,6 +1052,75 @@ mod unit_runtime {
         assert_eq!(actual_fn(&mut context).unwrap(), Value::NIL);
     }
 
+    /// The eval unit runtime's exact `accept-process-output` slot: GNU's
+    /// timeout path with an empty process table (asserted). Any premise in
+    /// which a process could produce output is an explicit ABSENT-LAYER
+    /// refusal, never a silent no-op.
+    fn unit_accept_process_output(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
+        use neovm_value::error::{LispCondition, expect_max_args, signal};
+        use neovm_value::value::{ValueKind, VecLikeType};
+
+        expect_max_args("accept-process-output", &args, 4)?;
+        assert!(
+            ctx.processes().list_processes().is_empty(),
+            "ABSENT-LAYER system::accept-process-output: the eval unit runtime carries no process backend"
+        );
+        if let Some(process) = args.first().copied() {
+            if !process.is_nil() {
+                assert!(
+                    process.is_process(),
+                    "accept-process-output: PROCESS must be a process"
+                );
+                panic!(
+                    "ABSENT-LAYER system::accept-process-output: a process argument needs the system wait backend"
+                );
+            }
+        }
+        let seconds = match args.get(1).copied() {
+            None => 0.0,
+            Some(value) if value.is_nil() => 0.0,
+            Some(value) => match value.kind() {
+                ValueKind::Fixnum(_) => value.as_fixnum().expect("fixnum") as f64,
+                ValueKind::Float => value.xfloat(),
+                ValueKind::Veclike(VecLikeType::Bignum) => {
+                    panic!("ABSENT-LAYER system::accept-process-output: bignum timeout")
+                }
+                _ => {
+                    return Err(signal(
+                        LispCondition::WrongTypeArgument,
+                        vec![Value::symbol("numberp"), value],
+                    ));
+                }
+            },
+        };
+        let millis = match args.get(2).copied() {
+            None => 0,
+            Some(value) if value.is_nil() => 0,
+            Some(value) => value.as_fixnum().ok_or_else(|| {
+                signal(
+                    LispCondition::WrongTypeArgument,
+                    vec![Value::symbol("fixnump"), value],
+                )
+            })?,
+        };
+        let total_secs = seconds + millis as f64 / 1000.0;
+        if total_secs > 0.0 {
+            let total = std::time::Duration::from_secs_f64(total_secs);
+            let end_time = crate::emacs_core::eval::GnuTimerTimestamp::now().add_duration(total);
+            loop {
+                let now = crate::emacs_core::eval::GnuTimerTimestamp::now();
+                if now >= end_time {
+                    break;
+                }
+                let remaining = end_time.duration_until(now);
+                crate::emacs_core::eval::hooks_proof::wait::wait_for_duration_until_timer_deadline(
+                    ctx, remaining, end_time,
+                )?;
+            }
+        }
+        Ok(Value::NIL)
+    }
+
     /// Misc descriptors owned by this crate, including lower host-generic bodies.
     /// The unit runtime uses the same production descriptor or entry shape.
     fn misc_family_subr(name: &str) -> Option<crate::emacs_core::subr::SubrSpec> {
@@ -930,6 +1176,14 @@ mod unit_runtime {
                 crate::emacs_core::builtins::misc_pure::STANDARD_SYNTAX_TABLE_SUBR
             }
             "copy-marker" => crate::emacs_core::builtins::misc_eval::COPY_MARKER_SUBR,
+            "sleep-for" => crate::emacs_core::builtins::misc_eval::SLEEP_FOR_SUBR,
+            // The system owns production `accept-process-output`; the unit
+            // runtime binds its own exact timeout-only entry (see above).
+            "accept-process-output" => SubrSpec::new(
+                "accept-process-output",
+                NativeFn::ContextVec(unit_accept_process_output),
+                SubrArity::new(0, Some(4)),
+            ),
             "char-table-subtype" => crate::emacs_core::builtins::misc_pure::CHAR_TABLE_SUBTYPE_SUBR,
             "set-char-table-range" => {
                 crate::emacs_core::builtins::misc_eval::SET_CHAR_TABLE_RANGE_SUBR
@@ -2071,6 +2325,153 @@ mod unit_runtime {
         assert_eq!(
             marker_logical_fields(&numeric),
             Some((Some(current), Some(full_end), false))
+        );
+    }
+
+    macro_rules! same_subr_entry {
+        ($expected:expr, $actual:expr) => {{
+            use crate::emacs_core::eval::subr_abi::SubrFn;
+            match ($expected.function(), $actual.function()) {
+                (Some(SubrFn::Many(a)), Some(SubrFn::Many(b))) => a as usize == b as usize,
+                (Some(SubrFn::ManyNoContext(a)), Some(SubrFn::ManyNoContext(b))) => {
+                    a as usize == b as usize
+                }
+                (Some(SubrFn::ManySlice(a)), Some(SubrFn::ManySlice(b))) => {
+                    a as usize == b as usize
+                }
+                (Some(SubrFn::A0(a)), Some(SubrFn::A0(b))) => a as usize == b as usize,
+                (Some(SubrFn::A1(a)), Some(SubrFn::A1(b))) => a as usize == b as usize,
+                (Some(SubrFn::A2(a)), Some(SubrFn::A2(b))) => a as usize == b as usize,
+                (Some(SubrFn::A3(a)), Some(SubrFn::A3(b))) => a as usize == b as usize,
+                (Some(SubrFn::A4(a)), Some(SubrFn::A4(b))) => a as usize == b as usize,
+                (Some(SubrFn::A5(a)), Some(SubrFn::A5(b))) => a as usize == b as usize,
+                (Some(SubrFn::A6(a)), Some(SubrFn::A6(b))) => a as usize == b as usize,
+                (Some(SubrFn::A7(a)), Some(SubrFn::A7(b))) => a as usize == b as usize,
+                (Some(SubrFn::A8(a)), Some(SubrFn::A8(b))) => a as usize == b as usize,
+                _ => false,
+            }
+        }};
+    }
+
+    macro_rules! same_registered_subr_entry {
+        ($expected:expr, $actual:expr) => {{
+            use crate::emacs_core::eval::subr_abi::SubrFn;
+            match ($expected.function(), $actual.function) {
+                (Some(SubrFn::Many(a)), Some(SubrFn::Many(b))) => a as usize == b as usize,
+                (Some(SubrFn::ManyNoContext(a)), Some(SubrFn::ManyNoContext(b))) => {
+                    a as usize == b as usize
+                }
+                (Some(SubrFn::ManySlice(a)), Some(SubrFn::ManySlice(b))) => {
+                    a as usize == b as usize
+                }
+                (Some(SubrFn::A0(a)), Some(SubrFn::A0(b))) => a as usize == b as usize,
+                (Some(SubrFn::A1(a)), Some(SubrFn::A1(b))) => a as usize == b as usize,
+                (Some(SubrFn::A2(a)), Some(SubrFn::A2(b))) => a as usize == b as usize,
+                (Some(SubrFn::A3(a)), Some(SubrFn::A3(b))) => a as usize == b as usize,
+                (Some(SubrFn::A4(a)), Some(SubrFn::A4(b))) => a as usize == b as usize,
+                (Some(SubrFn::A5(a)), Some(SubrFn::A5(b))) => a as usize == b as usize,
+                (Some(SubrFn::A6(a)), Some(SubrFn::A6(b))) => a as usize == b as usize,
+                (Some(SubrFn::A7(a)), Some(SubrFn::A7(b))) => a as usize == b as usize,
+                (Some(SubrFn::A8(a)), Some(SubrFn::A8(b))) => a as usize == b as usize,
+                _ => false,
+            }
+        }};
+    }
+
+    #[test]
+    fn unit_sleep_for_uses_canonical_descriptor_and_registered_entry() {
+        use crate::emacs_core::builtins::misc_eval::SLEEP_FOR_SUBR;
+        use crate::emacs_core::subr::{CommandDefault, NoEvalPolicy, SubrArity, no_eval_policy};
+        use neovm_value::intern::intern;
+        use neovm_value::value::Value;
+
+        let expected = SLEEP_FOR_SUBR;
+        let descriptor = misc_family_subr("sleep-for").expect("real unit sleep-for descriptor");
+        assert_eq!(expected.name(), "sleep-for");
+        assert_eq!(descriptor.name(), "sleep-for");
+        assert_eq!(descriptor.arity(), expected.arity());
+        assert_eq!(expected.arity(), SubrArity::new(1, Some(2)));
+        assert!(
+            same_subr_entry!(expected, descriptor),
+            "unit family does not copy the canonical sleep-for static"
+        );
+        assert_eq!(descriptor.dispatch_kind(), expected.dispatch_kind());
+        assert_eq!(
+            expected.dispatch_kind(),
+            neovm_value::tagged::header::SubrDispatchKind::Builtin
+        );
+        assert!(descriptor.interactive_spec().is_none());
+        assert_eq!(descriptor.no_eval_policy(), expected.no_eval_policy());
+        assert_eq!(expected.no_eval_policy(), NoEvalPolicy::Native);
+        assert!(descriptor.leaf_spec().is_none());
+        assert_eq!(expected.command_default(), CommandDefault::Enabled);
+
+        let mut context = Context::new(unit_runtime());
+        let id = intern("sleep-for");
+        let actual = crate::emacs_core::eval::lookup_global_subr_entry(id)
+            .expect("registered unit sleep-for");
+        assert!(
+            same_registered_subr_entry!(expected, actual),
+            "registered entry is not the canonical sleep-for static"
+        );
+        assert_eq!((actual.min_args, actual.max_args), (1, Some(2)));
+        assert_eq!(actual.dispatch_kind, expected.dispatch_kind());
+        assert!(actual.interactive_spec.is_none());
+        assert_eq!(no_eval_policy(id), NoEvalPolicy::Native);
+        assert!(crate::emacs_core::subr::leaf::subr_leaf(id).is_none());
+
+        assert_eq!(
+            context.eval_str("(sleep-for 0)").expect("zero sleep"),
+            Value::NIL
+        );
+        assert!(
+            context.eval_str("(sleep-for \"x\")").is_err(),
+            "sleep-for rejects a non-number"
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            context.eval_str("(sleep-for 0.02)").expect("short sleep"),
+            Value::NIL
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(10),
+            "the eval-only wait did not wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn unit_accept_process_output_is_the_exact_timeout_path() {
+        use neovm_value::value::Value;
+
+        let mut context = Context::new(unit_runtime());
+        assert!(
+            context.processes().list_processes().is_empty(),
+            "the accepted unit premise is an empty process table"
+        );
+        assert_eq!(
+            context
+                .eval_str("(accept-process-output nil 0)")
+                .expect("zero-timeout accept"),
+            Value::NIL
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            context
+                .eval_str("(accept-process-output nil 0.02)")
+                .expect("short-timeout accept"),
+            Value::NIL
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(10),
+            "the unit accept timeout did not wait: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            context
+                .eval_str("(accept-process-output nil \"x\")")
+                .is_err(),
+            "a non-number timeout is refused"
         );
     }
 
@@ -3259,6 +3660,7 @@ mod unit_runtime {
 pub(crate) use unit_runtime::unit_runtime;
 #[cfg(test)]
 pub(crate) use unit_runtime::{
+    auto_save_slot_calls_for_test, reset_auto_save_slot_calls_for_test,
     terminal_delete_noelisp_slot_is_absent, terminal_live_ids_slot_is_absent,
 };
 

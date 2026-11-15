@@ -59,7 +59,11 @@ impl RenderApp {
                         .renderer_effects
                         .scroll_effects_active()
                     && let Some(frame) = state.render.compositor.current_frame.as_ref()
-                    && state.render.compositor.input_scroll.resolve(frame, intent)
+                    && state.render.compositor.input_scroll.resolve(
+                        &state.render.compositor.coverage_retention,
+                        frame,
+                        intent,
+                    )
                 {
                     state.render.compositor.current_scene_generation =
                         super::frame_state::next_scene_generation();
@@ -244,6 +248,15 @@ impl RenderApp {
                         Some(UserAttentionType::Informational)
                     };
                     window.request_user_attention(attention);
+                }
+            }
+            WindowCommand::FocusWindow { frame } => {
+                let emacs_frame_id = frame.raw_id();
+                if !self.frame_windows.focus(emacs_frame_id) {
+                    tracing::warn!(
+                        "FocusWindow requested for unknown frame_id=0x{:x}",
+                        emacs_frame_id
+                    );
                 }
             }
             WindowCommand::CreateWindow {
