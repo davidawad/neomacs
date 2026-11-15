@@ -86,6 +86,7 @@ pub(crate) fn configure_child_pty_tty(tty_name: &OsStr) -> Result<(), String> {
 /// # Safety
 /// Must only be called from a `pre_exec` context (post-fork, pre-exec), where
 /// running async-signal-safe syscalls on the child's fds is sound.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub(crate) unsafe fn establish_pty_controlling_terminal(
     tty: &std::ffi::CStr,
 ) -> std::io::Result<()> {

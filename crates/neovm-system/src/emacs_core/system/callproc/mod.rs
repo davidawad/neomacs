@@ -10,6 +10,7 @@ use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, not(all(target_os = "linux", target_env = "gnu"))))]
 use std::process::Command;
 
 use super::process::ProcessOutputDecoding;
@@ -111,6 +112,7 @@ pub(crate) fn new_child_command<S: AsRef<std::ffi::OsStr>>(program: S) -> ChildC
 /// Apply the platform's "own process group" isolation to an already-built
 /// command. Split out so callers that need portable_pty (which already
 /// `setsid`s the child) or a pre-configured command can opt in explicitly.
+#[cfg(any(test, not(all(target_os = "linux", target_env = "gnu"))))]
 pub(crate) fn isolate_child_command(command: &mut Command) {
     #[cfg(unix)]
     {

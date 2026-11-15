@@ -44,11 +44,10 @@ pub(crate) use process_attributes::{
 
 #[cfg(unix)]
 mod tty;
+#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
+pub(crate) use tty::establish_pty_controlling_terminal;
 #[cfg(unix)]
-pub(crate) use tty::{
-    configure_child_pty_tty, establish_pty_controlling_terminal, fd_foreground_pgrp,
-    tty_path_foreground_pgrp,
-};
+pub(crate) use tty::{configure_child_pty_tty, fd_foreground_pgrp, tty_path_foreground_pgrp};
 
 #[cfg(unix)]
 mod fd;
