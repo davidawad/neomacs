@@ -442,3 +442,127 @@ fn signals_the_editor_ignores_are_default_in_the_child() {
     assert_eq!(output.stdout, b"done");
     assert!(output.status.success());
 }
+
+/// A fresh pty pair and the slave's path.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn open_pty() -> (
+    std::os::fd::OwnedFd,
+    std::os::fd::OwnedFd,
+    std::path::PathBuf,
+) {
+    use std::ffi::{CStr, OsStr};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: valid out-pointers; the optional arguments are NULL.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: `openpty` succeeded, so both descriptors are open and ours.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let mut name = [0 as libc::c_char; 128];
+    // SAFETY: `name` is a writable buffer of the given length.
+    let named = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    assert_eq!(named, 0, "ptsname_r");
+    // SAFETY: `ptsname_r` wrote a NUL-terminated name into `name`.
+    let slave_path = std::path::Path::new(OsStr::from_bytes(
+        unsafe { CStr::from_ptr(name.as_ptr()) }.to_bytes(),
+    ))
+    .to_path_buf();
+    (master, slave, slave_path)
+}
+
+/// A `:stderr` descriptor the editor holds as fd 0 (it runs with stdin
+/// closed) must still be the pty child's stderr, not be replaced by the slave
+/// opened onto fd 0.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn a_pty_child_s_stderr_held_as_fd_0_stays_its_stderr() {
+    use std::os::fd::AsRawFd;
+
+    let (_master, _slave, slave_path) = open_pty();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("stderr");
+    // SAFETY: plain FFI; stdin is restored below before any assertion.
+    let saved_stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
+    assert!(saved_stdin > libc::STDERR_FILENO, "dup stdin");
+    unsafe { libc::close(libc::STDIN_FILENO) };
+    let file = std::fs::File::create(&path).expect("create stderr file");
+    let file_fd = file.as_raw_fd();
+    let spawned = sh("echo out; echo err >&2")
+        .stderr(ChildStdio::from(file))
+        .spawn_on_pty(&slave_path);
+    // SAFETY: `saved_stdin` is open and ours.
+    unsafe {
+        libc::dup2(saved_stdin, libc::STDIN_FILENO);
+        libc::close(saved_stdin);
+    }
+    assert_eq!(file_fd, libc::STDIN_FILENO, "the stderr file took fd 0");
+
+    let status = spawned.expect("spawn on pty").wait().expect("wait");
+    assert!(status.success());
+    assert_eq!(std::fs::read(&path).expect("read stderr file"), b"err\n");
+}
+
+/// The signals a pty child starts with default dispositions follow the path
+/// it took before posix_spawn: a child whose stderr is the slave resets
+/// what `portable_pty` reset (SIGHUP among them), while one with a separate
+/// stderr resets only GNU's four and inherits any other ignored signal,
+/// as GNU's `vfork` child and the old `setsid`-only fork did.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn a_pty_child_s_ignored_signals_depend_on_where_its_stderr_goes() {
+    let (_master, _slave, slave_path) = open_pty();
+    // SAFETY: plain FFI on this test process's own dispositions.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ignored_by = |stderr: Option<std::fs::File>, name: &str| {
+        let report = dir.path().join(name);
+        let mut command = sh(&format!(
+            "while read -r line; do \
+               case $line in SigIgn:*) echo \"${{line#SigIgn:}}\" > '{}';; esac; \
+             done < /proc/self/status",
+            report.display()
+        ));
+        if let Some(file) = stderr {
+            command.stderr(ChildStdio::from(file));
+        }
+        let status = command
+            .spawn_on_pty(&slave_path)
+            .expect("spawn on pty")
+            .wait()
+            .expect("wait");
+        assert!(status.success());
+        let mask = std::fs::read_to_string(&report).expect("read report");
+        u64::from_str_radix(mask.trim(), 16).expect("SigIgn mask")
+    };
+    let bit = |signal: libc::c_int| 1u64 << (signal - 1);
+
+    let separate = ignored_by(
+        Some(std::fs::File::create(dir.path().join("stderr")).expect("stderr file")),
+        "separate",
+    );
+    let merged = ignored_by(None, "merged");
+    // SAFETY: as above.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_DFL);
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+    }
+    assert_eq!(
+        separate,
+        bit(libc::SIGHUP),
+        "separate stderr: SIGHUP stays ignored"
+    );
+    assert_eq!(merged, 0, "stderr on the slave: nothing stays ignored");
+}
