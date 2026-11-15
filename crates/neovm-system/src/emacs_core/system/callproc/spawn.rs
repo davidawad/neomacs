@@ -26,9 +26,15 @@
 //! The platform split is resolved ONCE here.  glibc Linux takes the
 //! `posix_spawn` engine; every other platform keeps `std::process::Command`
 //! with the same session isolation applied by
-//! [`super::isolate_child_command`].  Pseudoterminal children need post-fork
-//! setup `posix_spawn` cannot express, so they take
-//! [`ChildCommand::into_forking_command`] -- GNU's `vfork` fallback.
+//! [`super::isolate_child_command`].
+//!
+//! GNU takes `vfork` for pseudoterminal children, but on glibc Linux
+//! `posix_spawn` expresses that setup too: after `POSIX_SPAWN_SETSID` the
+//! child opens the pty slave by name, and a session leader without a
+//! controlling terminal acquires the terminal it opens (Linux `open(2)`) --
+//! GNU's own reopen of `pty_name` in the child.  So glibc Linux starts pty
+//! children with [`ChildCommand::spawn_on_pty`]; elsewhere they take
+//! [`ChildCommand::into_forking_command`].
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -83,6 +89,7 @@ impl ChildEnv {
         env
     }
 
+    #[cfg(any(test, not(all(target_os = "linux", target_env = "gnu"))))]
     fn apply_to_command(&self, command: &mut std::process::Command) {
         if self.clear {
             command.env_clear();
@@ -269,9 +276,10 @@ impl ChildCommand {
     }
 
     /// The same child as a `std::process::Command` that will `fork`, with
-    /// the session isolation already installed.  For children that need
-    /// post-fork setup `posix_spawn` cannot express (a pty as controlling
-    /// terminal); GNU likewise falls back to `vfork` for pty children.
+    /// the session isolation already installed.  For pty children off glibc
+    /// Linux, which need post-fork setup there (GNU likewise falls back to
+    /// `vfork` for pty children).
+    #[cfg(any(test, not(all(target_os = "linux", target_env = "gnu"))))]
     pub(crate) fn into_forking_command(mut self) -> io::Result<std::process::Command> {
         #[cfg(unix)]
         super::retain_child_exit_status()?;
@@ -288,6 +296,7 @@ impl ChildCommand {
         Ok(command)
     }
 
+    #[cfg(any(test, not(all(target_os = "linux", target_env = "gnu"))))]
     fn forking_command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
         command.args(&self.args);
@@ -306,6 +315,7 @@ impl ChildCommand {
     }
 }
 
+#[cfg(any(test, not(all(target_os = "linux", target_env = "gnu"))))]
 fn std_stdio(stdio: ChildStdio) -> std::process::Stdio {
     match stdio {
         ChildStdio::Inherit => std::process::Stdio::inherit(),
