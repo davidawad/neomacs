@@ -1346,11 +1346,22 @@ pub fn builtin_display_supports_face_attributes_p(
 // X display builtins (compatibility stubs)
 // ---------------------------------------------------------------------------
 
-/// (x-display-list) -> nil in batch-style vm context.
+/// Return the list of display names that Emacs has connections to.
+///
+/// GNU `Fx_display_list` (xfns.c:7692) walks the open-connection chain; the
+/// live window-system terminals are Neo's connection registry, so the answer
+/// is their names. Nil in batch and TTY sessions (no display connection), and
+/// never derived from frames or the DISPLAY variable — a connection outlives
+/// its last frame.
 #[doc(hidden)]
 pub fn builtin_x_display_list(args: Vec<Value>) -> EvalResult {
     expect_max_args("x-display-list", &args, 0)?;
-    Ok(Value::NIL)
+    Ok(Value::list(
+        super::terminal::pure::graphical_display_names()
+            .into_iter()
+            .map(Value::string)
+            .collect(),
+    ))
 }
 
 /// (x-frame-edges &optional FRAME TYPE) -> nil in batch/no-X context.
@@ -2665,6 +2676,14 @@ pub fn builtin_x_focus_frame(eval: &mut Context, args: Vec<Value>) -> EvalResult
         .and_then(|frame| frame.effective_window_system())
         .is_some_and(gui_window_system_active_value)
     {
+        // GNU calls the terminal's `focus_frame_hook` here (`src/frame.c:3767`); the win32 hook
+        // activates the frame window (`src/w32term.c:7386`). Selection alone
+        // leaves the OS focus where it was, which is what broke `other-frame`.
+        let no_activate = args.get(1).is_some_and(|value| value.is_truthy());
+        if let Some(host) = eval.display_host.as_mut() {
+            host.focus_gui_frame(fid, no_activate)
+                .map_err(|message| signal("error", vec![Value::string(message)]))?;
+        }
         Ok(Value::NIL)
     } else {
         Err(x_window_system_frame_error())
@@ -3224,11 +3243,11 @@ pub fn builtin_x_display_set_last_user_time(
     x_optional_display_query_error_eval(eval, "x-display-set-last-user-time", query_args)
 }
 
-/// Check DISPLAY and a non-nil XRM-STRING, then admit a daemon connection.
+/// Check DISPLAY and a non-nil XRM-STRING before admitting a connection.
 ///
 /// GNU `Fx_open_connection` runs both `CHECK_STRING`s before `x_term_init`
-/// (`src/xfns.c:7645-7647`). A typed DISPLAY on the non-daemon GUI arm still
-/// returns nil; refusing an unopenable name there is a separate change.
+/// (`src/xfns.c:7645-7647`). Ordinary GUI contexts admit only a connection
+/// identified by their native host; a foreign name cannot reuse that terminal.
 ///
 /// The `neo` frontend is Neomacs's pgtk analogue, and pgtk's own
 /// `Fx_open_connection` replaces a nil DISPLAY with the empty string before
@@ -3242,11 +3261,11 @@ pub fn builtin_x_open_connection(
     expect_args_range("x-open-connection", &args, 1, 3)?;
     // `android-win`, `ns-win` and `w32-win` pass their own non-nil names;
     // only the pgtk-like `neo` arm inherits pgtk's nil-is-empty rule.
-    let neo_nil_display = eval.daemon().is_none()
-        && args[0].is_nil()
+    let neo_frontend = eval.daemon().is_none()
         && active_window_system_symbol(eval)
             .and_then(|value| WindowSystemKind::from_symbol_value(&value))
             == Some(WindowSystemKind::Neo);
+    let neo_nil_display = neo_frontend && args[0].is_nil();
     if !args[0].is_string() && !neo_nil_display {
         return Err(signal(
             LispCondition::WrongTypeArgument,
@@ -3266,7 +3285,23 @@ pub fn builtin_x_open_connection(
         _ => None,
     };
     if eval.daemon().is_some() {
-        ensure_daemon_graphical_connection(eval, Some(args[0]))?;
+        ensure_daemon_graphical_connection(eval, Some(args[0])).map_err(|reason| {
+            if reason
+                .as_signal()
+                .is_some_and(|sig| sig.symbol_name() == "error")
+            {
+                let requested_display = display_string_text(&args[0]).expect("checked string");
+                tracing::debug!(%requested_display, ?reason, "x-open-connection daemon refused admission");
+                signal(
+                    "error",
+                    vec![Value::string(format!(
+                        "Display {requested_display} can’t be opened"
+                    ))],
+                )
+            } else {
+                reason
+            }
+        })?;
         if let Some(resources) = resources.as_deref()
             && let Some(host) = eval.display_host.as_mut()
         {
@@ -3274,20 +3309,49 @@ pub fn builtin_x_open_connection(
         }
         return Ok(Value::NIL);
     }
+    let requested_display = display_string_text(&args[0]).unwrap_or_default();
     if x_window_system_active(eval) {
-        if let Some(resources) = resources.as_deref()
-            && let Some(host) = eval.display_host.as_mut()
+        // GNU pgtk opens its empty name as the default display
+        // (src/gtkutil.c:246-250). The host's None selector names its owned
+        // default; an explicit empty X11/daemon name stays a strict request.
+        let host_display = if neo_frontend && requested_display.is_empty() {
+            None
+        } else {
+            Some(requested_display.as_str())
+        };
+        let admitted = match eval
+            .display_host
+            .as_ref()
+            .map(|host| host.graphical_connection_identity(host_display))
         {
-            host.set_gui_resource_database(resources);
+            Some(Ok(Some(_))) => true,
+            Some(Err(reason)) => {
+                tracing::debug!(%requested_display, %reason, "x-open-connection host refused admission");
+                false
+            }
+            Some(Ok(None)) => {
+                tracing::debug!(%requested_display, "x-open-connection host has no graphical connection");
+                false
+            }
+            None => {
+                tracing::debug!(%requested_display, "x-open-connection has no native display host");
+                false
+            }
+        };
+        if admitted {
+            if let Some(resources) = resources.as_deref()
+                && let Some(host) = eval.display_host.as_mut()
+            {
+                host.set_gui_resource_database(resources);
+            }
+            return Ok(Value::NIL);
         }
-        return Ok(Value::NIL);
     }
-    // A nil display reaches the pgtk-like empty name here only if the `neo`
-    // frontend is not active after all; report it rather than panicking.
-    let display = display_string_text(&args[0]).unwrap_or_default();
     Err(signal(
         "error",
-        vec![Value::string(format!("Display {display} can’t be opened"))],
+        vec![Value::string(format!(
+            "Display {requested_display} can’t be opened"
+        ))],
     ))
 }
 

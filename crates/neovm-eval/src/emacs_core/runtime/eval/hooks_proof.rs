@@ -47,6 +47,7 @@ pub struct EvalHookSet {
     call_interactively: &'static call_interactively::CallInteractivelyHooks,
     case_tables: &'static case_tables::CaseTableHooks,
     buffer_kill: &'static buffer_kill::BufferKillHooks,
+    auto_save: &'static auto_save_hooks::AutoSaveHooks,
     kmacro: &'static kmacro_hooks::KmacroHooks,
     display_query: &'static display_query_hooks::DisplayQueryHooks,
     perf_enabled: bool,
@@ -88,6 +89,12 @@ pub struct WaitServiceHooks {
         ) -> Result<input_hooks::CommandInputWaitOutcome, Flow>,
     #[doc(hidden)]
     pub wait_for_resize_ack_until: fn(&mut Context, Instant) -> Result<bool, Flow>,
+    /// One slice of a deadline-bounded wait that services timers and process
+    /// output (GNU `wait_reading_process_output`): production supplies the
+    /// system wait backend, the eval unit runtime supplies a Green-only wait.
+    #[doc(hidden)]
+    pub wait_for_duration_until_timer_deadline:
+        fn(&mut Context, Duration, GnuTimerTimestamp) -> Result<(), Flow>,
 }
 
 /// Timer-deadline upcalls, read once per input-wait decision.
@@ -146,6 +153,7 @@ impl EvalHookSet {
         call_interactively: &'static call_interactively::CallInteractivelyHooks,
         case_tables: &'static case_tables::CaseTableHooks,
         buffer_kill: &'static buffer_kill::BufferKillHooks,
+        auto_save: &'static auto_save_hooks::AutoSaveHooks,
         kmacro: &'static kmacro_hooks::KmacroHooks,
         display_query: &'static display_query_hooks::DisplayQueryHooks,
         perf_enabled: bool,
@@ -165,6 +173,7 @@ impl EvalHookSet {
             call_interactively,
             case_tables,
             buffer_kill,
+            auto_save,
             kmacro,
             display_query,
             perf_enabled,
@@ -232,6 +241,7 @@ pub fn install_eval_hooks(
     )?);
     accept_hook_status(case_tables::install_case_table_hooks(set.case_tables)?);
     accept_hook_status(buffer_kill::install_buffer_kill_hooks(set.buffer_kill)?);
+    accept_hook_status(auto_save_hooks::install_auto_save_hooks(set.auto_save)?);
     accept_hook_status(kmacro_hooks::install_kmacro_hooks(set.kmacro)?);
     // 4. Display policy queries.
     accept_hook_status(display_query_hooks::install_display_query_hooks(
@@ -335,6 +345,14 @@ pub(crate) mod wait {
         deadline: Instant,
     ) -> Result<bool, Flow> {
         (installed().wait.wait_for_resize_ack_until)(ctx, deadline)
+    }
+
+    pub(crate) fn wait_for_duration_until_timer_deadline(
+        ctx: &mut Context,
+        duration: Duration,
+        timer_deadline: GnuTimerTimestamp,
+    ) -> Result<(), Flow> {
+        (installed().wait.wait_for_duration_until_timer_deadline)(ctx, duration, timer_deadline)
     }
 }
 

@@ -1476,6 +1476,7 @@ struct PrimaryWindowDisplayHost {
     primary_frame: PrimaryFrame,
     gui_startup: Option<GuiStartupParameters>,
     last_window_titles: Mutex<HashMap<neovm_core::window::FrameId, LispString>>,
+    display_identity: Option<neomacs_display_protocol::GraphicalDisplayIdentity>,
     font_metrics: Option<FontMetricsService>,
     font_entities: FontEntityCatalog,
     primary_window_size: SharedPrimaryWindowSize,
@@ -1757,9 +1758,14 @@ fn record_primary_window_resize(shared: &SharedPrimaryWindowSize, event: &Displa
 
 impl PrimaryWindowDisplayHost {
     fn synchronized_font_metrics(&mut self) -> &mut FontMetricsService {
-        let service = self
-            .font_metrics
-            .get_or_insert_with(FontMetricsService::new);
+        let binding = &self.display_identity;
+        let service = self.font_metrics.get_or_insert_with(|| {
+            let mut service = FontMetricsService::new();
+            if let Some(identity) = binding {
+                service.set_display_identity(identity.clone());
+            }
+            service
+        });
         let _ = service.synchronize_font_catalog();
         service
     }
@@ -2403,6 +2409,21 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         )
     }
 
+    fn focus_gui_frame(
+        &mut self,
+        frame_id: neovm_core::window::FrameId,
+        _no_activate: bool,
+    ) -> Result<(), String> {
+        // The native activation request has no non-activating variant on
+        // Windows, where GNU's w32 hook also ignores NOACTIVATE
+        // (`src/w32term.c:7367`).
+        let frame = self.frame_ref_for_gui_frame(frame_id);
+        self.send_render_command(
+            RenderCommand::Window(WindowCommand::FocusWindow { frame }),
+            "failed to focus GUI frame",
+        )
+    }
+
     fn set_gui_frame_alpha_lower_limit(&mut self, limit: f32) {
         self.frame_opacity
             .lock()
@@ -2573,6 +2594,18 @@ impl DisplayHost for PrimaryWindowDisplayHost {
             RenderCommand::Config(ConfigCommand::SetModifierPolicy(policy)),
             "failed to set the NS modifier policy",
         )
+    }
+
+    fn synchronize_symbol_font_policy(
+        &mut self,
+        use_primary_font: bool,
+        char_script_table: Option<Value>,
+    ) {
+        // The same GNU symbol-reuse rule the layout engine's font service
+        // applies; this host's service is the evaluator-path counterpart and
+        // has no other source for the policy.
+        self.synchronized_font_metrics()
+            .synchronize_symbol_font_policy(use_primary_font, char_script_table);
     }
 
     fn resolve_font_for_char(
@@ -2782,10 +2815,14 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         pixel_size: u32,
         wght: Option<f32>,
     ) -> Result<Option<neovm_core::emacs_core::eval::FontPxProbeResult>, String> {
-        Ok(neomacs_layout_engine::font::probe::probe_font_px_metrics(
+        let metrics = neomacs_layout_engine::font::probe::probe_font_px_metrics(
             file, face_index, pixel_size, wght,
-        )
-        .map(core_font_px_metrics))
+        );
+        if let Some(metrics) = metrics {
+            self.synchronized_font_metrics()
+                .observe_opened_font_metrics(metrics.ascent, metrics.descent);
+        }
+        Ok(metrics.map(core_font_px_metrics))
     }
 
     fn probe_font_entity_metrics(
@@ -2852,6 +2889,8 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         ) else {
             return Ok(None);
         };
+        self.synchronized_font_metrics()
+            .observe_opened_font_metrics(metrics.ascent, metrics.descent);
         let capability = self.font_otf_capability(file, 0).ok().flatten();
         Ok(Some(ResolvedFontEntityMetrics {
             metrics: core_font_px_metrics(metrics),
@@ -3717,6 +3756,10 @@ fn initialize_reused_gui_startup_frame(eval: &mut Context, frame_id: FrameId) {
         frame.set_known_parameter(FrameParam::ToolBarLines, Value::fixnum(1));
     }
 
+    // The graphical frame must own its initial matrix allocation before the
+    // face-initialization Lisp can query it, as at GNU frame creation.
+    neovm_core::emacs_core::window_cmds::adjust_frame_glyph_matrices(eval, frame_id);
+
     // Callers bootstrapping an existing GUI frame, including isolated test
     // fixtures, bypass faces.el:x-create-frame-with-faces. Apply its frame-local
     // Lisp initialization here. The GUI worker instead starts with a terminal
@@ -3838,6 +3881,12 @@ fn sync_selected_gui_chrome_state(eval: &mut Context) {
         if frame.effective_window_system().is_none() {
             return;
         }
+        let previous_geometry = (
+            *frame.root_window().bounds(),
+            frame.menu_bar_height,
+            frame.tool_bar_height,
+            frame.compact_bar_height,
+        );
         // A shown GUI frame realizes its menu/tab/tool bars into the frame's
         // top margin (GNU's FRAME_TOP_MARGIN), so the window text area — and
         // the windows' tab/header lines — must sit below them.  The reused
@@ -3856,13 +3905,25 @@ fn sync_selected_gui_chrome_state(eval: &mut Context) {
         } else {
             GuiBarPresentation::Separate
         });
-        geometry_hints = Some((frame.id, frame.gui_geometry_hints()));
+        let geometry_changed = previous_geometry
+            != (
+                *frame.root_window().bounds(),
+                frame.menu_bar_height,
+                frame.tool_bar_height,
+                frame.compact_bar_height,
+            );
+        geometry_hints = Some((frame.id, frame.gui_geometry_hints(), geometry_changed));
     }
 
-    if let Some((frame_id, hints)) = geometry_hints
-        && let Some(host) = eval.display_host.as_mut()
-    {
-        let _ = host.set_gui_frame_geometry_hints(frame_id, hints);
+    if let Some((frame_id, hints, geometry_changed)) = geometry_hints {
+        if geometry_changed {
+            // GNU bar-height changes adjust matrices after reflow. An unchanged
+            // chrome sync must not consume a pending unused-font opening.
+            neovm_core::emacs_core::window_cmds::adjust_frame_glyph_matrices(eval, frame_id);
+        }
+        if let Some(host) = eval.display_host.as_mut() {
+            let _ = host.set_gui_frame_geometry_hints(frame_id, hints);
+        }
     }
 }
 
@@ -4420,6 +4481,9 @@ fn run_gui_evaluator_worker(
     };
     if startup.daemon.is_none() {
         evaluator.initialize_graphical_terminal(identity.clone());
+        // Seed after loading the image, on its Lisp owner thread. GNU's
+        // handle-args can still replace this with an explicit -d/--display.
+        evaluator.set_variable("x-display-name", Value::string(identity.terminal_name()));
     }
     let font_display = identity.clone();
     evaluator.set_variable("dump-mode", Value::NIL);
@@ -4477,6 +4541,10 @@ fn run_gui_evaluator_worker(
             pending_position: None,
         }),
         last_window_titles: Mutex::new(HashMap::new()),
+        display_identity: match &bootstrap_display.kind {
+            BootstrapDisplayKind::Gui { identity, .. } => Some(identity.clone()),
+            BootstrapDisplayKind::Tty { .. } => None,
+        },
         font_metrics: None,
         font_entities: FontEntityCatalog::default(),
         primary_window_size: Arc::clone(&primary_window_size),
@@ -4544,7 +4612,13 @@ fn run_gui_evaluator_worker(
     )));
     install_diagnostics_eval_hooks(&mut evaluator);
 
-    frame_layout::configure_gui_runtime(bootstrap_display.font_sizing());
+    frame_layout::configure_gui_runtime(
+        bootstrap_display.font_sizing(),
+        match &bootstrap_display.kind {
+            BootstrapDisplayKind::Gui { identity, .. } => Some(identity.clone()),
+            BootstrapDisplayKind::Tty { .. } => None,
+        },
+    );
     let preview_tx = emacs_comms.cmd_tx.clone();
     let preview_waker = render_waker.clone();
     evaluator.scroll_preview_fn = Some(Box::new(move |eval, frame, window, inputs| {
@@ -5006,9 +5080,6 @@ pub fn run(mode: RuntimeMode) {
     // from a graphical session, retain native hosting on the OS main thread;
     // the existing startup lifecycle waits without creating a window until
     // Lisp receives the first graphical frame request.
-    let inherited_display = ["WAYLAND_DISPLAY", "DISPLAY"]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
     let gui_connection = if startup.frontend == FrontendKind::Gui {
         let system_name = graphical_system_name();
         Some(
@@ -5026,7 +5097,10 @@ pub fn run(mode: RuntimeMode) {
                 }
             },
         )
-    } else if startup.daemon.is_some() && !startup.noninteractive && inherited_display {
+    } else if startup.daemon.is_some()
+        && !startup.noninteractive
+        && neomacs_display_runtime::display_identity::should_open_daemon_gui_host()
+    {
         let system_name = graphical_system_name();
         match neomacs_display_runtime::render_thread::open_gui_connection_host(&system_name) {
             Ok(host) => match finish_gui_connection(interactivity, &host) {
@@ -5931,6 +6005,10 @@ fn bootstrap_buffers_with_font(
         }
     }
     eval.create_window_markers_for_minibuffer(frame_id, mini_id);
+    if display.frontend() == FrontendKind::Gui {
+        // Startup has now finalized the font and root/minibuffer geometry.
+        neovm_core::emacs_core::window_cmds::adjust_frame_glyph_matrices(eval, frame_id);
+    }
 
     BootstrapResult {
         scratch_id,

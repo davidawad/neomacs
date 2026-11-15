@@ -103,6 +103,10 @@ mod emacs_core_runtime_eval_tests_gc_tls_migration_proofs_test_rs;
 mod emacs_core_lisp_native_builtins_tests_builtins_test_rs;
 
 #[cfg(test)]
+#[path = "emacs_core/lisp/native/builtins/tests/get_internal_run_time_test.rs"]
+mod emacs_core_lisp_native_builtins_tests_get_internal_run_time_test_rs;
+
+#[cfg(test)]
 #[path = "emacs_core/lisp/native/builtins/tests/random_seed_test.rs"]
 mod emacs_core_lisp_native_builtins_tests_random_seed_test_rs;
 
@@ -323,6 +327,11 @@ mod emacs_core_lisp_print_tests_graph_tail_units_rs;
 #[cfg(test)]
 #[path = "emacs_core/lisp/print/tests/printer_quit_units.rs"]
 mod emacs_core_lisp_print_tests_printer_quit_units_rs;
+// Re-homed print-circle candidate test: the fixture round-trips through
+// `read`, a core-owned reader command.
+#[cfg(test)]
+#[path = "emacs_core/lisp/print/tests/print_circle_candidate_runtime_test.rs"]
+mod emacs_core_lisp_print_tests_print_circle_candidate_runtime_test_rs;
 
 // Remaining printer re-homes of the same P1 EVAL wave F1 batch (boot/oracle
 // helpers live in this crate).  Bodies byte-identical; only use paths and
@@ -430,6 +439,12 @@ mod emacs_core_runtime_bytecode_tests_vm_window_surface_test_rs;
 #[cfg(test)]
 #[path = "emacs_core/runtime/bytecode/tests/vm_display_host_test.rs"]
 mod emacs_core_runtime_bytecode_tests_vm_display_host_test_rs;
+// VM tests for vertical-motion over display-resolved rows: eval's unit
+// runtime has no window geometry, so the rows cannot fold there. Assertions
+// are unchanged; the plain-text tail of vm_motion_builtins stays in eval.
+#[cfg(test)]
+#[path = "emacs_core/runtime/bytecode/tests/vm_display_motion_test.rs"]
+mod emacs_core_runtime_bytecode_tests_vm_display_motion_test_rs;
 
 // VM tests whose harness is the runtime-startup image. The canonical hook
 // proof is minted in core. The lexical-binding macroexpand test writes
@@ -540,6 +555,13 @@ mod emacs_core_runtime_bytecode_tests_decode_test_rs;
 #[cfg(test)]
 #[path = "emacs_core/runtime/eval/tests/green_p15_condition_wait_test.rs"]
 mod emacs_core_runtime_eval_tests_green_p15_condition_wait_test_rs;
+// A green thread's face and display changes must reach the main thread:
+// internal-make-lisp-face and internal-set-lisp-face-attribute are
+// display-owned subrs, so the row runs against core's canonical face
+// install. Assertions are unchanged.
+#[cfg(test)]
+#[path = "emacs_core/runtime/eval/tests/green_face_display_test.rs"]
+mod emacs_core_runtime_eval_tests_green_face_display_test_rs;
 #[cfg(test)]
 #[path = "emacs_core/runtime/eval/tier_i/tests/list_bindings_test.rs"]
 mod emacs_core_runtime_eval_tier_i_tests_list_bindings_test_rs;
@@ -670,6 +692,10 @@ mod emacs_core_lisp_native_builtins_tests_positioned_final_boundaries_class_b_te
 mod emacs_core_runtime_eval_tests_green_switch_class_b_test_rs;
 
 #[cfg(test)]
+#[path = "emacs_core/runtime/eval/tests/green_thread_buffer_test.rs"]
+mod emacs_core_runtime_eval_tests_green_thread_buffer_test_rs;
+
+#[cfg(test)]
 #[path = "emacs_core/runtime/eval/keyboard/tests/display_service_class_b_test.rs"]
 mod emacs_core_runtime_eval_keyboard_tests_display_service_class_b_test_rs;
 
@@ -683,9 +709,17 @@ mod emacs_core_runtime_jit_compile_tests_load_containment_class_b_test_rs;
 #[path = "emacs_core/runtime/jit/tests/green_release_class_b_test.rs"]
 mod emacs_core_runtime_jit_tests_green_release_class_b_test_rs;
 
-#[cfg(test)]
+#[path = "emacs_core/runtime/bytecode/tests/vm_reader_message_runtime_test.rs"]
+mod emacs_core_runtime_bytecode_tests_vm_reader_message_runtime_test_rs;
+#[path = "emacs_core/runtime/bytecode/tests/vm_replace_region_runtime_test.rs"]
+mod emacs_core_runtime_bytecode_tests_vm_replace_region_runtime_test_rs;
 #[path = "emacs_core/runtime/bytecode/tests/vm_shared_runtime_test.rs"]
 mod emacs_core_runtime_bytecode_tests_vm_shared_runtime_test_rs;
+#[cfg(test)]
+#[path = "emacs_core/runtime/bytecode/tests/vm_syntax_motion_runtime_test.rs"]
+mod emacs_core_runtime_bytecode_tests_vm_syntax_motion_runtime_test_rs;
+#[path = "emacs_core/runtime/bytecode/tests/vm_time_builtins_runtime_test.rs"]
+mod emacs_core_runtime_bytecode_tests_vm_time_builtins_runtime_test_rs;
 
 #[cfg(all(test, feature = "sqlite"))]
 #[path = "emacs_core/runtime/eval/tests/sqlite_runtime_feature_test.rs"]

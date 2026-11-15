@@ -456,13 +456,20 @@ pub(crate) fn update_auto_hscroll_before_redisplay(ctx: &mut Context) {
                     }
                 };
 
-            let window_height = window.bounds().height;
+            let visible_lines = if frame.effective_window_system().is_some() {
+                window
+                    .display()
+                    .and_then(|display| display.glyph_matrix_row_scale.allocated_rows())
+                    .unwrap_or(0)
+                    .min(i64::MAX as usize) as i64
+            } else {
+                ((window.bounds().height / char_height.max(1.0)).floor() as i64).max(1)
+            };
             let gutter_cols = match ctx.edit.buffers.get(buffer_id) {
                 Some(buf) => crate::emacs_core::xdisp::line_number_gutter_cols(
                     buf,
                     ctx.variables(),
-                    window_height,
-                    char_height,
+                    visible_lines,
                     window.window_start().unwrap_or(point_lisp),
                     point_byte,
                     body_cols,

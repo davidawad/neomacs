@@ -355,6 +355,14 @@ pub struct WindowParams {
     pub char_height: f32,
     /// Whether the containing frame is a real window-system frame.
     pub window_system: bool,
+    /// GNU desired-matrix row scale owned by this live window.
+    pub glyph_matrix_row_scale: std::num::NonZeroU32,
+    pub glyph_matrix_rows: Option<usize>,
+    /// Captured display-connection minimum, shared by capacity and freshness.
+    /// `None` on frames without a graphical connection: GNU's
+    /// `required_matrix_height` then uses `WINDOW_TOTAL_LINES`, never a
+    /// pixel division by a sentinel font height (src/dispnew.c:1758).
+    pub smallest_opened_font_height: Option<u32>,
     /// Font pixel size
     pub font_pixel_size: f32,
     /// Immutable GNU image-scaling facts inherited from the containing frame.

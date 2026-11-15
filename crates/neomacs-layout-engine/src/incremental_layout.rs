@@ -205,6 +205,12 @@ pub struct RetainedWindowKey {
     pub tab_width: i32,
     pub char_width: f32,
     pub char_height: f32,
+    /// Graphical-connection font minimum; `None` when the frame has no
+    /// graphical connection (GNU `FRAME_SMALLEST_FONT_HEIGHT` exists only for
+    /// window-system displays, src/frame.h:1831).
+    pub smallest_opened_font_height: Option<u32>,
+    pub glyph_matrix_row_scale: std::num::NonZeroU32,
+    pub glyph_matrix_rows: Option<usize>,
     pub font_pixel_size: f32,
     // --- Additional layout-affecting inputs (adversarial-review fixes). These
     // are read fresh from buffer-locals / window state each frame but do NOT
@@ -356,6 +362,9 @@ impl RetainedWindowKey {
             tab_width: p.tab_width,
             char_width: p.char_width,
             char_height: p.char_height,
+            smallest_opened_font_height: p.smallest_opened_font_height,
+            glyph_matrix_row_scale: p.glyph_matrix_row_scale,
+            glyph_matrix_rows: p.glyph_matrix_rows,
             font_pixel_size: p.font_pixel_size,
             tab_stop_list: p.tab_stop_list.clone(),
             extra_line_spacing: p.extra_line_spacing,
@@ -509,6 +518,9 @@ impl RetainedWindowKey {
             tab_width,
             char_width,
             char_height,
+            smallest_opened_font_height,
+            glyph_matrix_row_scale,
+            glyph_matrix_rows,
             font_pixel_size,
             tab_stop_list,
             extra_line_spacing,

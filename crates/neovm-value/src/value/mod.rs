@@ -4491,6 +4491,12 @@ impl TaggedValue {
         let delta = value.wrapping_sub(Self::memory_use_count(counter));
         add_wrapping(counter, delta as u64);
     }
+
+    /// Return the live cons-cell count for `(garbage-collect)` statistics.
+    #[doc(hidden)]
+    pub fn cons_live_count_snapshot() -> i64 {
+        with_tagged_heap(|heap| heap.cons_live_count_exact() as i64)
+    }
 }
 
 // ---------------------------------------------------------------------------

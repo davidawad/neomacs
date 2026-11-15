@@ -96,14 +96,6 @@ const BATCHES: &[BatchDef] = &[
         event_id: Some("eval.lcms"),
     },
     BatchDef {
-        module: "crate::emacs_core::composite",
-        key: "composite",
-        file: "crates/neovm-core/src/emacs_core/composite/subrs.rs",
-        base_cfg: "always",
-        unlisted_layer: None,
-        event_id: None,
-    },
-    BatchDef {
         module: "crate::emacs_core::neo::terminal",
         key: "terminal",
         file: "crates/neovm-display/src/emacs_core/display/neo/terminal/subrs.rs",
@@ -131,14 +123,6 @@ const BATCHES: &[BatchDef] = &[
         module: "crate::emacs_core::xwidget",
         key: "xwidget",
         file: "crates/neovm-display/src/emacs_core/display/xwidget/subrs.rs",
-        base_cfg: "always",
-        unlisted_layer: None,
-        event_id: None,
-    },
-    BatchDef {
-        module: "crate::emacs_core::indent",
-        key: "indent",
-        file: "crates/neovm-core/src/emacs_core/indent/subrs.rs",
         base_cfg: "always",
         unlisted_layer: None,
         event_id: None,
@@ -2386,8 +2370,8 @@ mod provider_tests {
             (
                 "command-modes",
                 "COMMAND_MODES_SUBR",
-                "get-byte",
-                "find-charset-region",
+                "char-after",
+                "new-fontset",
                 1,
                 Some(1),
             ),
@@ -2504,8 +2488,8 @@ mod provider_tests {
             direct.iter().filter(|spec| spec.name == "identity").count(),
             1
         );
-        assert_eq!(direct[index - 1].name, "string");
-        assert_eq!(direct[index + 1].name, "ngettext");
+        assert_eq!(direct[index - 1].name, "expt");
+        assert_eq!(direct[index + 1].name, "propertize");
         assert_eq!(
             (
                 direct[index].min,
@@ -2544,8 +2528,8 @@ mod provider_tests {
             direct.iter().filter(|spec| spec.name == "reverse").count(),
             1
         );
-        assert_eq!(direct[index - 1].name, "cl-type-of");
-        assert_eq!(direct[index + 1].name, "copy-alist");
+        assert_eq!(direct[index - 1].name, "bufferp");
+        assert_eq!(direct[index + 1].name, "make-list");
         assert_eq!(
             (
                 direct[index].min,
@@ -2577,7 +2561,7 @@ mod provider_tests {
             .collect();
         let index = direct.iter().position(|spec| spec.name == "subrp").unwrap();
         assert_eq!(direct.iter().filter(|spec| spec.name == "subrp").count(), 1);
-        assert_eq!(direct[index - 1].name, "buffer-substring-no-properties");
+        assert_eq!(direct[index - 1].name, "upcase-initials-region");
         assert_eq!(direct[index + 1].name, "*");
         assert_eq!(
             (
@@ -2620,7 +2604,7 @@ mod provider_tests {
                 .count(),
             1
         );
-        assert_eq!(direct[index - 1].name, "clrhash");
+        assert_eq!(direct[index - 1].name, "string-to-unibyte");
         assert_eq!(direct[index + 1].name, "float");
         assert_eq!(
             (
@@ -2662,7 +2646,7 @@ mod provider_tests {
                 .count(),
             1
         );
-        assert_eq!(direct[index - 1].name, "string-make-unibyte");
+        assert_eq!(direct[index - 1].name, "number-to-string");
         assert_eq!(direct[index + 1].name, "string-to-unibyte");
         assert_eq!(
             (
@@ -2701,8 +2685,8 @@ mod provider_tests {
             direct.iter().filter(|spec| spec.name == "bufferp").count(),
             1
         );
-        assert_eq!(direct[index - 1].name, "hash-table-p");
-        assert_eq!(direct[index + 1].name, "sequencep");
+        assert_eq!(direct[index - 1].name, "ash");
+        assert_eq!(direct[index + 1].name, "reverse");
         assert_eq!(
             (
                 direct[index].min,
@@ -2744,7 +2728,7 @@ mod provider_tests {
             1
         );
         assert_eq!(direct[index - 1].name, "unibyte-string");
-        assert_eq!(direct[index + 1].name, "char-to-string");
+        assert_eq!(direct[index + 1].name, "string-to-multibyte");
         assert_eq!(
             (
                 direct[index].min,
@@ -2778,7 +2762,7 @@ mod provider_tests {
                 .count(),
             1
         );
-        assert_eq!(direct[index - 1].name, "safe-length");
+        assert_eq!(direct[index - 1].name, "make-list");
         assert_eq!(direct[index + 1].name, "concat");
         assert_eq!(
             (
@@ -2822,7 +2806,7 @@ mod provider_tests {
             1
         );
         assert_eq!(direct[index - 1].name, "get-buffer");
-        assert_eq!(direct[index + 1].name, "find-buffer");
+        assert_eq!(direct[index + 1].name, "get-file-buffer");
         assert_eq!(
             (
                 direct[index].min,
@@ -2838,6 +2822,38 @@ mod provider_tests {
         assert_eq!(
             (home.module.as_str(), home.static_ident.as_str()),
             ("misc_eval", "MAKE_INDIRECT_BUFFER_SUBR")
+        );
+    }
+
+    #[test]
+    fn core_sleep_for_source_resolves_the_single_production_descriptor() {
+        const CALL: &str = "neovm_eval::emacs_core::builtins::misc_eval::SLEEP_FOR_SUBR";
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(read(&root, CORE_MANIFEST).unwrap().matches(CALL).count(), 1);
+        let (events, _) = manifest_events(&root).unwrap();
+        let direct: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Direct { spec, .. } => Some(spec),
+                _ => None,
+            })
+            .collect();
+        let hits: Vec<_> = direct
+            .iter()
+            .filter(|spec| spec.name == "sleep-for")
+            .collect();
+        assert_eq!(hits.len(), 1, "sleep-for direct declaration multiplicity");
+        assert_eq!(
+            (hits[0].min, hits[0].max, hits[0].cfg.as_str()),
+            (1, Some(2), "always")
+        );
+        let home = hits[0]
+            .static_home
+            .as_ref()
+            .expect("real sleep-for static source home");
+        assert_eq!(
+            (home.module.as_str(), home.static_ident.as_str()),
+            ("misc_eval", "SLEEP_FOR_SUBR")
         );
     }
 }
