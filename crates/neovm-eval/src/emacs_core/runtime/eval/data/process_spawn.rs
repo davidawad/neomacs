@@ -82,7 +82,7 @@ pub struct SpawnedChild {
 pub enum ChildBackend {
     /// Reaped with `waitpid`; `status` caches the exit once collected so a
     /// later `kill` can never signal a reused pid.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
     Pid {
         status: Option<ExitStatus>,
     },

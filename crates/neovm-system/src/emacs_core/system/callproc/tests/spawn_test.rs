@@ -77,12 +77,32 @@ fn forking_command_keeps_the_session_isolation() {
 }
 
 #[test]
-fn glibc_linux_spawns_without_forking() {
+fn glibc_linux_and_macos_spawn_without_forking() {
     assert_eq!(
         ChildCommand::uses_posix_spawn(),
-        cfg!(all(target_os = "linux", target_env = "gnu")),
+        cfg!(any(
+            all(target_os = "linux", target_env = "gnu"),
+            target_os = "macos"
+        )),
         "posix_spawn engine selection must follow the platform gate"
     );
+}
+
+/// The gate and the engine that actually ran agree: a `posix_spawn` child
+/// is pid-backed, a forked one is a `std::process::Child`.
+#[test]
+fn spawn_takes_the_engine_the_gate_selects() {
+    use neovm_eval::emacs_core::eval::data::process_spawn::ChildBackend;
+
+    let mut child = sh("exit 0")
+        .stdin(ChildStdio::Null)
+        .stdout(ChildStdio::Null)
+        .stderr(ChildStdio::Null)
+        .spawn()
+        .expect("spawn child");
+    let forked = matches!(child.backend, ChildBackend::Std(_));
+    child.wait().expect("wait child");
+    assert_eq!(!forked, ChildCommand::uses_posix_spawn());
 }
 
 #[test]
@@ -177,7 +197,7 @@ fn interruptible_output_reaps_the_exact_child_even_without_open_output_pipes() {
 /// nap after the pipes closed charged every `call-process` its full length
 /// (magit-status ran ~23 of them per refresh, 10 ms each).
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn exit_wake_fd_becomes_readable_when_the_child_exits() {
     use std::os::fd::AsRawFd;
 
@@ -197,11 +217,33 @@ fn exit_wake_fd_becomes_readable_when_the_child_exits() {
         .spawn()
         .expect("spawn cat");
     assert!(child.try_wait().expect("try_wait").is_none());
-    let exit = super::exit_wake_fd(&child).expect("pidfd for an unreaped child");
+    let exit = super::exit_wake_fd(&child).expect("exit descriptor for an unreaped child");
     assert_eq!(poll(exit.as_raw_fd(), 0), 0, "cat is still running");
     drop(child.stdin.take());
     assert_eq!(poll(exit.as_raw_fd(), 10_000), 1, "exit wakes the poll");
+    // A pidfd turns readable only once the child is waitable.
+    #[cfg(target_os = "linux")]
     assert!(child.try_wait().expect("try_wait").unwrap().success());
+    // XNU posts NOTE_EXIT a moment before the child is waitable.
+    #[cfg(target_os = "macos")]
+    assert!(child.wait().expect("wait").success());
+}
+
+/// The wait reports a fired exit descriptor, so the caller can stop polling
+/// one that stays readable (a kqueue keeps its event pending) instead of
+/// spinning until the child is waitable.
+#[test]
+#[cfg(unix)]
+fn wait_for_exit_or_wake_reports_whether_the_exit_fired() {
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let exit = OwnedFd::from(reader);
+    assert!(!super::wait_for_exit_or_wake(Some(&exit), None, 0).expect("idle poll"));
+    writer.write_all(b"x").expect("write");
+    assert!(super::wait_for_exit_or_wake(Some(&exit), None, 0).expect("ready poll"));
+    assert!(!super::wait_for_exit_or_wake(None, None, 0).expect("no descriptor"));
 }
 
 #[test]

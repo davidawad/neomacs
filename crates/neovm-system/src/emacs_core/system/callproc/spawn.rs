@@ -23,11 +23,11 @@
 //! `posix_spawn` shares the address space until `exec` (`CLONE_VM |
 //! CLONE_VFORK`) and costs tens of microseconds regardless of heap size.
 //!
-//! The platform split is resolved ONCE here.  glibc Linux takes the
-//! `posix_spawn` engine; every other platform keeps `std::process::Command`
-//! with the same session isolation applied by
-//! [`super::isolate_child_command`].  Pseudoterminal children need post-fork
-//! setup `posix_spawn` cannot express, so they take
+//! The platform split is resolved ONCE here.  glibc Linux and macOS take the
+//! `posix_spawn` engine (GNU's `USABLE_POSIX_SPAWN` holds on both); every
+//! other platform keeps `std::process::Command` with the same session
+//! isolation applied by [`super::isolate_child_command`].  Pseudoterminal
+//! children need post-fork setup `posix_spawn` cannot express, so they take
 //! [`ChildCommand::into_forking_command`] -- GNU's `vfork` fallback.
 
 use std::collections::BTreeMap;
@@ -221,10 +221,10 @@ impl ChildCommand {
         self.spawn_with(stdin, stdout, stderr)?.wait_with_output()
     }
 
-    /// The `posix_spawn` engine needs `POSIX_SPAWN_SETSID` (glibc 2.26) and
-    /// `posix_spawn_file_actions_addchdir_np` (glibc 2.29).  GNU gates the
-    /// same way (`USABLE_POSIX_SPAWN`).
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    /// The `posix_spawn` engine needs `POSIX_SPAWN_SETSID` (glibc 2.26,
+    /// macOS 10.15) and `posix_spawn_file_actions_addchdir_np` (glibc 2.29,
+    /// macOS 10.15).  GNU gates the same way (`USABLE_POSIX_SPAWN`).
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
     fn spawn_with(
         &self,
         stdin: ChildStdio,
@@ -237,7 +237,7 @@ impl ChildCommand {
 
     /// Elsewhere the child forks through `std::process::Command`, with the
     /// same session isolation applied in the forked child.
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
     fn spawn_with(
         &self,
         stdin: ChildStdio,
@@ -287,7 +287,10 @@ impl ChildCommand {
     /// Whether spawning goes through `posix_spawn` on this platform.
     #[cfg(test)]
     pub(crate) fn uses_posix_spawn() -> bool {
-        cfg!(all(target_os = "linux", target_env = "gnu"))
+        cfg!(any(
+            all(target_os = "linux", target_env = "gnu"),
+            target_os = "macos"
+        ))
     }
 }
 
@@ -319,7 +322,7 @@ pub(crate) trait SpawnedChildIo {
 impl SpawnedChildIo for SpawnedChild {
     fn wait(&mut self) -> io::Result<ExitStatus> {
         let result = match &mut self.backend {
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
             ChildBackend::Pid { status } => {
                 if let Some(status) = status {
                     return Ok(*status);
@@ -337,7 +340,7 @@ impl SpawnedChildIo for SpawnedChild {
     #[cfg_attr(unix, allow(dead_code))]
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let result = match &mut self.backend {
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
             ChildBackend::Pid { status } => {
                 if status.is_some() {
                     return Ok(*status);
@@ -372,7 +375,7 @@ impl SpawnedChildIo for SpawnedChild {
             }
         }
         match &mut self.backend {
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
             ChildBackend::Pid { status } => {
                 if status.is_some() {
                     return Ok(());
@@ -422,7 +425,13 @@ impl SpawnedChildIo for SpawnedChild {
                     nap = (nap * 2).min(10);
                     timeout
                 };
-                wait_for_exit_or_wake(exit.as_ref(), wake, timeout)?;
+                if wait_for_exit_or_wake(exit.as_ref(), wake, timeout)? {
+                    // The exit was posted.  A kqueue stays readable until its
+                    // event is read, and XNU posts NOTE_EXIT a moment before
+                    // the child is waitable: polling it again would spin
+                    // through that window, so nap from here on.
+                    *exit = None;
+                }
             };
             Ok(Output {
                 status,
@@ -465,7 +474,7 @@ fn revoke_lost_child<T>(child: &mut SpawnedChild, result: &io::Result<T>) {
 
 /// A descriptor that becomes readable when this child exits. Opened only
 /// after a WNOHANG probe found the child unreaped, so the PID still names
-/// it; `None` (no pidfd support, or ownership already lost) makes the
+/// it; `None` (no kernel support, or ownership already lost) makes the
 /// caller fall back to short naps.
 #[cfg(target_os = "linux")]
 fn exit_wake_fd(child: &SpawnedChild) -> Option<std::os::fd::OwnedFd> {
@@ -480,7 +489,61 @@ fn exit_wake_fd(child: &SpawnedChild) -> Option<std::os::fd::OwnedFd> {
     (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as libc::c_int) })
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// macOS has no pidfd: a one-shot kqueue watching `EVFILT_PROC`/`NOTE_EXIT`
+/// on the pid, the source `process::sys::child_exit_event` already uses for
+/// deleted children.  A kqueue descriptor polls readable while an event is
+/// pending and is never drained here.  XNU posts `NOTE_EXIT` a moment before
+/// the child becomes waitable, so the caller polls it once and naps after
+/// that wake.  `ESRCH` (the exit already passed) yields `None`, and that
+/// probe reaps it.
+#[cfg(target_os = "macos")]
+fn exit_wake_fd(child: &SpawnedChild) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    if !child.signal_authority {
+        return None;
+    }
+    // SAFETY: kqueue takes no arguments and returns a fresh descriptor.
+    let queue = unsafe { libc::kqueue() };
+    if queue < 0 {
+        return None;
+    }
+    // SAFETY: kqueue returned a fresh descriptor owned here.
+    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+    // SAFETY: the queue is live; F_SETFD takes an integer flag argument.
+    if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return None;
+    }
+    let change = libc::kevent {
+        ident: child.pid as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    loop {
+        // SAFETY: one initialized change; no output events requested.
+        let registered = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if registered >= 0 {
+            return Some(queue);
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn exit_wake_fd(_child: &SpawnedChild) -> Option<std::os::fd::OwnedFd> {
     None
 }
@@ -557,14 +620,15 @@ fn drain_pipes_with_attention(
 }
 
 /// Block until the child's exit descriptor or the evaluator's signal wake is
-/// readable, or `timeout` milliseconds pass. An interrupted poll returns so
-/// the caller re-services attention.
+/// readable, or `timeout` milliseconds pass, and report whether the exit
+/// descriptor fired. An interrupted poll returns so the caller re-services
+/// attention.
 #[cfg(unix)]
 fn wait_for_exit_or_wake(
     exit: Option<&std::os::fd::OwnedFd>,
     wake: Option<libc::c_int>,
     timeout: libc::c_int,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
     let mut fds: Vec<libc::pollfd> = exit
         .map(AsRawFd::as_raw_fd)
@@ -580,7 +644,7 @@ fn wait_for_exit_or_wake(
     if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::Interrupted {
-            return Ok(());
+            return Ok(false);
         }
         return Err(error);
     }
@@ -589,7 +653,7 @@ fn wait_for_exit_or_wake(
     {
         crate::emacs_core::os_signal::drain_wake_pipe(fd);
     }
-    Ok(())
+    Ok(exit.is_some() && fds[0].revents != 0)
 }
 
 #[cfg(unix)]
@@ -649,7 +713,7 @@ fn drain_pipes(stdout: Option<File>, stderr: Option<File>) -> io::Result<(Vec<u8
     Ok((out, err))
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
 mod posix {
     //! The `posix_spawn` engine and the pid-based waiting its children use.
 
@@ -763,6 +827,7 @@ mod posix {
             })
         }
 
+        #[cfg(target_os = "linux")]
         fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
             let mut fds: [libc::c_int; 2] = [-1, -1];
             // SAFETY: `fds` is a valid two-element out array.
@@ -772,6 +837,27 @@ mod posix {
             // SAFETY: `pipe2` succeeded, so both descriptors are open and owned
             // by nothing else.
             Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+        }
+
+        /// macOS has no `pipe2`: `pipe`, then `FD_CLOEXEC` on both ends, as
+        /// `std::process` does there.
+        #[cfg(target_os = "macos")]
+        fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+            let mut fds: [libc::c_int; 2] = [-1, -1];
+            // SAFETY: `fds` is a valid two-element out array.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `pipe` succeeded, so both descriptors are open and owned
+            // by nothing else.
+            let ends = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            for end in [&ends.0, &ends.1] {
+                // SAFETY: the descriptor is live; F_SETFD takes an integer flag.
+                if unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(ends)
         }
 
         fn c_string(value: &OsStr, what: &str) -> io::Result<CString> {
@@ -827,7 +913,7 @@ mod posix {
                 // SAFETY: `dir` is a valid NUL-terminated C string that outlives
                 // the spawn.
                 check(unsafe {
-                    libc::posix_spawn_file_actions_addchdir_np(&mut self.0, dir.as_ptr())
+                    sys::posix_spawn_file_actions_addchdir_np(&mut self.0, dir.as_ptr())
                 })
             }
         }
@@ -847,14 +933,15 @@ mod posix {
         impl Attributes {
             /// GNU `emacs_posix_spawn_init_attributes`: own session, default
             /// dispositions for the signals the editor ignores (SIGINT, SIGQUIT,
-            /// SIGPIPE, SIGPROF), and an empty signal mask in the child.
+            /// SIGPIPE, SIGPROF, and SIGCHLD on macOS), and an empty signal
+            /// mask in the child.
             fn gnu() -> io::Result<Self> {
                 let mut attributes = std::mem::MaybeUninit::<libc::posix_spawnattr_t>::uninit();
                 // SAFETY: `init` fully initializes the out-pointer on success.
                 check(unsafe { libc::posix_spawnattr_init(attributes.as_mut_ptr()) })?;
                 // SAFETY: initialized just above.
                 let mut this = Self(unsafe { attributes.assume_init() });
-                let flags = libc::POSIX_SPAWN_SETSID as libc::c_int
+                let flags = sys::POSIX_SPAWN_SETSID as libc::c_int
                     | libc::POSIX_SPAWN_SETSIGDEF
                     | libc::POSIX_SPAWN_SETSIGMASK;
                 // SAFETY: FFI on an initialized attributes object.
@@ -871,6 +958,10 @@ mod posix {
                     for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGPIPE, libc::SIGPROF] {
                         libc::sigaddset(defaults.as_mut_ptr(), signal);
                     }
+                    // GNU's `DARWIN_OS` workaround: macOS was seen delivering
+                    // SIGCHLD to the spawned child instead of its parent.
+                    #[cfg(target_os = "macos")]
+                    libc::sigaddset(defaults.as_mut_ptr(), libc::SIGCHLD);
                     libc::sigemptyset(empty.as_mut_ptr());
                     check(libc::posix_spawnattr_setsigdefault(
                         &mut this.0,
@@ -891,6 +982,26 @@ mod posix {
                 unsafe {
                     libc::posix_spawnattr_destroy(&mut self.0);
                 }
+            }
+        }
+
+        /// The two session/chdir symbols, which the `libc` crate exports for
+        /// glibc but not for Apple targets.
+        mod sys {
+            #[cfg(target_os = "linux")]
+            pub(super) use libc::{POSIX_SPAWN_SETSID, posix_spawn_file_actions_addchdir_np};
+
+            /// `<sys/spawn.h>`: `#define POSIX_SPAWN_SETSID 0x0400`.
+            #[cfg(target_os = "macos")]
+            pub(super) const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
+
+            #[cfg(target_os = "macos")]
+            unsafe extern "C" {
+                /// `<spawn.h>`, macOS 10.15 and later.
+                pub(super) fn posix_spawn_file_actions_addchdir_np(
+                    actions: *mut libc::posix_spawn_file_actions_t,
+                    path: *const libc::c_char,
+                ) -> libc::c_int;
             }
         }
 
