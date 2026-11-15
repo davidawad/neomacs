@@ -781,7 +781,8 @@ pub mod terminal_signal_observer {
                         record.len() - written,
                     )
                 };
-                if count < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                if count < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                {
                     continue;
                 }
                 if count <= 0 {
