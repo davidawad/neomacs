@@ -3586,6 +3586,337 @@ fn process_exit_status_initial() {
     assert_eq!(results[1], "OK 0");
 }
 
+/// Spawn `sh -c SCRIPT` on a pty and collect everything it writes there,
+/// with the slave's path and device number.
+#[cfg(target_os = "linux")]
+fn run_on_pty(script: &str) -> (Vec<u8>, std::path::PathBuf, u64) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let sh = find_bin("sh");
+    let mut processes = ProcessManager::new();
+    let id = processes.create_process_lisp(
+        LispString::from_utf8("pty-spawn"),
+        Value::NIL,
+        LispString::from_utf8(&sh),
+        vec![LispString::from_utf8("-c"), LispString::from_utf8(script)],
+        crate::emacs_core::process::ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    processes.spawn_child(id, true).expect("spawn pty child");
+    let proc = processes.get(id).expect("process record");
+    let slave = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        proc.tty_name
+            .as_lisp_string()
+            .expect("pty child has a tty name")
+            .as_bytes(),
+    ));
+    // While the master is open: the slave goes away with it.
+    let rdev = std::fs::metadata(&slave).expect("stat slave").rdev();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut output = Vec::new();
+    while Instant::now() < deadline && !output.ends_with(b"END\n") {
+        if let Some(run) = processes.read_process_output_without_decoding(
+            id,
+            ProcessOutputDestination::to_filter(),
+            &neovm_text::emacs_core::coding::CodingSystemManager::new(),
+        ) {
+            output.extend_from_slice(run.undecoded_bytes());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    processes.kill_process(id);
+    (output, slave, rdev)
+}
+
+/// `tty_nr` as `/proc/PID/stat` encodes it (`new_encode_dev`).
+#[cfg(target_os = "linux")]
+fn proc_stat_tty_nr(rdev: u64) -> u64 {
+    let (major, minor) = (libc::major(rdev) as u64, libc::minor(rdev) as u64);
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
+/// GNU `create_process` with a pty (src/process.c): the child leads a new
+/// session whose controlling terminal is the pty slave, which is also its
+/// stdin, stdout and stderr; no descriptor the editor opened close-on-exec
+/// stays open and no pty master or slave sits above fd 2, no signal is
+/// blocked and none is ignored.
+///
+/// The shell reports on itself through `/proc/self` read by its builtins (a
+/// redirection or a glob runs in the shell, not in a child), so the numbers
+/// hold in whatever pid namespace `/proc` belongs to.
+#[cfg(target_os = "linux")]
+#[test]
+fn pty_child_leads_a_session_controlled_by_the_slave() {
+    crate::test_utils::init_test_tracing();
+    let _ctx = crate::test_utils::new_context();
+    let (output, slave, rdev) = run_on_pty(
+        "read -r stat < /proc/self/stat; echo \"$stat\"; \
+         for fd in /proc/self/fd/*; do \
+           printf '%s=%s ' \"${fd##*/}\" \"$(readlink /proc/self/fd/${fd##*/})\"; \
+         done; echo; \
+         for fd in 0 1 2; do readlink /proc/self/fd/$fd; done; \
+         while read -r line; do \
+           case $line in SigBlk:*|SigIgn:*) echo \"$line\";; esac; \
+         done < /proc/self/status; echo END",
+    );
+    let text = String::from_utf8(output).expect("utf-8 child report");
+    let mut lines = text.lines();
+
+    // `pid (comm) state ppid pgrp session tty_nr ...`
+    let stat = lines.next().expect("stat line");
+    let shell_pid: u32 = stat.split(' ').next().unwrap().parse().unwrap();
+    let after_comm = &stat[stat.rfind(')').expect("comm") + 2..];
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let (pgrp, session, tty_nr) = (
+        fields[2].parse::<u32>().unwrap(),
+        fields[3].parse::<u32>().unwrap(),
+        fields[4].parse::<u64>().unwrap(),
+    );
+    assert_eq!(session, shell_pid, "the child leads its own session");
+    assert_eq!(pgrp, shell_pid, "the child leads its own process group");
+    assert_eq!(
+        tty_nr,
+        proc_stat_tty_nr(rdev),
+        "the controlling terminal is the pty slave {}",
+        slave.display()
+    );
+
+    // Above 2, the child holds the descriptor its glob reads `/proc/self/fd`
+    // through (closed again by the time `readlink`, which inherits the
+    // others, reads its target), plus at most
+    // whatever the test runner handed this process without close-on-exec (a
+    // jobserver pipe, say), which any child may inherit.  Nothing else, and
+    // never a pty master or the slave, even one that lost close-on-exec.
+    // The glob sorts as strings ("10" before "2"), so sort by number.
+    let mut fds: Vec<(i32, &str)> = lines
+        .next()
+        .expect("fd list")
+        .split_whitespace()
+        .map(|entry| {
+            let (fd, target) = entry.split_once('=').expect("fd=target");
+            (fd.parse().unwrap(), target)
+        })
+        .collect();
+    fds.sort_unstable();
+    let numbers: Vec<i32> = fds.iter().map(|&(fd, _)| fd).collect();
+    assert_eq!(
+        &numbers[..3],
+        &[0, 1, 2],
+        "the standard descriptors are open"
+    );
+    for &(fd, target) in &fds[3..] {
+        assert!(
+            !target.contains("ptmx") && std::path::Path::new(target) != slave,
+            "fd {fd} -> {target} is a pty descriptor: {fds:?}"
+        );
+    }
+    let inherited_by_any_child = |fd: i32| {
+        // SAFETY: `F_GETFD` only reads this process's descriptor flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        flags >= 0 && flags & libc::FD_CLOEXEC == 0
+    };
+    let unexplained: Vec<i32> = numbers[3..]
+        .iter()
+        .copied()
+        .filter(|&fd| !inherited_by_any_child(fd))
+        .collect();
+    assert!(
+        unexplained.len() <= 1,
+        "only the glob's descriptor joins the inherited ones: {fds:?}"
+    );
+    for fd in 0..3 {
+        assert_eq!(
+            std::path::Path::new(lines.next().expect("fd target").trim()),
+            slave,
+            "fd {fd} is the pty slave"
+        );
+    }
+    for line in lines.by_ref().take(2) {
+        let (name, mask) = line.split_once(':').expect("signal mask line");
+        assert_eq!(
+            u64::from_str_radix(mask.trim(), 16).unwrap(),
+            0,
+            "{name}: the child starts with no blocked or ignored signal"
+        );
+    }
+    assert_eq!(lines.next(), Some("END"));
+}
+
+/// Pages of the stand-in editor heap in [`heap_rewrite_faults_after`].
+#[cfg(target_os = "linux")]
+const HEAP_PAGES: usize = 16 * 1024;
+
+/// Minor faults this thread takes rewriting a 64 MiB private heap after
+/// `start` ran.  A `fork` write-protects every private page of the parent,
+/// so after one the editor takes a fault per page it writes; `posix_spawn`
+/// (`CLONE_VM | CLONE_VFORK`) leaves the page tables alone.
+#[cfg(target_os = "linux")]
+fn heap_rewrite_faults_after(start: impl FnOnce()) -> u64 {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let len = HEAP_PAGES * page;
+    // SAFETY: a fresh private anonymous mapping, unmapped below.
+    let heap = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(heap, libc::MAP_FAILED);
+    // One fault per 4 KiB page, not per 2 MiB huge page.
+    // SAFETY: `heap` is the mapping of `len` bytes created above.
+    unsafe { libc::madvise(heap, len, libc::MADV_NOHUGEPAGE) };
+    let bytes = heap.cast::<u8>();
+    let touch = |value: u8| {
+        for index in 0..HEAP_PAGES {
+            // SAFETY: `index * page < len`, inside the mapping.
+            unsafe { bytes.add(index * page).write_volatile(value) };
+        }
+    };
+    let minor_faults = || {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: `usage` is a valid out-pointer.
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: initialized by the successful call above.
+        unsafe { usage.assume_init() }.ru_minflt as u64
+    };
+    touch(1);
+    start();
+    let before = minor_faults();
+    touch(2);
+    let faults = minor_faults() - before;
+    // SAFETY: the mapping created above, no longer referenced.
+    unsafe { libc::munmap(heap, len) };
+    faults
+}
+
+/// Starting a pty child must not copy the editor's address space, so its
+/// cost does not grow with the editor's heap.
+#[cfg(target_os = "linux")]
+#[test]
+fn pty_spawn_does_not_copy_the_editor_address_space() {
+    crate::test_utils::init_test_tracing();
+    let _ctx = crate::test_utils::new_context();
+    let mut processes = ProcessManager::new();
+    let mut id = None;
+    let faults = heap_rewrite_faults_after(|| {
+        let pid = processes.create_process_lisp(
+            LispString::from_utf8("pty-true"),
+            Value::NIL,
+            LispString::from_utf8(&find_bin("true")),
+            Vec::new(),
+            crate::emacs_core::process::ProcessCodingSystems::gnu_make_process_initial(),
+        );
+        processes.spawn_child(pid, true).expect("spawn pty child");
+        id = Some(pid);
+    });
+    processes.kill_process(id.expect("spawned"));
+    assert!(
+        faults < (HEAP_PAGES / 16) as u64,
+        "rewriting {HEAP_PAGES} pages after a pty start took {faults} copy-on-write \
+         faults: the start forked the editor"
+    );
+}
+
+/// `make-process :connection-type 'pty :stderr PIPE-PROCESS`: stdin and
+/// stdout are the pty slave and stderr is the pipe (GNU `create_process`'s
+/// `forkerr`), and that start does not fork the editor either.
+#[cfg(target_os = "linux")]
+#[test]
+fn pty_spawn_with_a_stderr_pipe_process_keeps_stderr_on_the_pipe() {
+    crate::test_utils::init_test_tracing();
+    let mut buffers = neovm_edit::buffer::BufferManager::new();
+    let mut processes = ProcessManager::new();
+    let threads = neovm_eval::emacs_core::threads::ThreadManager::new();
+    let stderrproc = builtin_make_pipe_process_impl(
+        &mut processes,
+        &mut buffers,
+        &threads,
+        None,
+        ConnectionProcessCodingVariables::unbound(),
+        vec![
+            Value::keyword(":name"),
+            Value::string("pty-split-stderr"),
+            Value::keyword(":buffer"),
+            Value::NIL,
+        ],
+        neovm_value::tagged::value::SymbolMode::Bare,
+    )
+    .expect("make-pipe-process");
+    let mut owner = Value::NIL;
+    let faults = heap_rewrite_faults_after(|| {
+        owner = builtin_make_process_impl(
+            &mut processes,
+            &mut buffers,
+            &threads,
+            vec![
+                Value::keyword(":name"),
+                Value::string("pty-split-owner"),
+                Value::keyword(":command"),
+                Value::list(vec![
+                    Value::string(find_bin("sh")),
+                    Value::string("-c"),
+                    Value::string(
+                        "for fd in 0 1; do readlink /proc/self/fd/$fd; done; \
+                         readlink /proc/self/fd/2 >&2; echo END",
+                    ),
+                ]),
+                Value::keyword(":stderr"),
+                stderrproc,
+            ],
+            true,
+            neovm_value::tagged::value::SymbolMode::Bare,
+        )
+        .expect("make-process");
+    });
+    let owner_id = owner.as_process_id().expect("owner process id");
+    let stderr_id = stderrproc.as_process_id().expect("stderr pipe id");
+    let slave = processes
+        .get(owner_id)
+        .and_then(|proc| proc.tty_name.as_lisp_string())
+        .map(|name| String::from_utf8_lossy(name.as_bytes()).into_owned())
+        .expect("pty child has a tty name");
+
+    let coding_systems = neovm_text::emacs_core::coding::CodingSystemManager::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    while Instant::now() < deadline && !(stdout.ends_with(b"END\n") && !stderr.is_empty()) {
+        for (id, sink) in [(owner_id, &mut stdout), (stderr_id, &mut stderr)] {
+            if let Some(run) = processes.read_process_output_without_decoding(
+                id,
+                ProcessOutputDestination::to_filter(),
+                &coding_systems,
+            ) {
+                sink.extend_from_slice(run.undecoded_bytes());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    processes.kill_process(owner_id);
+
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        format!("{slave}\n{slave}\nEND\n"),
+        "stdin and stdout are the pty slave"
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr).starts_with("pipe:["),
+        "stderr is the pipe, got {:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        faults < (HEAP_PAGES / 16) as u64,
+        "rewriting {HEAP_PAGES} pages after a split-stderr pty start took {faults} \
+         copy-on-write faults: the start forked the editor"
+    );
+}
+
 #[test]
 fn pty_process_output_does_not_translate_lf_to_crlf_like_gnu() {
     crate::test_utils::init_test_tracing();
