@@ -37,6 +37,11 @@ enum DeadlockVerdict {
     IndexInconsistent(SchedulerIndexInconsistency),
 }
 
+#[cfg(feature = "shared-heap")]
+mod parallel_thread;
+#[cfg(all(test, feature = "shared-heap"))]
+pub(crate) use parallel_thread::PANIC_NEXT_BODY;
+
 /// Waits that gave the Baton up (tests read it).
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) static SELECT_PARKS: std::sync::atomic::AtomicUsize =
@@ -556,6 +561,8 @@ impl Context {
         };
         let key = seat.key;
         let control = Arc::clone(&seat.control);
+        #[cfg(feature = "shared-heap")]
+        let parallel = self.parallel_lock_shared();
         if let Some(refusal) = switch_refusal(self) {
             self.abandon_unpublished_park_request(request)?;
             return Err(signal("error", vec![Value::string(refusal)]));
@@ -670,11 +677,16 @@ impl Context {
         self.publish_parked_roots(&baton, key, publication);
         // All World/registry borrows have ended before the unique Baton moves.
         let (outcome, host_resume, native_resume) = match request {
-            ParkRequest::Ordinary(wait) => (
-                control.transfer(key, wait, baton, receiver.as_channel()),
-                None,
-                None,
-            ),
+            ParkRequest::Ordinary(wait) => {
+                #[cfg(feature = "shared-heap")]
+                let outcome = match parallel.as_deref() {
+                    Some(lock) => control.transfer_parallel(lock, key, wait, baton),
+                    None => control.transfer(key, wait, baton, receiver.as_channel()),
+                };
+                #[cfg(not(feature = "shared-heap"))]
+                let outcome = control.transfer(key, wait, baton, receiver.as_channel());
+                (outcome, None, None)
+            }
             ParkRequest::MainNative { mut wait, wait_end } => {
                 let mut handoff = MainNativeHandoff {
                     control: &control,
@@ -1104,7 +1116,12 @@ impl Context {
         };
         #[cfg(any(test, feature = "test-support"))]
         SELECT_PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.green_key() == Some(ThreadKey::Main) {
+        // A Parallel World's main waits detached like any other thread.
+        #[cfg(feature = "shared-heap")]
+        let main_native = self.parallel_lock().is_none();
+        #[cfg(not(feature = "shared-heap"))]
+        let main_native = true;
+        if main_native && self.green_key() == Some(ThreadKey::Main) {
             let control = Arc::clone(&self.green_seat().expect("seated").control);
             // When main retains an idle Baton, an earlier sleeping peer must
             // still get its deadline. Runnable peers take the Baton themselves.
@@ -1220,6 +1237,10 @@ impl Context {
         // above). Wake and join them deterministically; idle carriers hold no
         // Baton and touch no World state.
         self.with_green_runtime(|runtime| runtime.carriers.drain());
+        #[cfg(feature = "shared-heap")]
+        if let Some(lock) = self.parallel_lock() {
+            lock.join_threads();
+        }
         // All continuations have restored or terminated, and their scoped
         // collectors/readers have returned. Finish any retained failure before
         // dropping the main reservation; keep the Baton for post-teardown
@@ -1396,6 +1417,24 @@ impl Context {
         self.with_green_runtime(|runtime| {
             runtime.pending_starts.borrow_mut().insert(key, function);
         });
+        #[cfg(feature = "shared-heap")]
+        if let Some(lock) = self.parallel_lock_shared() {
+            if let Err(error) = parallel_thread::spawn(key, Arc::clone(&control), receiver, lock) {
+                tracing::warn!(?error, "a Parallel Lisp thread's OS thread did not start");
+                // As the carrier refusal below: GNU restores the previous
+                // situation, then signals.
+                self.with_green_runtime(|runtime| {
+                    runtime.pending_starts.borrow_mut().remove(&key);
+                });
+                control.unregister_worker(key);
+                self.threads.discard_unstarted_thread(id);
+                return Err(signal(
+                    "error",
+                    vec![Value::string("Could not start a new thread")],
+                ));
+            }
+            return Ok(handle);
+        }
         let job = CarrierJob {
             key,
             receiver,
@@ -1434,6 +1473,12 @@ impl Context {
         self.green_admission_readiness()
             .map_err(super::GreenThreadStartError::Admission)?;
         let baton = self.start_green_runtime()?;
+        #[cfg(feature = "shared-heap")]
+        let baton = if self.threading_mode() == super::super::ThreadingMode::Parallel {
+            self.install_parallel_lock(baton).attach().into_baton()
+        } else {
+            baton
+        };
         // The main carrier runs Lisp on this OS thread; reserve its dense
         // SymId/NameId caches as worker owners do on creation.
         neovm_value::intern::prepare_thread_symbol_caches();

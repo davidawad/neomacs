@@ -144,7 +144,7 @@ impl CompileEnvScope {
         } else {
             // SAFETY: the caller's contract above.
             let ctx = unsafe { &*ctx };
-            let green = ctx.threading_mode() == crate::emacs_core::eval::ThreadingMode::Green;
+            let green = ctx.threading_mode().uses_owner_threads();
             if jit_inline_vars().any() || green {
                 let env = CompileEnv {
                     obarray: std::ptr::from_ref(&ctx.obarray),
