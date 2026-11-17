@@ -14,7 +14,8 @@
 //! acquisition of it is counted in [`ParallelStats`].
 
 use super::Baton;
-use std::sync::atomic::{AtomicU64, Ordering};
+use neovm_value::detached::AttachReason;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{JoinHandle, ThreadId};
 use std::time::Instant;
@@ -29,6 +30,15 @@ pub(crate) struct ParallelStats {
     pub(crate) safepoint_stops: u64,
     pub(crate) collections: u64,
     pub(crate) deferred_bytes: u64,
+    /// Attaches of detached threads for a `World`-class primitive.
+    pub(crate) attach_by_class: u64,
+    /// Attaches of detached threads for a heap access.
+    pub(crate) attach_by_alloc: u64,
+    /// Attaches of detached threads for an interning primitive.
+    pub(crate) attach_by_intern: u64,
+    /// Buffer-local reads of detached threads (no attach: the read skips
+    /// the shared cache).
+    pub(crate) attach_by_blv: u64,
 }
 
 /// Where the Baton is, under the lock.
@@ -64,6 +74,13 @@ pub(crate) struct BatonLock {
     safepoint_stops: AtomicU64,
     collections: AtomicU64,
     deferred_bytes: AtomicU64,
+    /// Lisp threads inside their detached body: their stacks hold roots no
+    /// collection can see, so none may run (slice S3's limitation).
+    detached_threads: AtomicU64,
+    /// A collection was deferred and has not run yet.
+    collection_deferred: AtomicBool,
+    /// Per [`AttachReason`], in declaration order.
+    attach_by: [AtomicU64; 4],
 }
 
 fn elapsed_ns(since: Instant) -> u64 {
@@ -93,6 +110,9 @@ impl BatonLock {
             safepoint_stops: AtomicU64::new(0),
             collections: AtomicU64::new(0),
             deferred_bytes: AtomicU64::new(0),
+            detached_threads: AtomicU64::new(0),
+            collection_deferred: AtomicBool::new(false),
+            attach_by: Default::default(),
         }
     }
 
@@ -226,6 +246,51 @@ impl BatonLock {
             safepoint_stops: load(&self.safepoint_stops),
             collections: load(&self.collections),
             deferred_bytes: load(&self.deferred_bytes),
+            attach_by_class: load(&self.attach_by[0]),
+            attach_by_alloc: load(&self.attach_by[1]),
+            attach_by_intern: load(&self.attach_by[2]),
+            attach_by_blv: load(&self.attach_by[3]),
+        }
+    }
+
+    /// Count one attach (or detached read) for REASON.
+    pub(crate) fn count_attach(&self, reason: AttachReason) {
+        let index = match reason {
+            AttachReason::Class => 0,
+            AttachReason::Alloc => 1,
+            AttachReason::Intern => 2,
+            AttachReason::Blv => 3,
+        };
+        self.attach_by[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A Lisp thread's body starts running detached.
+    pub(crate) fn body_detached(&self) {
+        self.detached_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A Lisp thread's detached body ended.
+    pub(crate) fn body_attached(&self) {
+        self.detached_threads.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// How many Lisp threads are inside their detached body.
+    pub(crate) fn detached_threads(&self) -> u64 {
+        self.detached_threads.load(Ordering::Acquire)
+    }
+
+    /// A collection due now waits for every detached body to end; BYTES is
+    /// what it would have looked at. Counted once per deferred collection.
+    pub(crate) fn defer_collection(&self, bytes: u64) {
+        if !self.collection_deferred.swap(true, Ordering::AcqRel) {
+            self.deferred_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// A collection runs; count it when it is one that was deferred.
+    pub(crate) fn collection_runs(&self) {
+        if self.collection_deferred.swap(false, Ordering::AcqRel) {
+            self.collections.fetch_add(1, Ordering::Relaxed);
         }
     }
 

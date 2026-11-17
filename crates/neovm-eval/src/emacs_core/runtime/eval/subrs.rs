@@ -4601,6 +4601,14 @@ fn shared_heap_stats(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
         Value::fixnum(i64::try_from(parallel.collections).unwrap_or(i64::MAX)),
         Value::symbol(":deferred-bytes"),
         Value::fixnum(i64::try_from(parallel.deferred_bytes).unwrap_or(i64::MAX)),
+        Value::symbol(":attach-by-class"),
+        Value::fixnum(i64::try_from(parallel.attach_by_class).unwrap_or(i64::MAX)),
+        Value::symbol(":attach-by-alloc"),
+        Value::fixnum(i64::try_from(parallel.attach_by_alloc).unwrap_or(i64::MAX)),
+        Value::symbol(":attach-by-intern"),
+        Value::fixnum(i64::try_from(parallel.attach_by_intern).unwrap_or(i64::MAX)),
+        Value::symbol(":attach-by-blv"),
+        Value::fixnum(i64::try_from(parallel.attach_by_blv).unwrap_or(i64::MAX)),
     ]))
 }
 
