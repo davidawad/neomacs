@@ -66,6 +66,25 @@ fn run_command_rejects_zero_iterations_before_launch() {
 }
 
 #[test]
+fn gc_stress_selects_the_scenario_owned_threshold_only_for_threads_stress() {
+    let PerfCommand::Run {
+        scenario,
+        execution_overrides,
+        ..
+    } = parse(&["run", "threads-stress", "--gc-stress"]).expect("parse GC stress run")
+    else {
+        panic!("run command must remain typed")
+    };
+    assert_eq!(scenario, ScenarioId::ThreadsStress);
+    let overrides: Vec<String> = Vec::<crate::ExecutionOverride>::from(execution_overrides)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(overrides, ["NEOVM_GC_THRESHOLD=16384"]);
+    assert!(parse(&["run", "threads-numeric-loop", "--gc-stress"]).is_err());
+}
+
+#[test]
 fn workload_defaults_come_from_the_typed_scenario_spec() {
     let PerfCommand::Run {
         scenario,

@@ -119,6 +119,9 @@ struct RunArgs {
     /// Runtime setting: NAME=VALUE sets; NAME alone removes an inherited setting. Repeatable.
     #[arg(long = "env", value_name = "NAME[=VALUE]")]
     execution_overrides: Vec<crate::ExecutionOverride>,
+    /// Set a low GC allocation threshold for the threads-stress scenario.
+    #[arg(long, requires = "scenario")]
+    gc_stress: bool,
     /// Extra editor argv, preserved verbatim and recorded; repeat as --editor-arg=ARG.
     #[arg(
         long = "editor-arg",
@@ -474,8 +477,20 @@ impl TryFrom<PerfSubcommand> for PerfCommand {
                 Self::InputLatency { path, budget_us }
             }
             PerfSubcommand::Run(arguments) => {
-                let execution_overrides = arguments
-                    .execution_overrides
+                if arguments.gc_stress && arguments.scenario != ScenarioId::ThreadsStress {
+                    return Err(PerfCliError::Usage {
+                        message: "--gc-stress is only valid for threads-stress".to_owned(),
+                    });
+                }
+                let mut execution_overrides = arguments.execution_overrides;
+                if arguments.gc_stress {
+                    execution_overrides.push(
+                        "NEOVM_GC_THRESHOLD=16384"
+                            .parse()
+                            .map_err(|message| PerfCliError::Usage { message })?,
+                    );
+                }
+                let execution_overrides = execution_overrides
                     .try_into()
                     .map_err(|message| PerfCliError::Usage { message })?;
                 let counters = arguments.counters.scope();

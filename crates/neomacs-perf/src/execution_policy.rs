@@ -37,6 +37,7 @@ impl FromStr for ExecutionOverride {
                 | "NEOVM_REGEX_SHORT_LITERAL"
                 | "NEOVM_EMACS_MULE_PREPARED"
                 | "NEOVM_OVERLAY_LOCAL_MOVE"
+                | "NEOVM_GC_THRESHOLD"
         );
         if !supported {
             return Err(format!(
@@ -64,6 +65,7 @@ impl FromStr for ExecutionOverride {
                 "NEOVM_OVERLAY_LOCAL_MOVE" => matches!(value, "off" | "on"),
                 "NEOVM_JIT_THRESHOLD" => value.parse::<u32>().is_ok_and(|v| v > 0),
                 "NEOVM_JIT_LOOP_HEAT" => value.parse::<u32>().is_ok(),
+                "NEOVM_GC_THRESHOLD" => value.parse::<u64>().is_ok_and(|v| v > 0),
                 _ => unreachable!("validated name"),
             };
             if !valid {
