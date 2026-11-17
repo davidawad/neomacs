@@ -614,3 +614,230 @@ fn measure_the_numeric_loop_serial_versus_parallel() {
         eval(&mut ev, "(neomacs-shared-heap-stats)")
     );
 }
+
+/// One `bench.el` workload: the function a thread calls and its argument.
+struct BenchWorkload<'src> {
+    name: &'src str,
+    /// The `fset` form that defines the function.
+    define: &'src str,
+    /// The form each thread evaluates.
+    call: &'src str,
+}
+
+/// `bench.el`'s functions, byte-compiled by GNU Emacs (`b-` names, the
+/// `make-byte-code` of each `byte-compile`) or interpreted (`i-fix`).
+/// The sizes are the benchmark's divided
+/// down for a test build; the JSON document is [`bench_json_document`].
+const BENCH_WORKLOADS: [BenchWorkload<'static>; 6] = [
+    BenchWorkload {
+        name: "bytecode-fixnum-loop",
+        define: r#"(fset 'b-fix (make-byte-code 257 "\300\211\211\3W\203\26\0\301\2\2\302_\\\303\"\262\2T\202\2\0\210\207" [0 logand 7 1048575] 7))"#,
+        call: "(b-fix 2000000)",
+    },
+    BenchWorkload {
+        name: "bytecode-cons-loop",
+        define: r#"(fset 'b-cons (make-byte-code 257 "\300\301\211\3W\203\31\0\211\2G\302V?\205\22\0\2B\262\2T\202\2\0\210G\207" [nil 0 50] 6))"#,
+        call: "(b-cons 40000)",
+    },
+    // `b-big`'s sum leaves the fixnum range after about 1.9M iterations;
+    // started at a bignum ([`BIGNUM_SUM`]), every `+` allocates one.
+    BenchWorkload {
+        name: "bytecode-bignum-loop",
+        define: r#"(fset 'b-big (make-byte-code 514 "\300\211\003\127\203\022\000\001\001\211\137\134\262\002\124\202\001\000\001\207" [0] 6))"#,
+        call: "(logand (b-big 30000 (* 4 most-positive-fixnum)) 1048575)",
+    },
+    BenchWorkload {
+        name: "json-parse-hash",
+        define: r#"(fset 'b-jh (make-byte-code 257 "\301\302\10\303\304#\305H!\207" [b-json hash-table-count json-parse-string :object-type hash-table 0] 6))"#,
+        call: "(b-jh nil)",
+    },
+    BenchWorkload {
+        name: "json-parse-alist",
+        define: r#"(fset 'b-ja (make-byte-code 257 "\301\10\302\303\304\305%G\207" [b-json json-parse-string :object-type alist :array-type list] 7))"#,
+        call: "(b-ja nil)",
+    },
+    BenchWorkload {
+        name: "interpreted-fixnum-loop",
+        // `(dotimes (i n) ...)` as GNU's `dotimes` (subr.el) expands it:
+        // the editor expands macros eagerly when it loads `bench.el`.
+        define: "(fset 'i-fix
+                   (lambda (n)
+                     (let ((s 0))
+                       (let ((upper n) (counter 0))
+                         (while (< counter upper)
+                           (let ((i counter))
+                             (setq s (logand (+ s (* i 7)) 1048575)))
+                           (setq counter (1+ counter))))
+                       s)))",
+        call: "(i-fix 20000)",
+    },
+];
+
+/// `bench.el`'s `b-json`: an array of RECORDS objects of four members.
+fn bench_json_document(records: usize) -> String {
+    let objects: Vec<String> = (1..=records)
+        .map(|i| format!(r#"{{"id":{i},"name":"item-{i}","tags":["a","b","c"],"v":{i}.5}}"#))
+        .collect();
+    format!("[{}]", objects.join(","))
+}
+
+/// The growth of every counter from BEFORE to AFTER (`threads` is AFTER's).
+fn stats_delta(before: &ParallelStats, after: &ParallelStats) -> ParallelStats {
+    ParallelStats {
+        threads: after.threads,
+        attach_count: after.attach_count - before.attach_count,
+        attach_wait_ns: after.attach_wait_ns - before.attach_wait_ns,
+        detached_ns: after.detached_ns - before.detached_ns,
+        safepoint_stops: after.safepoint_stops - before.safepoint_stops,
+        collections: after.collections - before.collections,
+        deferred_bytes: after.deferred_bytes - before.deferred_bytes,
+        attach_by_class: after.attach_by_class - before.attach_by_class,
+        attach_by_alloc: after.attach_by_alloc - before.attach_by_alloc,
+        attach_by_intern: after.attach_by_intern - before.attach_by_intern,
+        attach_by_blv: after.attach_by_blv - before.attach_by_blv,
+        stop_wait_ns: after.stop_wait_ns - before.stop_wait_ns,
+        stop_max_ns: after.stop_max_ns.max(before.stop_max_ns),
+    }
+}
+
+/// A Parallel World with every [`BENCH_WORKLOADS`] function defined.
+fn bench_world() -> Context {
+    let mut ev = parallel();
+    let literal = bench_json_document(1000).replace('"', "\\\"");
+    assert_eq!(
+        eval(&mut ev, &format!("(progn (setq b-json \"{literal}\") t)")),
+        "t"
+    );
+    for workload in &BENCH_WORKLOADS {
+        eval(&mut ev, workload.define);
+    }
+    ev
+}
+
+/// Run WORKLOAD on THREADS Lisp threads at once, check every result
+/// against SERIAL (a serial call's), and return the counters the run
+/// added: the threads' attaches and the collections main runs once they
+/// are joined.
+fn bench_row(
+    ev: &mut Context,
+    workload: &BenchWorkload<'_>,
+    threads: usize,
+    serial: &str,
+) -> ParallelStats {
+    let before = stats_so_far(ev);
+    let form = format!(
+        "(let ((k 0) (ts nil))
+           (while (< k {threads})
+             (setq ts (cons (make-thread (lambda () {call})) ts))
+             (setq k (1+ k)))
+           (let ((results (mapcar 'thread-join ts)) (n 0))
+             ;; Main's safe points after the joins run a deferred collection.
+             (while (< n 2000) (setq n (1+ n)))
+             results))",
+        call = workload.call
+    );
+    let expected = format!("({})", vec![serial; threads].join(" "));
+    assert_eq!(eval(ev, &form), expected, "{} x {threads}", workload.name);
+    stats_delta(&before, &stats(ev))
+}
+
+/// Attribution of the `bench.el` workloads' parallel costs: each one on 2,
+/// 4 and 8 Lisp threads, with the counters `neomacs-shared-heap-stats`
+/// reports. Every thread's result equals the serial call's; the table is
+/// printed for VERIFY.md (the nanosecond columns are measurements, never
+/// asserted).
+#[test]
+fn bench_workloads_on_2_4_8_threads_report_their_attaches_and_collections() {
+    let mut ev = bench_world();
+    println!(
+        "| workload | threads | attach-count | by-alloc | by-class | by-intern | by-blv \
+         | attach-wait-ns | collections | safepoint-stops | deferred-bytes | stop-wait-ns |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for workload in &BENCH_WORKLOADS {
+        let serial = eval(&mut ev, workload.call);
+        for threads in [2, 4, 8] {
+            let row = bench_row(&mut ev, workload, threads, &serial);
+            println!(
+                "| {} | {threads} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                workload.name,
+                row.attach_count,
+                row.attach_by_alloc,
+                row.attach_by_class,
+                row.attach_by_intern,
+                row.attach_by_blv,
+                row.attach_wait_ns,
+                row.collections,
+                row.safepoint_stops,
+                row.deferred_bytes,
+                row.stop_wait_ns,
+            );
+        }
+    }
+}
+
+/// [`bench_workloads_on_2_4_8_threads_report_their_attaches_and_collections`]
+/// as wall-clock times: serial (main, one call per thread, its collections
+/// inline) against the threads' phase (spawn to the last join, as
+/// `bench.el` times it), and apart from both the collection main runs
+/// after the joins (deferred while the threads ran). Each call repeats
+/// `NEOVM_MEASURE_REPEAT` times. A measurement in a test build: printed
+/// only.
+#[test]
+#[ignore = "a measurement: run with --run-ignored only"]
+fn measure_bench_workloads_serial_versus_parallel() {
+    let setting = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let threads = setting("NEOVM_MEASURE_THREADS", 8);
+    let repeat = setting("NEOVM_MEASURE_REPEAT", 10);
+    let mut ev = bench_world();
+    // Main compiles as the threads do, as in the editor.
+    #[cfg(feature = "jit")]
+    crate::emacs_core::jit::force_jit_off_for_test(false);
+    println!("| workload | threads | serial | threads' phase | speedup | after the joins |");
+    println!("|---|---:|---:|---:|---:|---:|");
+    for workload in &BENCH_WORKLOADS {
+        let call = format!(
+            "(let ((j 0) (r nil)) (while (< j {repeat}) (setq r {}) (setq j (1+ j))) r)",
+            workload.call
+        );
+        let result = eval(&mut ev, &call);
+        let serial_form = format!(
+            "(let ((k 0) (r nil)) (while (< k {threads}) (setq r (cons {call} r)) (setq k (1+ k))) r)"
+        );
+        let parallel_form = format!(
+            "(let ((k 0) (ts nil))
+               (while (< k {threads})
+                 (setq ts (cons (make-thread (lambda () {call})) ts))
+                 (setq k (1+ k)))
+               (mapcar 'thread-join ts))"
+        );
+        let settle = "(let ((n 0)) (while (< n 20000) (setq n (1+ n))))";
+        eval(&mut ev, settle);
+        let started = std::time::Instant::now();
+        eval(&mut ev, &serial_form);
+        let serial = started.elapsed();
+        eval(&mut ev, settle);
+        let started = std::time::Instant::now();
+        let joined = eval(&mut ev, &parallel_form);
+        let parallel = started.elapsed();
+        let started = std::time::Instant::now();
+        eval(&mut ev, settle);
+        let after = started.elapsed();
+        assert_eq!(
+            joined,
+            format!("({})", vec![result.as_str(); threads].join(" ")),
+            "{}",
+            workload.name
+        );
+        println!(
+            "| {} | {threads} | {serial:.2?} | {parallel:.2?} | {:.2}x | {after:.2?} |",
+            workload.name,
+            serial.as_secs_f64() / parallel.as_secs_f64()
+        );
+    }
+}
