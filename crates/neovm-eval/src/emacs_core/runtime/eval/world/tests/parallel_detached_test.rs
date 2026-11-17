@@ -303,6 +303,180 @@ fn collections_wait_for_detached_threads_and_run_after_the_join() {
     assert!(collected.collections >= 1, "{collected:?}");
 }
 
+/// [`stats`], all zero before the first thread starts the World's lock.
+fn stats_so_far(ev: &mut Context) -> ParallelStats {
+    ev.parallel_lock().map(BatonLock::stats).unwrap_or_default()
+}
+
+/// The attaches detached threads made between BEFORE and AFTER, per
+/// reason: (class, alloc, intern).
+fn attaches_between(before: &ParallelStats, after: &ParallelStats) -> (u64, u64, u64) {
+    (
+        after.attach_by_class - before.attach_by_class,
+        after.attach_by_alloc - before.attach_by_alloc,
+        after.attach_by_intern - before.attach_by_intern,
+    )
+}
+
+/// The byte-compiled `(lambda (n s) (let ((i 0)) (while (< i n) (setq s
+/// (+ s (* i i))) (setq i (1+ i))) s))`: started at a bignum S, every
+/// `+` makes a new bignum.
+const BIGNUM_SUM: &str = r#"(make-byte-code 514 "\300\211\003\127\203\022\000\001\001\211\137\134\262\002\124\202\001\000\001\207" [0] 6)"#;
+
+/// Two threads run the bignum loop of N iterations from S0 at once;
+/// returns both results and the threads' attaches.
+fn two_bignum_loops(ev: &mut Context, n: i128) -> (String, (u64, u64, u64)) {
+    let before = stats_so_far(ev);
+    let result = eval(
+        ev,
+        &format!(
+            "(let ((a (make-thread (lambda () (tpd-bignum-sum {n} (* 4 most-positive-fixnum)))))
+                   (b (make-thread (lambda () (tpd-bignum-sum {n} (* 4 most-positive-fixnum))))))
+               (list (thread-join a) (thread-join b)))"
+        ),
+    );
+    (result, attaches_between(&before, &stats(ev)))
+}
+
+/// A byte-compiled loop whose accumulator is a bignum allocates its
+/// bignums from each thread's own runs: the attaches do not grow with the
+/// iterations (one heap attach per thread makes its allocation state).
+#[test]
+fn a_detached_bignum_loop_attaches_a_bounded_number_of_times() {
+    let mut ev = parallel();
+    eval(&mut ev, &format!("(fset 'tpd-bignum-sum {BIGNUM_SUM})"));
+    let s0 = 4 * ((1_i128 << 61) - 1);
+    let expected = |n: i128| s0 + (n - 1) * n * (2 * n - 1) / 6;
+    for n in [2_000, 20_000] {
+        let (result, attaches) = two_bignum_loops(&mut ev, n);
+        assert_eq!(result, format!("({0} {0})", expected(n)));
+        println!(
+            "bignum loop, 2 threads x {n} iterations: attaches (class, alloc, intern) {attaches:?}"
+        );
+        let (class, alloc, intern) = attaches;
+        assert_eq!((class, intern), (0, 0), "{attaches:?}");
+        assert!(alloc <= 2, "{n} iterations: {attaches:?}");
+    }
+}
+
+/// About 180 KB of JSON: 1000 records of strings, integers, floats, nested
+/// arrays and objects, with 8 distinct member names.
+fn json_document() -> String {
+    use std::fmt::Write as _;
+    let mut json = String::from("[");
+    for i in 0..1000 {
+        if i > 0 {
+            json.push(',');
+        }
+        write!(
+            json,
+            "{{\"id\":{i},\"name\":\"record-{i}-{:0>40}\",\"score\":{}.5,\
+             \"tags\":[\"alpha\",\"beta\",\"gamma-{i}\"],\
+             \"pos\":[{}.25,{}.75,{}.125],\"meta\":{{\"rank\":{},\"note\":\"n{i}\"}}}}",
+            i * 7,
+            i * 3,
+            i,
+            i + 1,
+            i + 2,
+            i % 17,
+        )
+        .expect("a String takes every write");
+    }
+    json.push(']');
+    json
+}
+
+/// Bind `tpd-json` to the document, as a Lisp string literal.
+fn set_json_document(ev: &mut Context) {
+    let literal = json_document().replace('\\', "\\\\").replace('"', "\\\"");
+    assert_eq!(
+        eval(ev, &format!("(progn (setq tpd-json \"{literal}\") t)")),
+        "t"
+    );
+}
+
+/// `json-parse-string` builds its conses, strings, floats, vectors and hash
+/// tables detached, from each thread's own runs: one call per thread on 2
+/// threads attaches for its allocation state only, never for the call.
+#[test]
+fn a_detached_json_parse_string_attaches_a_bounded_number_of_times() {
+    let mut ev = parallel();
+    set_json_document(&mut ev);
+    let before = stats_so_far(&mut ev);
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(let ((a (make-thread
+                       (lambda () (json-parse-string tpd-json :object-type 'hash-table))))
+                   (b (make-thread
+                       (lambda () (json-parse-string tpd-json :object-type 'hash-table)))))
+               (let ((ra (thread-join a)) (rb (thread-join b)))
+                 (list (length ra) (gethash \"id\" (aref ra 999))
+                       (gethash \"name\" (aref rb 3))
+                       (gethash \"pos\" (aref ra 2))
+                       (hash-table-count (aref rb 999))
+                       (gethash \"rank\" (gethash \"meta\" (aref rb 20))))))"
+        ),
+        "(1000 999 \"record-3-0000000000000000000000000000000000000021\" [2.25 3.75 4.125] 6 3)"
+    );
+    let attaches = attaches_between(&before, &stats(&mut ev));
+    println!("json-parse-string, 2 threads x 1 call: attaches (class, alloc, intern) {attaches:?}");
+    let (class, alloc, intern) = attaches;
+    assert_eq!((class, intern), (0, 0), "{attaches:?}");
+    assert!(alloc <= 2, "{attaches:?}");
+}
+
+/// With `:object-type 'alist` the member names become symbols through the
+/// process-wide symbol registry, which is thread-safe and holds no World
+/// state: that needs no attach either, and the result is the serial parse's.
+#[test]
+fn a_detached_json_parse_string_to_alists_attaches_a_bounded_number_of_times() {
+    let mut ev = parallel();
+    set_json_document(&mut ev);
+    let before = stats_so_far(&mut ev);
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(let ((a (make-thread
+                       (lambda () (json-parse-string tpd-json :object-type 'alist))))
+                   (b (make-thread
+                       (lambda () (json-parse-string tpd-json :object-type 'alist)))))
+               (let ((serial (json-parse-string tpd-json :object-type 'alist)))
+                 (list (equal (thread-join a) serial) (equal (thread-join b) serial)
+                       (cdr (assq 'note (cdr (assq 'meta (aref serial 7))))))))"
+        ),
+        "(t t \"n7\")"
+    );
+    let attaches = attaches_between(&before, &stats(&mut ev));
+    println!(
+        "json-parse-string alist, 2 threads x 1 call: attaches (class, alloc, intern) {attaches:?}"
+    );
+    let (class, alloc, intern) = attaches;
+    assert_eq!((class, intern), (0, 0), "{attaches:?}");
+    assert!(alloc <= 2, "{attaches:?}");
+}
+
+/// A malformed document signals from the detached parse as from a serial
+/// one: the same condition and data.
+#[test]
+fn a_detached_json_parse_string_signals_as_a_serial_one() {
+    let mut ev = parallel();
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(let ((parse (lambda (s)
+                            (condition-case err (json-parse-string s) (error err)))))
+               (let ((th (make-thread (lambda ()
+                                        (list (funcall parse \"[1, 2\")
+                                              (funcall parse \"{\\\"a\\\": tru}\"))))))
+                 (equal (thread-join th)
+                        (list (funcall parse \"[1, 2\")
+                              (funcall parse \"{\\\"a\\\": tru}\")))))"
+        ),
+        "t"
+    );
+}
+
 /// Item 8's measurement in a test binary: the numeric loop on N threads
 /// versus the same loops one after another on main, with each thread's
 /// binding conses allocated next to each other's and, padded, apart.

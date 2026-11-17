@@ -217,6 +217,16 @@ const DETACHED_EVALUATOR: &[(&str, &str)] = &[
     ),
 ];
 
+/// Primitives the inventory leaves `World` by default that only read their
+/// arguments and build fresh objects: they run detached, allocating from
+/// the thread's own runs (`neovm_value::detached`); a step that needs the
+/// World attaches for itself. Each row: name, why.
+const DETACHED_CONSTRUCTORS: &[(&str, &str)] = &[(
+    "json-parse-string",
+    "reads its string argument and builds conses, strings, numbers, vectors \
+     and hash tables; interning an alist or plist key attaches",
+)];
+
 /// The placement of the primitive NAME.
 pub(crate) fn placement(name: &str) -> Placement {
     if let Some(&(_, reason, _)) = ATTACH_OVERRIDES.iter().find(|row| row.0 == name) {
@@ -226,6 +236,9 @@ pub(crate) fn placement(name: &str) -> Placement {
         return Placement::DetachedIfNumeric;
     }
     if DETACHED_EVALUATOR.iter().any(|row| row.0 == name) {
+        return Placement::Detached;
+    }
+    if DETACHED_CONSTRUCTORS.iter().any(|row| row.0 == name) {
         return Placement::Detached;
     }
     let entry = inventory()
@@ -288,7 +301,8 @@ impl DetachedTable {
             .filter(|entry| entry.kind == CatalogKind::Primitive)
             .map(|entry| entry.name)
             .chain(DETACHED_NUMERIC.iter().map(|row| row.0))
-            .chain(DETACHED_EVALUATOR.iter().map(|row| row.0));
+            .chain(DETACHED_EVALUATOR.iter().map(|row| row.0))
+            .chain(DETACHED_CONSTRUCTORS.iter().map(|row| row.0));
         for name in names {
             let placement = placement(name);
             let sym = neovm_value::intern::intern(name);
