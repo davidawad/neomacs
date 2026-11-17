@@ -39,6 +39,8 @@ pub(crate) use era::prepare_keeper_backing;
 mod function_write_hooks;
 mod green_owner;
 #[cfg(feature = "shared-heap")]
+mod parallel_classify;
+#[cfg(feature = "shared-heap")]
 mod parallel_owner;
 mod slot;
 // Crate-visible so the public test-support re-export in eval/mod.rs can name
@@ -51,6 +53,10 @@ pub use green_owner::Baton;
 pub(crate) use green_owner::OwnedProofProjection;
 #[allow(unused_imports)]
 pub(crate) use green_owner::{FrozenLegacyRoots, OwnedParallelError, OwnedParallelProjection};
+#[cfg(feature = "shared-heap")]
+pub(crate) use parallel_classify::{
+    prepare_detached_table, subr_attach_reason, symbol_attach_reason,
+};
 #[cfg(feature = "shared-heap")]
 pub(crate) use parallel_owner::{BatonLock, ParallelStats};
 pub(crate) use slot::WorldSlot;
