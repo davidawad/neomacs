@@ -176,6 +176,12 @@ fn push_onto_charset_list(ctx: &mut Context, name: Value) {
 }
 
 crate::emacs_core::subr::define_subrs! {
+    #[cfg(feature = "shared-heap")]
+    crate::emacs_core::subr::world_subr!(SubrSpec::new(
+            "neomacs-shared-heap-stats",
+            NativeFn::ContextVec(shared_heap_stats),
+            SubrArity::new(0, Some(0)),
+        )),
     // Diagnostics-only VM-profiler control subrs (feature `vm-profile`).
     #[cfg(feature = "vm-profile")]
     crate::emacs_core::subr::world_subr!(SubrSpec::new(
@@ -4561,6 +4567,41 @@ crate::emacs_core::subr::define_subrs! {
         }),
         SubrArity::new(1, Some(2)),
     )),
+}
+
+#[cfg(feature = "shared-heap")]
+fn shared_heap_stats(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
+    expect_args("neomacs-shared-heap-stats", &args, 0)?;
+    let parallel = ctx.parallel_lock().map_or_else(
+        || crate::emacs_core::eval::world::ParallelStats {
+            threads: ctx.threads.all_thread_ids().len() as u64,
+            ..Default::default()
+        },
+        |lock| lock.stats(),
+    );
+    let mode = match ctx.threading_mode() {
+        crate::emacs_core::eval::ThreadingMode::Sim => "sim",
+        crate::emacs_core::eval::ThreadingMode::Green => "green",
+        crate::emacs_core::eval::ThreadingMode::Parallel => "parallel",
+    };
+    Ok(Value::list(vec![
+        Value::symbol(":mode"),
+        Value::symbol(mode),
+        Value::symbol(":threads"),
+        Value::fixnum(i64::try_from(parallel.threads).unwrap_or(i64::MAX)),
+        Value::symbol(":attach-count"),
+        Value::fixnum(i64::try_from(parallel.attach_count).unwrap_or(i64::MAX)),
+        Value::symbol(":attach-wait-ns"),
+        Value::fixnum(i64::try_from(parallel.attach_wait_ns).unwrap_or(i64::MAX)),
+        Value::symbol(":detached-ns"),
+        Value::fixnum(i64::try_from(parallel.detached_ns).unwrap_or(i64::MAX)),
+        Value::symbol(":safepoint-stops"),
+        Value::fixnum(i64::try_from(parallel.safepoint_stops).unwrap_or(i64::MAX)),
+        Value::symbol(":collections"),
+        Value::fixnum(i64::try_from(parallel.collections).unwrap_or(i64::MAX)),
+        Value::symbol(":deferred-bytes"),
+        Value::fixnum(i64::try_from(parallel.deferred_bytes).unwrap_or(i64::MAX)),
+    ]))
 }
 
 fn evaluator_subr(name: &str) -> Option<EvaluatorSubr> {

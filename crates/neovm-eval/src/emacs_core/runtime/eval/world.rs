@@ -38,6 +38,8 @@ pub(crate) use era::WorldProofEraFinishFailure;
 pub(crate) use era::prepare_keeper_backing;
 mod function_write_hooks;
 mod green_owner;
+#[cfg(feature = "shared-heap")]
+mod parallel_owner;
 mod slot;
 // Crate-visible so the public test-support re-export in eval/mod.rs can name
 // the driver class directly. This stays crate-internal; the struct itself is
@@ -49,6 +51,8 @@ pub use green_owner::Baton;
 pub(crate) use green_owner::OwnedProofProjection;
 #[allow(unused_imports)]
 pub(crate) use green_owner::{FrozenLegacyRoots, OwnedParallelError, OwnedParallelProjection};
+#[cfg(feature = "shared-heap")]
+pub(crate) use parallel_owner::{Attached, BatonLock, ParallelStats};
 pub(crate) use slot::WorldSlot;
 pub(crate) use sole_owner::{
     PublishedSoleOwnerDriver, SoleOwnerDriver, SoleOwnerRegistration, SoleOwnerVm,
@@ -86,6 +90,8 @@ struct World {
     threading: Cell<super::admission::ThreadingMode>,
     /// The Green runtime (round 3d), once started.
     green: std::cell::RefCell<Option<Box<super::green::GreenRuntime>>>,
+    #[cfg(feature = "shared-heap")]
+    parallel: std::sync::OnceLock<parallel_owner::BatonLock>,
     /// The OS thread holding the World's Baton, in a Green World
     /// (`green_owner`'s safety argument; checked in debug builds).
     baton_holder: Cell<Option<std::thread::ThreadId>>,
@@ -120,6 +126,32 @@ impl ColdRetained for World {}
 pub(crate) struct WorldLease(Arc<World>);
 static_assertions::assert_not_impl_any!(WorldLease: Send, Sync, Clone);
 static_assertions::assert_eq_size!(WorldLease, Arc<World>);
+
+impl Context {
+    /// The World's lock-based Baton authority, when this is a Parallel World.
+    #[cfg(feature = "shared-heap")]
+    pub(crate) fn parallel_lock(&self) -> Option<&BatonLock> {
+        self.obarray.lease.0.parallel.get()
+    }
+
+    /// Whether the calling OS thread currently owns this World's Baton.
+    #[cfg(feature = "shared-heap")]
+    pub(crate) fn attached(&self) -> bool {
+        self.parallel_lock()
+            .is_some_and(BatonLock::is_attached_here)
+    }
+
+    /// Install the World's lock-based Baton authority exactly once.
+    #[cfg(feature = "shared-heap")]
+    pub(crate) fn install_parallel_lock(&self, baton: Baton) -> Result<(), ()> {
+        self.obarray
+            .lease
+            .0
+            .parallel
+            .set(BatonLock::new(baton))
+            .map_err(|_| ())
+    }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 impl Context {
@@ -1294,6 +1326,8 @@ impl WorldStorageBuilder {
             thread_projections: Default::default(),
             threading: Cell::new(super::admission::ThreadingMode::from_env()),
             green: Default::default(),
+            #[cfg(feature = "shared-heap")]
+            parallel: std::sync::OnceLock::new(),
             baton_holder: Cell::new(None),
         }));
         // Reinstall the upstream TLS slot from the finalized heap's root
@@ -1570,3 +1604,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/sole_owner_phase_test.rs"]
 mod sole_owner_tests;
+
+#[cfg(all(test, feature = "shared-heap"))]
+#[path = "world/tests/parallel_owner_test.rs"]
+mod parallel_owner_tests;
