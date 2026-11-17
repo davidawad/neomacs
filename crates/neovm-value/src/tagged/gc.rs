@@ -1079,6 +1079,12 @@ pub struct TaggedHeap {
     /// is N-mutator ready. Appended after the frozen store ABI fields, so no
     /// pinned offset moves.
     overlay_serial: crate::heap_types::OverlaySerialCounter,
+
+    /// The owner threads' allocator (`owner_pages.rs`), made when the first
+    /// owner state is; `None` keeps every allocation on the keeper path.
+    /// Appended last, so no pinned offset moves.
+    #[cfg(feature = "shared-heap")]
+    owner_pages: Option<std::sync::Arc<owner_pages::OwnerPages>>,
 }
 
 impl Default for TaggedHeap {
@@ -1213,6 +1219,8 @@ impl TaggedHeap {
             #[cfg(any(test, feature = "test-support"))]
             mapped_veclike_traces: 0,
             overlay_serial: crate::heap_types::OverlaySerialCounter::new(),
+            #[cfg(feature = "shared-heap")]
+            owner_pages: None,
             dirty_owner_bits: FxHashSet::default(),
             dirty_writes: Vec::new(),
             gc_collections: 0,

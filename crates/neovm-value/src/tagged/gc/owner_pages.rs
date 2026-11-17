@@ -211,3 +211,222 @@ impl<T: PagedObject> PagePool<T> {
         adopted.into_iter().map(|pending| pending.page).collect()
     }
 }
+
+/// The cold allocator state, only ever touched under [`OwnerPages::cold`].
+struct AllocatorCold {
+    blocks: Vec<PendingBlock>,
+    /// Base of the cons block being carved.
+    carving_block: Option<usize>,
+    floats: PagePool<FloatObj>,
+    strings: PagePool<StringObj>,
+    vectors: PagePool<VectorObj>,
+    /// Owner-allocated boxed vector-likes awaiting their `all_objects` link.
+    boxed: Vec<*mut VecLikeHeader>,
+    charges: Charges,
+    open_runs: usize,
+}
+
+// SAFETY: the raw pointers name block and page storage and boxed objects this
+// state owns exclusively until adoption hands them to the keeper's heap; they
+// are read and written only under `OwnerPages::cold`, from whichever thread
+// holds it. No thread-affine data (no Rc, no TLS-derived pointer) is held.
+unsafe impl Send for AllocatorCold {}
+
+/// A cons block adoption registers, with its closed runs.
+pub(super) struct AdoptedBlock {
+    pub(super) block: ConsBlock,
+    /// `(first cell index, cells)` handed out.
+    pub(super) handed: Vec<(usize, usize)>,
+    /// `(first cell index, cells)` never handed out.
+    pub(super) unused: Vec<(usize, usize)>,
+}
+
+/// What one adoption moves into the heap.
+struct Adoption {
+    blocks: Vec<AdoptedBlock>,
+    floats: Vec<ObjectPage<FloatObj>>,
+    strings: Vec<ObjectPage<StringObj>>,
+    vectors: Vec<ObjectPage<VectorObj>>,
+    boxed: Vec<*mut VecLikeHeader>,
+    charges: Charges,
+}
+
+impl AllocatorCold {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            carving_block: None,
+            floats: PagePool::new(),
+            strings: PagePool::new(),
+            vectors: PagePool::new(),
+            boxed: Vec::new(),
+            charges: Charges::default(),
+            open_runs: 0,
+        }
+    }
+
+    fn carve(&mut self, class: OwnerClass, sizes: OwnerRunSizes) -> OwnerRun {
+        self.open_runs += 1;
+        match class {
+            OwnerClass::Cons => self.carve_cons(sizes.cons_cells),
+            OwnerClass::Float => self.floats.carve(sizes.slots),
+            OwnerClass::String => self.strings.carve(sizes.slots),
+            OwnerClass::Vector => self.vectors.carve(sizes.slots),
+        }
+    }
+
+    fn block_mut(&mut self, base: usize) -> &mut PendingBlock {
+        self.blocks
+            .iter_mut()
+            .rev()
+            .find(|pending| pending.block.base_addr() == base)
+            .expect("an owner run names a pending cons block")
+    }
+
+    fn carve_cons(&mut self, want: usize) -> OwnerRun {
+        let reserved = self
+            .carving_block
+            .map(|base| (base, self.block_mut(base).block.reserve_tail(want)))
+            .filter(|&(_, (_, n))| n > 0);
+        let (base, first, n) = match reserved {
+            Some((base, (first, n))) => (base, first, n),
+            None => {
+                let mut block = ConsBlock::new();
+                let (first, n) = block.reserve_tail(want);
+                let base = block.base_addr();
+                self.blocks.push(PendingBlock {
+                    block,
+                    open_runs: 0,
+                    handed: Vec::new(),
+                    unused: Vec::new(),
+                });
+                self.carving_block = Some(base);
+                (base, first, n)
+            }
+        };
+        let pending = self.block_mut(base);
+        pending.open_runs += 1;
+        // SAFETY: `first + n` is within the block's cells (`reserve_tail`).
+        let start = unsafe { pending.block.cells_ptr().add(first) } as usize;
+        OwnerRun {
+            start,
+            cur: start,
+            lim: start + n * size_of::<ConsCell>(),
+        }
+    }
+
+    /// Close one owner run and charge what it handed out.
+    fn close(&mut self, class: OwnerClass, run: OwnerRun) {
+        if run.start == 0 {
+            return;
+        }
+        self.open_runs -= 1;
+        let mut charges = Charges::default();
+        match class {
+            OwnerClass::Cons => {
+                let pending = self.block_mut(run.start & !(CONS_BLOCK_ALIGN - 1));
+                let first = ConsBlock::index_of_ptr(run.start as *const ConsCell);
+                let used = (run.cur - run.start) / size_of::<ConsCell>();
+                let unused = (run.lim - run.cur) / size_of::<ConsCell>();
+                if used > 0 {
+                    pending.handed.push((first, used));
+                }
+                if unused > 0 {
+                    pending.unused.push((first + used, unused));
+                }
+                pending.open_runs -= 1;
+                charges.count(MemoryUseCountSlot::ConsCells, used as u64);
+                charges.allocated += used;
+                charges.cons_live += used;
+                charges.bytes += used * size_of::<ConsCell>();
+            }
+            OwnerClass::Float => {
+                let used = self.floats.close(run);
+                charges.count(MemoryUseCountSlot::Floats, used as u64);
+                charges.allocated += used;
+                charges.bytes += used * size_of::<FloatObj>();
+            }
+            OwnerClass::String => {
+                self.strings.close(run);
+            }
+            OwnerClass::Vector => {
+                self.vectors.close(run);
+            }
+        }
+        self.charges.add(&charges);
+    }
+
+    /// Everything no open run still writes; with no run open anywhere, the
+    /// carving blocks and pages as well (owners start fresh ones).
+    fn drain(&mut self) -> Adoption {
+        let all = self.open_runs == 0;
+        let carving = self.carving_block;
+        let (blocks, kept) = std::mem::take(&mut self.blocks)
+            .into_iter()
+            .partition::<Vec<_>, _>(|pending| {
+                pending.open_runs == 0 && (all || Some(pending.block.base_addr()) != carving)
+            });
+        if all {
+            self.carving_block = None;
+        }
+        self.blocks = kept;
+        let blocks = blocks
+            .into_iter()
+            .map(|pending| AdoptedBlock {
+                block: pending.block,
+                handed: pending.handed,
+                unused: pending.unused,
+            })
+            .collect();
+        Adoption {
+            blocks,
+            floats: self.floats.drain(all),
+            strings: self.strings.drain(all),
+            vectors: self.vectors.drain(all),
+            boxed: std::mem::take(&mut self.boxed),
+            charges: std::mem::take(&mut self.charges),
+        }
+    }
+}
+
+/// The owner allocator a heap shares with its owner threads.
+pub(crate) struct OwnerPages {
+    cold: parking_lot::Mutex<AllocatorCold>,
+    sizes: OwnerRunSizes,
+    refills: AtomicU64,
+    lock_wait_ns: AtomicU64,
+    adoptions: AtomicU64,
+}
+
+impl OwnerPages {
+    pub(crate) fn new(sizes: OwnerRunSizes) -> Self {
+        Self {
+            cold: parking_lot::Mutex::new(AllocatorCold::new()),
+            sizes,
+            refills: AtomicU64::new(0),
+            lock_wait_ns: AtomicU64::new(0),
+            adoptions: AtomicU64::new(0),
+        }
+    }
+
+    /// Take the cold mutex, counting the acquisition and any wait.
+    fn lock(&self) -> parking_lot::MutexGuard<'_, AllocatorCold> {
+        self.refills.fetch_add(1, Ordering::Relaxed);
+        if let Some(guard) = self.cold.try_lock() {
+            return guard;
+        }
+        let start = std::time::Instant::now();
+        let guard = self.cold.lock();
+        let waited = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.lock_wait_ns.fetch_add(waited, Ordering::Relaxed);
+        guard
+    }
+
+    pub(crate) fn stats(&self) -> OwnerAllocStats {
+        OwnerAllocStats {
+            refills: self.refills.load(Ordering::Relaxed),
+            lock_wait_ns: self.lock_wait_ns.load(Ordering::Relaxed),
+            adoptions: self.adoptions.load(Ordering::Relaxed),
+        }
+    }
+}
