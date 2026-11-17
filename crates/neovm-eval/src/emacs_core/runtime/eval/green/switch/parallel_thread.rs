@@ -54,6 +54,13 @@ fn run_body(owner: &mut Context, function: Value) -> Result<Value, Flow> {
         if PANIC_NEXT_BODY.swap(false, std::sync::atomic::Ordering::Relaxed) {
             panic!("test hook: a Parallel thread body panics");
         }
+        // The collector's tests run Rust bodies on Lisp threads.
+        #[cfg(test)]
+        if let Some(body) =
+            crate::emacs_core::eval::world::parallel_gc::detached::take_thread_body(owner, function)
+        {
+            return Ok(Value::fixnum(body(owner)));
+        }
         owner.apply(function, Vec::new())
     }))
     .unwrap_or_else(|_| Err(signal("error", vec![Value::string("Lisp thread panicked")])))
@@ -66,6 +73,12 @@ fn run_detached_body(
     function: Value,
     lock: &BatonLock,
 ) -> Result<Value, Flow> {
+    // The collector's tests run their Rust bodies attached: each body opens
+    // its own detached sections (`parallel_gc::detached`).
+    #[cfg(test)]
+    if crate::emacs_core::eval::world::parallel_gc::detached::has_thread_body(owner, function) {
+        return run_body(owner, function);
+    }
     prepare_detached_table();
     // Counted before the Baton goes back, so no collection starts in between.
     lock.body_detached();

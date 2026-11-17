@@ -65,6 +65,19 @@ impl Control {
         // waiting detached re-check theirs, then queue on the lock.
         self.metadata_changed.notify_all();
         let baton = if wait == Wait::Runnable {
+            // The collector's test of detached execution runs its section
+            // here, between this park's detach and attach.
+            #[cfg(test)]
+            if let Some(section) =
+                crate::emacs_core::eval::world::parallel_gc::detached::take_pending_section()
+            {
+                // It runs, detached: a yielding peer must not wait for its
+                // attach.
+                self.parallel_resumed(me);
+                let baton = section.run(lock, baton);
+                self.parallel_resumed(me);
+                return Ok(Wake::Resume(baton));
+            }
             lock.yield_baton(baton, peer_runnable)
         } else {
             lock.detach(baton);

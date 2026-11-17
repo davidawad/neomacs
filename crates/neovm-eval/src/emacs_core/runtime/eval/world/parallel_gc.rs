@@ -475,6 +475,19 @@ pub(crate) mod detached {
             .push((name.to_owned(), Box::new(body)));
     }
 
+    /// Whether a thread started on FUNCTION runs a registered body.
+    pub(crate) fn has_thread_body(ctx: &Context, function: Value) -> bool {
+        let Some(symbol) = function.as_symbol_id(ctx.symbol_mode()) else {
+            return false;
+        };
+        let name = neovm_value::intern::resolve_sym(symbol);
+        BODIES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(known, _)| known.as_str() == name)
+    }
+
     /// The registered body of a thread started on FUNCTION.
     pub(crate) fn take_thread_body(ctx: &Context, function: Value) -> Option<ThreadBody> {
         let symbol = function.as_symbol_id(ctx.symbol_mode())?;
