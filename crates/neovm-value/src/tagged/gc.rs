@@ -2588,6 +2588,15 @@ mod record_arena_tests;
 /// are traced children). Scenarios run plain and (where the partition
 /// matters) VERIFY_PARTITION.
 mod allocation;
+#[cfg(feature = "shared-heap")]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "slices S3/S4 install and park owners; this slice's tests do"
+    )
+)]
+mod owner_pages;
 
 mod collector_tables;
 #[cfg(not(feature = "test-support"))]
