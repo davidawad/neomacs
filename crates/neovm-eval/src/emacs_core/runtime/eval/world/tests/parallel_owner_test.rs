@@ -389,3 +389,129 @@ fn a_panic_in_a_thread_body_releases_the_baton() {
         "again"
     );
 }
+
+#[test]
+fn a_detached_threads_values_survive_another_threads_collection() {
+    let mut ev = parallel();
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(let ((kept (make-list 1000 'kept)))
+               (thread-join
+                (make-thread (lambda ()
+                               (let ((i 0))
+                                 (while (< i 2000)
+                                   (make-list 50 i)
+                                   (setq i (1+ i))))
+                               (garbage-collect))))
+               (list (length kept) (car kept) (nth 999 kept)))"
+        ),
+        "(1000 kept kept)"
+    );
+}
+
+#[test]
+fn eight_threads_yield_and_collect_without_losing_values() {
+    let mut ev = parallel();
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(progn
+               (fset 'tp8-run
+                     (lambda (n)
+                       (let ((mine nil) (k 0))
+                         (while (< k 30)
+                           (setq mine (cons (make-list 20 (+ (* n 1000) k)) mine))
+                           (thread-yield)
+                           (if (= (% k 10) 0) (garbage-collect))
+                           (setq k (1+ k)))
+                         (let ((sum 0))
+                           (while mine
+                             (let ((xs (car mine)))
+                               (while xs (setq sum (+ sum (car xs)) xs (cdr xs))))
+                             (setq mine (cdr mine)))
+                           sum))))
+               (let ((ths nil) (i 0))
+                 (while (< i 8)
+                   (setq ths (cons (make-thread (list 'lambda nil (list 'tp8-run i))) ths))
+                   (setq i (1+ i)))
+                 (mapcar #'thread-join (nreverse ths))))"
+        ),
+        "(8700 608700 1208700 1808700 2408700 3008700 3608700 4208700)"
+    );
+}
+
+#[test]
+fn a_detached_threads_vm_frames_survive_other_threads_collections() {
+    let mut ev = parallel();
+    // `(lambda () (list (make-list 100 'x) (tpv-next) (make-list 100 'y)))`
+    // as byte-code: its first list lives only on the VM stack across the call.
+    eval(
+        &mut ev,
+        "(fset 'tpv-f
+           (make-byte-code nil
+                           (unibyte-string 192 193 194 195 34 196 32 193 194 197 34 35 135)
+                           [list make-list 100 x tpv-next y]
+                           6))",
+    );
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(progn
+               (setq tpv-depth 10)
+               (fset 'tpv-next (lambda ()
+                                 (if (> tpv-depth 0)
+                                     (progn (setq tpv-depth (1- tpv-depth)) (tpv-f))
+                                   (thread-yield)
+                                   'bottom)))
+               (fset 'tpv-count (lambda (r)
+                                  (let ((n 0))
+                                    (while (consp r)
+                                      (let ((xs (car r)))
+                                        (while xs
+                                          (if (eq (car xs) 'x) (setq n (1+ n)))
+                                          (setq xs (cdr xs))))
+                                      (setq r (car (cdr r))))
+                                    n)))
+               (let ((th (make-thread (lambda () (tpv-count (tpv-f))))))
+                 (thread-yield)
+                 (let ((i 0))
+                   (while (< i 3)
+                     (let ((j 0)) (while (< j 3000) (make-list 20 j) (setq j (1+ j))))
+                     (garbage-collect)
+                     (setq i (1+ i))))
+                 (thread-join th)))"
+        ),
+        "1100"
+    );
+}
+
+#[test]
+fn main_ending_ends_every_thread_and_joins_its_os_thread() {
+    let mut ev = parallel();
+    eval(
+        &mut ev,
+        "(progn
+           (setq tpt-m (make-mutex) tpt-ran nil)
+           (mutex-lock tpt-m)
+           (setq tpt-a (make-thread (lambda ()
+                                      (unwind-protect (mutex-lock tpt-m)
+                                        (setq tpt-ran 'a)))))
+           (setq tpt-b (make-thread (lambda ()
+                                      (unwind-protect (sleep-for 30)
+                                        (setq tpt-ran 'b)))))
+           (thread-yield)
+           (setq tpt-c (make-thread (lambda () (setq tpt-ran 'c)))))",
+    );
+    ev.green_teardown();
+    assert!(ev.visible_variable_value_or_nil("tpt-ran").is_nil());
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(list (thread-live-p tpt-a) (thread-live-p tpt-b) (thread-live-p tpt-c)
+                   (plist-get (neomacs-shared-heap-stats) :threads))"
+        ),
+        "(nil nil nil 1)"
+    );
+    drop(ev);
+}
