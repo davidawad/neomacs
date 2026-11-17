@@ -841,3 +841,20 @@ fn measure_bench_workloads_serial_versus_parallel() {
         );
     }
 }
+
+/// The bytecode VM's `cons` on a detached thread takes the thread's own
+/// allocation runs: two threads interpreting `b-cons` (40000 conses each)
+/// attach for their allocation state once each, not once per cons.
+#[test]
+fn a_bytecode_cons_loop_attaches_a_bounded_number_of_times() {
+    // Every thread interprets the bytecode: no compile replaces `Op::Cons`.
+    // SAFETY: before any thread of this test process reads the variable.
+    unsafe { std::env::set_var("NEOVM_JIT", "0") };
+    let mut ev = bench_world();
+    let workload = &BENCH_WORKLOADS[1];
+    let serial = eval(&mut ev, workload.call);
+    let row = bench_row(&mut ev, workload, 2, &serial);
+    println!("b-cons, 2 threads, JIT off: {row:?}");
+    assert_eq!(row.attach_by_class, 0, "{row:?}");
+    assert!(row.attach_by_alloc <= 2, "{row:?}");
+}

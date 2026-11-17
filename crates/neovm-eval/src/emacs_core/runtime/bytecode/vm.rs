@@ -6811,13 +6811,18 @@ impl<'a> Vm<'a> {
                         // The Context owns the heap: allocate through it
                         // directly instead of Value::cons's thread-local
                         // heap lookup (a TLS access per cons on the hottest
-                        // allocation opcode).
-                        // A Parallel World's detached thread attaches for it.
+                        // allocation opcode). A Parallel World's detached
+                        // thread conses from its own allocation runs
+                        // (`Value::cons`), without the Baton.
                         #[cfg(feature = "shared-heap")]
-                        let _attached = neovm_value::detached::AttachedScope::enter(
-                            neovm_value::detached::AttachReason::Alloc,
-                        );
-                        stk!()[len - 2] = self.ctx.tagged_heap.alloc_cons(car_val, cdr_val);
+                        let cell = if neovm_value::detached::is_detached() {
+                            Value::cons(car_val, cdr_val)
+                        } else {
+                            self.ctx.tagged_heap.alloc_cons(car_val, cdr_val)
+                        };
+                        #[cfg(not(feature = "shared-heap"))]
+                        let cell = self.ctx.tagged_heap.alloc_cons(car_val, cdr_val);
+                        stk!()[len - 2] = cell;
                         stk!().pop();
                     }
                     Op::List(n) => {
