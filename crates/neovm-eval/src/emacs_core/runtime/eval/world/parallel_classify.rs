@@ -12,16 +12,26 @@
 //! thread makes while detached attach in `neovm_value::detached`, and
 //! collections wait until no thread runs detached.
 
+use super::{Baton, BatonLock, Context};
 use crate::emacs_core::eval::subr_abi::SubrFn;
 use crate::emacs_core::subr::effect_catalog::inventory;
 use crate::emacs_core::subr::effect_schema::{
     ArithOperands, CatalogKind, ParallelClass, ParallelVariant,
 };
-use neovm_value::detached::AttachReason;
+use neovm_value::detached::{AttachReason, DetachedGate};
+use neovm_value::error::Flow;
 use neovm_value::intern::SymId;
 use neovm_value::value::Value;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+/// A detached thread attached for one primitive
+/// ([`Context::parallel_attach`]); give it to [`Context::parallel_detach`].
+#[must_use = "the thread holds the Baton until it detaches"]
+pub(crate) struct ParallelAttach {
+    lock: std::sync::Arc<BatonLock>,
+    gate: DetachedGate,
+}
 
 /// Where a primitive runs in a detached thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,4 +359,160 @@ pub(crate) fn symbol_attach_reason(symbol: SymId, args: &[Value]) -> Option<Atta
     }
     let placement = DetachedTable::get().by_symbol.get(&symbol).copied();
     attach_reason(placement, args)
+}
+
+/// The gate's attach: take the Baton for one heap access.
+///
+/// # Safety
+///
+/// LOCK is the `BatonLock` [`detached_gate`] erased, still alive.
+unsafe fn gate_attach(lock: *const (), reason: AttachReason) -> *mut () {
+    // SAFETY: the caller's contract.
+    let lock = unsafe { &*lock.cast::<BatonLock>() };
+    lock.count_attach(reason);
+    Box::into_raw(Box::new(lock.attach().into_baton())).cast()
+}
+
+/// The gate's detach: a collection the access made due waits for the
+/// detached threads; then the Baton goes back.
+///
+/// # Safety
+///
+/// As [`gate_attach`]; TOKEN is what it returned.
+unsafe fn gate_detach(lock: *const (), token: *mut ()) {
+    // SAFETY: the caller's contract.
+    let lock = unsafe { &*lock.cast::<BatonLock>() };
+    // SAFETY: `gate_attach` boxed this Baton, and each token detaches once.
+    let baton = unsafe { Box::from_raw(token.cast::<Baton>()) };
+    neovm_value::tagged::gc::with_tagged_heap(|heap| {
+        if heap.should_collect() {
+            lock.defer_collection(heap.bytes_since_gc() as u64);
+        }
+    });
+    lock.detach(*baton);
+}
+
+/// The gate's count of a detached read.
+///
+/// # Safety
+///
+/// As [`gate_attach`].
+unsafe fn gate_note(lock: *const (), reason: AttachReason) {
+    // SAFETY: the caller's contract.
+    unsafe { &*lock.cast::<BatonLock>() }.count_attach(reason);
+}
+
+/// The gate a detached thread of LOCK's World runs behind. LOCK must
+/// outlive the thread's detached body (the World holds it).
+pub(crate) fn detached_gate(lock: &BatonLock) -> DetachedGate {
+    DetachedGate {
+        lock: std::ptr::from_ref(lock).cast(),
+        attach: gate_attach,
+        detach: gate_detach,
+        note: gate_note,
+    }
+}
+
+impl Context {
+    /// Run F attached when this OS thread runs detached: take the Baton
+    /// for REASON, seat it for F (a wait inside F gives it up and takes it
+    /// back as on any thread), and detach again after. If F unwinds, the
+    /// thread stays attached; its body's end expects either.
+    pub(crate) fn with_parallel_attach<R>(
+        &mut self,
+        reason: AttachReason,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let attach = self.parallel_attach(reason);
+        let result = f(self);
+        if let Some(attach) = attach {
+            self.parallel_detach(attach);
+        }
+        result
+    }
+
+    /// The first half of [`Self::with_parallel_attach`], for a caller whose
+    /// call needs more than this Context: `None` on an attached thread.
+    pub(crate) fn parallel_attach(&mut self, reason: AttachReason) -> Option<ParallelAttach> {
+        let lock = self.parallel_lock_shared()?;
+        let gate = neovm_value::detached::suspend_detached()?;
+        lock.count_attach(reason);
+        self.parallel_seat_baton(lock.attach().into_baton());
+        Some(ParallelAttach { lock, gate })
+    }
+
+    /// The second half of [`Self::with_parallel_attach`].
+    pub(crate) fn parallel_detach(&mut self, attach: ParallelAttach) {
+        let baton = self.parallel_unseat_baton();
+        attach.lock.detach(baton);
+        neovm_value::detached::resume_detached(attach.gate);
+    }
+
+    /// Whether a GC safe point must not collect now: a detached thread
+    /// never does, and while any thread runs detached a due collection is
+    /// deferred (slice S3's stage-2 limitation: their stacks hold roots no
+    /// collector can see until slice S4).
+    #[inline]
+    pub(crate) fn parallel_defers_safe_point(&self) -> bool {
+        if neovm_value::detached::is_detached() {
+            return true;
+        }
+        let Some(lock) = self.parallel_lock() else {
+            return false;
+        };
+        if Self::detached_peers(lock) == 0 {
+            return false;
+        }
+        if self.tagged_heap.should_collect() {
+            lock.defer_collection(self.tagged_heap.bytes_since_gc() as u64);
+        }
+        true
+    }
+
+    /// [`Self::parallel_defers_safe_point`] at a collection's entry; a
+    /// collection that runs after a deferral is counted.
+    pub(crate) fn parallel_defers_collection(&self) -> bool {
+        if neovm_value::detached::is_detached() {
+            return true;
+        }
+        let Some(lock) = self.parallel_lock() else {
+            return false;
+        };
+        if Self::detached_peers(lock) > 0 {
+            lock.defer_collection(self.tagged_heap.bytes_since_gc() as u64);
+            return true;
+        }
+        lock.collection_runs();
+        false
+    }
+
+    /// Detached bodies other than this OS thread's own (whose roots the
+    /// collection it runs does see).
+    fn detached_peers(lock: &BatonLock) -> u64 {
+        let own = u64::from(neovm_value::detached::running_detached());
+        lock.detached_threads().saturating_sub(own)
+    }
+
+    /// GNU `thread-signal` reaches a detached thread through its quit
+    /// request: at its next quit poll the thread raises the signal stored
+    /// for it, attached. Any other quit request is left for the ordinary
+    /// poll.
+    pub(crate) fn parallel_raise_thread_signal(&mut self) -> Result<(), Flow> {
+        if self.parallel_lock().is_none()
+            || !neovm_value::detached::running_detached()
+            || !self.quit_requested.is_requested()
+        {
+            return Ok(());
+        }
+        let Some(key) = self.green_key() else {
+            return Ok(());
+        };
+        self.with_parallel_attach(AttachReason::Class, |ctx| {
+            if !ctx.threads.has_pending_thread_signal(key.id()) {
+                return Ok(());
+            }
+            ctx.quit_requested.clear();
+            ctx.green_raise_pending_signal(key)
+        })
+    }
 }

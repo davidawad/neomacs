@@ -55,7 +55,7 @@ pub(crate) use green_owner::OwnedProofProjection;
 pub(crate) use green_owner::{FrozenLegacyRoots, OwnedParallelError, OwnedParallelProjection};
 #[cfg(feature = "shared-heap")]
 pub(crate) use parallel_classify::{
-    prepare_detached_table, subr_attach_reason, symbol_attach_reason,
+    detached_gate, prepare_detached_table, subr_attach_reason, symbol_attach_reason,
 };
 #[cfg(feature = "shared-heap")]
 pub(crate) use parallel_owner::{BatonLock, ParallelStats};
