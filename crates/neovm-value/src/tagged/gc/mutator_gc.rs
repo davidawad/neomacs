@@ -122,11 +122,11 @@ impl TaggedHeap {
 
     #[inline]
     pub(super) fn mutators(&self) -> impl Iterator<Item = &MutatorGcState> {
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(any(test, feature = "test-support", feature = "shared-heap")))]
         {
             std::iter::once(self.current_mutator_gc())
         }
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, feature = "test-support", feature = "shared-heap"))]
         {
             std::iter::once(&self.mutator_gc).chain(
                 self._satb_layout_reserve
@@ -140,11 +140,11 @@ impl TaggedHeap {
 
     #[inline]
     pub(super) fn mutators_mut(&mut self) -> impl Iterator<Item = &mut MutatorGcState> {
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(any(test, feature = "test-support", feature = "shared-heap")))]
         {
             std::iter::once(self.current_mutator_gc_mut())
         }
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, feature = "test-support", feature = "shared-heap"))]
         {
             std::iter::once(&mut self.mutator_gc).chain(
                 self._satb_layout_reserve
@@ -268,10 +268,16 @@ impl SatbMutatorState {
 
 /// One registered test owner includes a real hot MutatorGcState, not merely a
 /// transport buffer. The ordinary iterator family and the stopped SATB fold
-/// both enumerate this exact same set of registrations.
-#[cfg(any(test, feature = "test-support"))]
+/// both enumerate this exact same set of registrations. A `shared-heap`
+/// build keeps the chain too, so a Parallel World's per-owner barrier state
+/// is visited by the stopped collector once owners register it.
+#[cfg(any(test, feature = "test-support", feature = "shared-heap"))]
 struct RegisteredMutatorGc {
     gc: MutatorGcState,
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(dead_code, reason = "only the test registry folds SATB state")
+    )]
     satb: SatbMutatorState,
 }
 
@@ -287,7 +293,7 @@ struct MutatorSatbRegistry {
     /// Owner-resident SATB words folded by the last successful termination.
     /// Keep diagnostics in this cold allocation so heap/JIT offsets do not move.
     last_termination_partial_words: usize,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "shared-heap"))]
     registered: Vec<RegisteredMutatorGc>,
     /// Scoped pointer to the actual AllStopped guard; never a manufactured proof.
     /// Access and lifetime erasure are confined to collector_tables.
@@ -354,7 +360,7 @@ impl MutatorSatbSlot {
             current: SatbMutatorState::new(young),
             young_control,
             last_termination_partial_words: 0,
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(any(test, feature = "test-support", feature = "shared-heap"))]
             registered: Vec::new(),
             collector_tables: None,
             observations: std::cell::OnceCell::new(),

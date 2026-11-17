@@ -30,6 +30,11 @@ pub enum AsyncSource {
     /// A handled OS signal is pending (`os_signal::drain_pending_os_signals`
     /// consumes it).
     OsSignal = 1 << 1,
+    /// A Parallel World's collection asks every thread running detached to
+    /// park at its next safe point (feature `shared-heap`; the requester
+    /// lowers it when the collection ends).
+    #[cfg(feature = "shared-heap")]
+    StopRequest = 1 << 2,
 }
 
 /// Bits 8..32 of [`ASYNC_ATTENTION`] count the raised [`QuitRequest`]s of the
