@@ -176,6 +176,94 @@ fn a_collection_stops_a_thread_running_detached() {
     assert_eq!(after.safepoint_stops - before.safepoint_stops, 1);
 }
 
+/// Eight threads, each building 10_000-element lists in Lisp and summing
+/// them in detached sections, with a tiny `gc-cons-threshold`.
+fn eight_threads_cons_and_collect() {
+    const THREADS: usize = 8;
+    const ROUNDS: i64 = 50;
+    const N: i64 = 10_000;
+    let mut ev = parallel();
+    // Threads still consing, and threads waiting in a section for a peer's
+    // collection: a section waits for one while some peer still conses, so
+    // every run stops threads at their safe points, however it is timed.
+    let alive = Arc::new(AtomicUsize::new(THREADS));
+    let waiting = Arc::new(AtomicUsize::new(0));
+    for k in 0..THREADS {
+        let (alive, waiting) = (Arc::clone(&alive), Arc::clone(&waiting));
+        register_thread_body(&format!("pgc-cons-{k}"), move |owner| {
+            let mut wrong = 0;
+            for round in 0..ROUNDS {
+                let base = (k as i64 * ROUNDS + round) * 100;
+                let list = apply(
+                    owner,
+                    "pgc-seq",
+                    vec![Value::fixnum(N), Value::fixnum(base)],
+                );
+                let (alive, waiting) = (Arc::clone(&alive), Arc::clone(&waiting));
+                let sum = with_detached(owner, &[list], move |section| {
+                    let entered = section.collections();
+                    waiting.fetch_add(1, Ordering::AcqRel);
+                    let mut sum = sum_detached(section, 0);
+                    while section.collections() == entered
+                        && waiting.load(Ordering::Acquire) < alive.load(Ordering::Acquire)
+                    {
+                        sum = sum_detached(section, 0);
+                    }
+                    waiting.fetch_sub(1, Ordering::AcqRel);
+                    sum
+                });
+                if sum != seq_sum(N, base) {
+                    wrong += 1;
+                }
+            }
+            alive.fetch_sub(1, Ordering::AcqRel);
+            wrong
+        });
+    }
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(progn
+               (setq gc-cons-threshold 10000)
+               (let ((ths nil) (k 0))
+                 (while (< k 8)
+                   (setq ths (cons (make-thread (intern (format \"pgc-cons-%d\" k))) ths))
+                   (setq k (1+ k)))
+                 (mapcar #'thread-join (nreverse ths))))"
+        ),
+        "(0 0 0 0 0 0 0 0)"
+    );
+    let stats = stats(&ev);
+    println!("eight threads: {stats:?}");
+    assert!(stats.collections > 0, "{stats:?}");
+    // A stop counts the threads that were inside a detached section; the
+    // others were waiting for the Baton (parked by Green's park) or consing
+    // under it (see VERIFY.md).
+    assert!(stats.safepoint_stops > 0, "{stats:?}");
+    assert!(
+        stats.safepoint_stops <= stats.collections * THREADS as u64,
+        "{stats:?}"
+    );
+}
+
+#[test]
+fn eight_threads_cons_and_collect_generational() {
+    assert_ne!(
+        std::env::var("NEOVM_GC_GENERATIONAL").as_deref(),
+        Ok("0"),
+        "the default collector is generational"
+    );
+    eight_threads_cons_and_collect();
+}
+
+#[test]
+fn eight_threads_cons_and_collect_full_heap_only() {
+    // SAFETY: nextest runs each test in its own process, and no other thread
+    // of this one exists yet; the heap reads the variable as it is built.
+    unsafe { std::env::set_var("NEOVM_GC_GENERATIONAL", "0") };
+    eight_threads_cons_and_collect();
+}
+
 #[test]
 fn a_collection_completes_while_a_thread_waits_in_thread_join() {
     let mut ev = parallel();

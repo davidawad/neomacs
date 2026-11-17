@@ -394,6 +394,11 @@ pub(crate) mod detached {
             unsafe { Value::from_bits(self.held[index]) }
         }
 
+        /// How many collections the World has finished.
+        pub(crate) fn collections(&self) -> u64 {
+            self.stop.counters().collections
+        }
+
         /// A safe point: park here when a stop is requested.
         pub(crate) fn safepoint(&mut self) {
             let held = &self.held;
