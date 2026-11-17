@@ -100,6 +100,12 @@ pub extern "C" fn neovm_jit_cons(car: i64, cdr: i64) -> i64 {
 /// while the caller's other values sit in native slots.
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn neovm_jit_make_float(value: f64) -> i64 {
+    // A Parallel World's detached thread boxes from its own allocation
+    // runs, without the Baton.
+    #[cfg(feature = "shared-heap")]
+    if neovm_value::detached::is_detached() {
+        return Value::make_float(value).bits() as i64;
+    }
     neovm_value::tagged::gc::with_tagged_heap(|heap| heap.alloc_float_inline(value)).bits() as i64
 }
 

@@ -7501,6 +7501,8 @@ pub(crate) enum MainNativeWaitObservation {
 }
 
 pub(crate) use admission::ThreadingMode;
+#[cfg(feature = "shared-heap")]
+pub(crate) use admission::parallel_world_made;
 pub(crate) use green::GreenStartError;
 #[doc(hidden)]
 pub use green::switch::MainNativeHandoff;

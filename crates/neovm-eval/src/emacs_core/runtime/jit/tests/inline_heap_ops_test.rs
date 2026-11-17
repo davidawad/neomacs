@@ -1482,6 +1482,50 @@ fn the_inline_alloc_knob_turns_inline_allocation_off() {
     assert_eq!(conses_counted() - before, 300);
 }
 
+/// A Parallel World's threads run compiled code without the Baton, and an
+/// inline allocation bumps the heap's one keeper cursor, which every one of
+/// them would share: once the process made a Parallel World, no compile
+/// emits one, and the loop's conses come from the shim, counted exactly
+/// the same.
+#[cfg(feature = "shared-heap")]
+#[test]
+fn a_parallel_world_compiles_no_inline_allocation() {
+    let mut eval = crate::test_utils::with_legacy_gc(|| {
+        Context::new_with_threading(
+            crate::emacs_core::eval::ThreadingMode::Parallel,
+            crate::test_utils::unit_runtime(),
+        )
+    });
+    assert!(!super::jit_inline_alloc_on());
+    eval.eval_str("(fset 'inline-alloc-probe (lambda () nil))")
+        .expect("probe");
+    let ctx_ptr = &mut eval as *mut Context as *mut u8;
+    let f = cons_loop_fn(-1);
+    let emitted = allocs_emitted();
+    let leaf = compile_bytecode_function_with(&f, Some(&eval.obarray)).expect("compiles");
+    assert_eq!(
+        allocs_emitted(),
+        emitted,
+        "no inline allocation in a Parallel World"
+    );
+    let before = conses_counted();
+    let Some(bits) = (match leaf.call(ctx_ptr, &[Value::make_int(300)]) {
+        NativeRun::Ok(bits) => Some(bits),
+        _ => None,
+    }) else {
+        panic!("the loop must run natively");
+    };
+    check_counted_list(
+        unsafe {
+            /* SAFETY: NativeRun::Ok is a real Value's tagged bits */
+            Value::from_bits(bits)
+        },
+        300,
+        "Parallel World",
+    );
+    assert_eq!(conses_counted() - before, 300);
+}
+
 // ---- P3.2 L0.9 / U2.10: no slot-0 test; `NEOVM_JIT_AREF_SLOT0` ----
 
 /// `(lambda (a i) (aref a i))`

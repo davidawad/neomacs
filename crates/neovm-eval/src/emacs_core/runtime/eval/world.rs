@@ -1339,7 +1339,7 @@ impl WorldStorageBuilder {
             global: Box::new(UnsafeCell::new(self.global)),
             owner_slabs: Default::default(),
             thread_projections: Default::default(),
-            threading: Cell::new(super::admission::ThreadingMode::from_env()),
+            threading: Cell::new(super::admission::ThreadingMode::from_env().for_new_world()),
             green: Default::default(),
             #[cfg(feature = "shared-heap")]
             parallel: std::sync::OnceLock::new(),
@@ -1481,7 +1481,7 @@ impl Context {
             !self.threads_admitted(),
             "the mode is fixed before admission"
         );
-        self.obarray.lease.0.threading.set(mode);
+        self.obarray.lease.0.threading.set(mode.for_new_world());
     }
 
     /// Whether thread admission has run in this World.

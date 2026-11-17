@@ -68,7 +68,32 @@ pub(crate) enum ThreadingMode {
     Parallel,
 }
 
+/// Whether this process has made a World whose mode is Parallel. That
+/// World's threads run JIT-compiled code without the Baton, so from then on
+/// no compile allocates inline (`jit_inline_alloc_on`): an inline
+/// allocation bumps the heap's one keeper cursor, which those threads would
+/// all share.
+#[cfg(feature = "shared-heap")]
+static PARALLEL_WORLD_MADE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has made a Parallel World ([`PARALLEL_WORLD_MADE`]).
+#[cfg(feature = "shared-heap")]
+pub(crate) fn parallel_world_made() -> bool {
+    PARALLEL_WORLD_MADE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl ThreadingMode {
+    /// This mode, for a World being made in it: a Parallel one is recorded
+    /// ([`PARALLEL_WORLD_MADE`]) before any Lisp runs in it.
+    pub(crate) fn for_new_world(self) -> Self {
+        #[cfg(feature = "shared-heap")]
+        if self == Self::Parallel {
+            PARALLEL_WORLD_MADE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self
+    }
+
     /// Whether Lisp threads are owners with owner-local bindings, each on
     /// its own OS thread: Green, and the experimental Parallel.
     pub(crate) fn uses_owner_threads(self) -> bool {

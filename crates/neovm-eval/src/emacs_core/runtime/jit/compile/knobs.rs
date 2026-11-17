@@ -470,8 +470,14 @@ pub(crate) fn force_gen0_collection_journal_for_test(on: Option<bool>) {
 /// open allocation region (`heap_inline::emit_inline_cons` /
 /// `emit_inline_box_float`). Default on; `NEOVM_JIT_INLINE_ALLOC=off` calls
 /// `neovm_jit_cons`/`neovm_jit_make_float` at every site — the single-build
-/// A/B.
+/// A/B. Off once the process made a Parallel World: its threads run
+/// compiled code without the Baton, and the region is the keeper's, one for
+/// every thread; the shims allocate from each thread's own runs.
 pub(crate) fn jit_inline_alloc_on() -> bool {
+    #[cfg(feature = "shared-heap")]
+    if crate::emacs_core::eval::parallel_world_made() {
+        return false;
+    }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
