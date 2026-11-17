@@ -8,7 +8,7 @@
 //! Baton (a mutex), then releases it and allocates while the keeper waits.
 
 use super::owner_pages::{
-    OwnerAllocState, OwnerRunSizes, close_owner_regions, reopen_owner_regions,
+    OwnerAllocState, OwnerPages, OwnerRunSizes, close_owner_regions, reopen_owner_regions,
 };
 use super::*;
 use crate::heap_types::LispString;
@@ -358,4 +358,57 @@ fn keeper_without_owners_takes_the_old_path() {
     assert!(heap.region_stats.float_refills > 0);
     heap.collect_exact(roots(&got));
     assert!(heap.owner_pages.is_none());
+}
+
+/// The `tag`-th owner's `i`-th bignum: past the fixnum range.
+fn owner_bignum(tag: usize, i: usize) -> Integer {
+    Integer::from(u64::MAX) * Integer::from(tag as u64 + 1) + Integer::from(i as u64)
+}
+
+#[test]
+fn owner_threads_allocate_bignums_that_pace_and_are_adopted() {
+    crate::test_utils::init_test_tracing();
+    const N: usize = 5_000;
+    let mut heap = TestHeap::new();
+    heap.install();
+    let mut states = vec![heap.new_owner_alloc_state(), heap.new_owner_alloc_state()];
+    let before = heap.bytes_since_gc();
+    let got = detached_section(&heap, &mut states, |tag| {
+        (0..N)
+            .map(|i| Value::make_integer(owner_bignum(tag, i)).bits())
+            .collect::<Vec<_>>()
+    });
+    // Parked with their runs closed, before any adoption: the keeper's
+    // pacing already counts the owners' bignums.
+    let pending = 2 * N * size_of::<BignumObj>();
+    assert!(heap.bytes_since_gc() - before >= pending);
+    heap.close_alloc_regions();
+    assert_eq!(
+        heap.owner_pages.as_deref().map(OwnerPages::pending_bytes),
+        Some(0)
+    );
+    assert!(
+        heap.bytes_since_gc() - before >= pending,
+        "adoption charged them"
+    );
+    for (tag, bits) in got.iter().enumerate() {
+        for (i, &bits) in bits.iter().enumerate() {
+            let ptr = value(bits).as_veclike_ptr().expect("a bignum");
+            assert!(heap.bignum_arena.owns(ptr.cast()));
+            assert_eq!(value(bits).as_bignum(), Some(&owner_bignum(tag, i)));
+        }
+    }
+    // The heap's own now: a collection keeps the rooted bignums, and
+    // reclaims the second owner's once only the first's are rooted.
+    heap.collect_exact(got.iter().flatten().copied().map(value));
+    let with_garbage = heap.live_bytes();
+    heap.collect_exact(got[0].iter().copied().map(value));
+    let without = heap.live_bytes();
+    assert!(
+        without < with_garbage,
+        "live bytes {without} after dropping the second owner's bignums, {with_garbage} before"
+    );
+    for (i, &bits) in got[0].iter().enumerate() {
+        assert_eq!(value(bits).as_bignum(), Some(&owner_bignum(0, i)));
+    }
 }

@@ -38,9 +38,17 @@ impl TaggedHeap {
     /// region is never granted past the threshold
     /// (`TaggedHeap::region_budget`), so the pacing gates that read this
     /// collect when they did before — at most one region early, never late.
+    /// With owner threads (feature `shared-heap`), what their closed runs
+    /// handed out counts from the refill that closed them, before adoption
+    /// charges it here.
     #[inline(always)]
     pub fn bytes_since_gc(&self) -> usize {
-        self.mutators().map(|state| state.bytes_since_gc).sum()
+        let charged = self.mutators().map(|state| state.bytes_since_gc).sum();
+        #[cfg(feature = "shared-heap")]
+        if let Some(owners) = self.owner_pages.as_deref() {
+            return charged + owners.pending_bytes();
+        }
+        charged
     }
 
     /// Bytes allocated since the last collection, exact (GNU's `since_gc`):

@@ -995,6 +995,14 @@ impl TaggedHeap {
     /// escapes (the `alloc_float_inline` pattern).
     #[inline(always)]
     pub(crate) fn alloc_bignum_inline(&mut self, value: Integer) -> TaggedValue {
+        #[cfg(feature = "shared-heap")]
+        {
+            let owner = owner_pages::installed_owner();
+            if !owner.is_null() {
+                // SAFETY: an installed state is this thread's own (`install`).
+                return unsafe { (*owner).alloc_bignum(std::ptr::from_mut(self), value) };
+            }
+        }
         let ptr = self.bignum_arena.alloc_slot();
         unsafe {
             std::ptr::write(

@@ -4,7 +4,7 @@
 //! keeper (the thread holding the World's Baton) allocates exactly as before:
 //! its cursors stay in `JitHeapState`. Every OTHER owner thread allocates from
 //! runs it alone writes: a run of cons cells in a cons block, of float,
-//! string or vector slots in a 64 KiB page. Those blocks and pages are NOT in
+//! string, vector or bignum slots in a 64 KiB page. Those blocks and pages are NOT in
 //! the heap's registries while owners carve them; they sit in [`OwnerPages`]'s
 //! cold state behind one `parking_lot::Mutex`, which an owner takes only to
 //! close one run and carve the next (a refill). Boxed vector-likes (hash
@@ -28,7 +28,7 @@
 
 use super::*;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 /// How many cells or slots an owner takes per refill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +63,7 @@ enum OwnerClass {
     Float,
     String,
     Vector,
+    Bignum,
 }
 
 /// One open run: `[start, lim)` reserved, `[start, cur)` handed out.
@@ -220,6 +221,7 @@ struct AllocatorCold {
     floats: PagePool<FloatObj>,
     strings: PagePool<StringObj>,
     vectors: PagePool<VectorObj>,
+    bignums: PagePool<BignumObj>,
     /// Owner-allocated boxed vector-likes awaiting their `all_objects` link.
     boxed: Vec<*mut VecLikeHeader>,
     charges: Charges,
@@ -247,6 +249,7 @@ struct Adoption {
     floats: Vec<ObjectPage<FloatObj>>,
     strings: Vec<ObjectPage<StringObj>>,
     vectors: Vec<ObjectPage<VectorObj>>,
+    bignums: Vec<ObjectPage<BignumObj>>,
     boxed: Vec<*mut VecLikeHeader>,
     charges: Charges,
 }
@@ -259,6 +262,7 @@ impl AllocatorCold {
             floats: PagePool::new(),
             strings: PagePool::new(),
             vectors: PagePool::new(),
+            bignums: PagePool::new(),
             boxed: Vec::new(),
             charges: Charges::default(),
             open_runs: 0,
@@ -272,6 +276,7 @@ impl AllocatorCold {
             OwnerClass::Float => self.floats.carve(sizes.slots),
             OwnerClass::String => self.strings.carve(sizes.slots),
             OwnerClass::Vector => self.vectors.carve(sizes.slots),
+            OwnerClass::Bignum => self.bignums.carve(sizes.slots),
         }
     }
 
@@ -352,6 +357,12 @@ impl AllocatorCold {
             OwnerClass::Vector => {
                 self.vectors.close(run);
             }
+            OwnerClass::Bignum => {
+                // As `alloc_bignum_inline` charges: the object, not its limbs.
+                let used = self.bignums.close(run);
+                charges.allocated += used;
+                charges.bytes += used * size_of::<BignumObj>();
+            }
         }
         self.charges.add(&charges);
     }
@@ -383,6 +394,7 @@ impl AllocatorCold {
             floats: self.floats.drain(all),
             strings: self.strings.drain(all),
             vectors: self.vectors.drain(all),
+            bignums: self.bignums.drain(all),
             boxed: std::mem::take(&mut self.boxed),
             charges: std::mem::take(&mut self.charges),
         }
@@ -396,6 +408,10 @@ pub(crate) struct OwnerPages {
     refills: AtomicU64,
     lock_wait_ns: AtomicU64,
     adoptions: AtomicU64,
+    /// The bytes the cold state's charges hold, not yet adopted: the
+    /// keeper's pacing reads them ([`TaggedHeap::bytes_since_gc`]) between
+    /// adoptions. Written under the cold mutex.
+    pending_bytes: AtomicUsize,
 }
 
 impl OwnerPages {
@@ -406,7 +422,21 @@ impl OwnerPages {
             refills: AtomicU64::new(0),
             lock_wait_ns: AtomicU64::new(0),
             adoptions: AtomicU64::new(0),
+            pending_bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// Publish COLD's charged bytes to [`Self::pending_bytes`]; the caller
+    /// holds the cold mutex COLD came from. Returns them.
+    fn publish_pending(&self, cold: &AllocatorCold) -> usize {
+        let bytes = cold.charges.bytes;
+        self.pending_bytes.store(bytes, Ordering::Relaxed);
+        bytes
+    }
+
+    /// Bytes owners allocated that no adoption has charged to the heap yet.
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.pending_bytes.load(Ordering::Relaxed)
     }
 
     /// Take the cold mutex, counting the acquisition and any wait.
@@ -452,6 +482,7 @@ pub(crate) struct OwnerAllocState {
     float: OwnerRun,
     string: OwnerRun,
     vector: OwnerRun,
+    bignum: OwnerRun,
     /// The parity the last refill read; every run stamps it.
     parity: MarkParity,
     charges: Charges,
@@ -501,6 +532,7 @@ impl OwnerAllocState {
             OwnerClass::Float => &mut self.float,
             OwnerClass::String => &mut self.string,
             OwnerClass::Vector => &mut self.vector,
+            OwnerClass::Bignum => &mut self.bignum,
         }
     }
 
@@ -525,6 +557,7 @@ impl OwnerAllocState {
         let old = std::mem::take(self.run_mut(class));
         cold.close(class, old);
         let run = cold.carve(class, shared.sizes);
+        shared.publish_pending(&cold);
         drop(cold);
         if class == OwnerClass::Float {
             let mut slot = run.start;
@@ -555,6 +588,33 @@ impl OwnerAllocState {
         self.run_mut(class)
             .take(stride)
             .expect("a fresh run has a slot")
+    }
+
+    /// `TaggedHeap::alloc_bignum_inline` on a slot of our bignum run: a
+    /// FULL-header write born at the run's parity. Its alloc bit is set when
+    /// the run closes; adoption puts the page in the bignum arena.
+    #[inline(always)]
+    pub(super) fn alloc_bignum(&mut self, heap: *const TaggedHeap, value: Integer) -> TaggedValue {
+        let ptr = self.take(
+            OwnerClass::Bignum,
+            <BignumObj as PagedObject>::SLOT_BYTES,
+            heap,
+        ) as *mut BignumObj;
+        // SAFETY: a never-used slot of our open run, written whole before the
+        // value escapes, as the keeper path does.
+        unsafe {
+            std::ptr::write(
+                ptr,
+                BignumObj {
+                    header: VecLikeHeader {
+                        gc: GcHeader::new_marked(HeapObjectKind::VecLike, self.parity),
+                        type_tag: VecLikeType::Bignum,
+                    },
+                    value,
+                },
+            );
+            TaggedValue::from_veclike_ptr(ptr as *const VecLikeHeader)
+        }
     }
 
     #[inline(always)]
@@ -675,19 +735,27 @@ pub(crate) fn close_owner_regions(state: &mut OwnerAllocState) {
         OwnerClass::Float,
         OwnerClass::String,
         OwnerClass::Vector,
+        OwnerClass::Bignum,
     ] {
         let run = std::mem::take(state.run_mut(class));
         cold.close(class, run);
     }
+    shared.publish_pending(&cold);
 }
 
 /// Resume allocating after a collection. Runs reopen lazily: the next
 /// allocation of each class refills, reading the collection's new parity.
 pub(crate) fn reopen_owner_regions(state: &mut OwnerAllocState) {
     debug_assert!(
-        [state.cons, state.float, state.string, state.vector]
-            .iter()
-            .all(|run| run.start == 0),
+        [
+            state.cons,
+            state.float,
+            state.string,
+            state.vector,
+            state.bignum
+        ]
+        .iter()
+        .all(|run| run.start == 0),
         "reopen without close"
     );
 }
@@ -724,6 +792,7 @@ impl TaggedHeap {
             float: OwnerRun::default(),
             string: OwnerRun::default(),
             vector: OwnerRun::default(),
+            bignum: OwnerRun::default(),
             parity: self.mark_parity,
             charges: Charges::default(),
             boxed: Vec::new(),
@@ -749,16 +818,27 @@ impl TaggedHeap {
         let Some(shared) = self.owner_pages.clone() else {
             return;
         };
-        let adoption = shared.cold.lock().drain();
+        let adoption = {
+            let mut cold = shared.cold.lock();
+            let adoption = cold.drain();
+            shared.publish_pending(&cold);
+            adoption
+        };
         let Adoption {
             blocks,
             floats,
             strings,
             vectors,
+            bignums,
             boxed,
             charges,
         } = adoption;
-        let moved = blocks.len() + floats.len() + strings.len() + vectors.len() + boxed.len();
+        let moved = blocks.len()
+            + floats.len()
+            + strings.len()
+            + vectors.len()
+            + bignums.len()
+            + boxed.len();
         for pending in blocks {
             self.adopt_owner_cons_block(pending);
         }
@@ -776,6 +856,9 @@ impl TaggedHeap {
                 let registered = self.vector_object_addrs.insert(slot as usize);
                 debug_assert!(registered, "owner vector registered twice");
             }
+        }
+        for page in bignums {
+            self.bignum_arena.adopt_page(page);
         }
         for header in boxed {
             self.link_veclike(header);
