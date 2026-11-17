@@ -41,6 +41,21 @@ fn result_deserialization_rejects_missing_threads() {
 }
 
 #[test]
+fn stress_validation_accepts_its_non_timing_result_shape() {
+    let request = RunRequest::new(
+        ScenarioId::ThreadsStress,
+        PathBuf::from("neomacs"),
+        NonZeroU32::new(1).expect("stress duration is positive"),
+    );
+    let raw = r#"{"schema_version":1,"scenario":"threads-stress","status":"ok","threads":2,"seconds":1,"iterations_total":4,"invariants_ok":true,"gcs_done_delta":2,"error":null}"#;
+    let result: ThreadsResult = serde_json::from_str(raw).expect("well-formed stress result");
+    assert!(
+        validate(&request, &result).is_empty(),
+        "stress rows do not require timing-only result fields"
+    );
+}
+
+#[test]
 fn scenario_ids_round_trip_through_closed_enum() {
     for (name, expected) in [
         ("threads-numeric-loop", ScenarioId::ThreadsNumericLoop),

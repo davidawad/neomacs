@@ -229,11 +229,11 @@ pub(crate) fn validate(request: &RunRequest, result: &ThreadsResult) -> Vec<Corr
     if result.threads == 0 {
         mismatch(&mut mismatches, "threads-positive", true, false);
     }
-    if result.threading_mode.as_deref().is_none_or(str::is_empty) {
-        mismatch(&mut mismatches, "threading-mode-present", true, false);
-    }
     match result.scenario {
         ScenarioId::ThreadsNumericLoop | ScenarioId::ThreadsJsonParse => {
+            if result.threading_mode.as_deref().is_none_or(str::is_empty) {
+                mismatch(&mut mismatches, "threading-mode-present", true, false);
+            }
             mismatch(
                 &mut mismatches,
                 "iterations",
