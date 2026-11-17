@@ -4,14 +4,17 @@
 //! keeper (the thread holding the World's Baton) allocates exactly as before:
 //! its cursors stay in `JitHeapState`. Every OTHER owner thread allocates from
 //! runs it alone writes: a run of cons cells in a cons block, of float,
-//! string, vector or bignum slots in a 64 KiB page. Those blocks and pages are NOT in
-//! the heap's registries while owners carve them; they sit in [`OwnerPages`]'s
-//! cold state behind one `parking_lot::Mutex`, which an owner takes only to
-//! close one run and carve the next (a refill). Boxed vector-likes (hash
-//! tables) are `Box`es whose `all_objects` link waits in the same cold state.
+//! string, vector or bignum slots in a 64 KiB page. Those blocks and pages are
+//! NOT in the heap's registries while owners carve them. An owner carves them
+//! from blocks and pages of its own and keeps them, with its boxed
+//! vector-likes (hash tables, `Box`es whose `all_objects` link waits), in its
+//! own pending state: a refill (close one run, carve the next) touches
+//! nothing another thread reads. When the owner closes its runs (it parks,
+//! attaches or ends) it hands its pending state to [`OwnerPages`]'s cold
+//! state behind one `parking_lot::Mutex`, the only time it takes that mutex.
 //!
-//! The keeper ADOPTS what the owners left there: under the same mutex it moves
-//! every block and page with no open run into the heap's registries
+//! The keeper ADOPTS what the owners handed over: under the same mutex it
+//! moves every block and page there into the heap's registries
 //! ([`TaggedHeap::adopt_owner_pages`], called from `close_alloc_regions`, so
 //! every collector entry adopts before it marks). Owner allocation therefore
 //! never touches a structure the keeper mutates without that mutex.
@@ -30,7 +33,8 @@ use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
-/// How many cells or slots an owner takes per refill.
+/// How many cells or slots an owner takes per refill, at most: a run never
+/// crosses its block or page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OwnerRunSizes {
     pub(crate) cons_cells: usize,
@@ -38,18 +42,20 @@ pub(crate) struct OwnerRunSizes {
 }
 
 impl OwnerRunSizes {
-    /// 16 KiB of conses, a quarter page of slots per class.
+    /// A whole cons block, a whole page of slots per class.
     pub(crate) const DEFAULT: Self = Self {
-        cons_cells: 1024,
-        slots: 256,
+        cons_cells: CONS_BLOCK_SIZE,
+        slots: usize::MAX,
     };
 }
 
-/// The owner allocator's lock counters (plain integers).
+/// The owner allocator's counters (plain integers).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OwnerAllocStats {
-    /// Cold-mutex acquisitions by owners (refills and closes).
+    /// Runs owners carved (refills), counted when each owner closes.
     pub(crate) refills: u64,
+    /// Cold-mutex acquisitions by owners (one per close).
+    pub(crate) locks: u64,
     /// Nanoseconds owners waited for the cold mutex.
     pub(crate) lock_wait_ns: u64,
     /// Keeper adoptions that moved at least one block, page or object.
@@ -196,6 +202,13 @@ impl<T: PagedObject> PagePool<T> {
         used
     }
 
+    /// Take over every page of OTHER, whose runs are all closed.
+    fn absorb(&mut self, other: &mut Self) {
+        debug_assert!(other.pages.iter().all(|pending| pending.open_runs == 0));
+        self.pages.append(&mut other.pages);
+        other.carving = None;
+    }
+
     /// Take every page no run is open in; the carving page too when `all`
     /// (no run is open anywhere), after which owners start a fresh page.
     fn drain(&mut self, all: bool) -> Vec<ObjectPage<T>> {
@@ -213,7 +226,10 @@ impl<T: PagedObject> PagePool<T> {
     }
 }
 
-/// The cold allocator state, only ever touched under [`OwnerPages::cold`].
+/// Owner blocks, pages and boxed objects not yet adopted: one owner's own
+/// pending state ([`OwnerAllocState`]), which only that owner touches, or
+/// the cold state every owner hands its pending state to, only ever
+/// touched under [`OwnerPages::cold`].
 struct AllocatorCold {
     blocks: Vec<PendingBlock>,
     /// Base of the cons block being carved.
@@ -230,8 +246,9 @@ struct AllocatorCold {
 
 // SAFETY: the raw pointers name block and page storage and boxed objects this
 // state owns exclusively until adoption hands them to the keeper's heap; they
-// are read and written only under `OwnerPages::cold`, from whichever thread
-// holds it. No thread-affine data (no Rc, no TLS-derived pointer) is held.
+// are read and written only by the owner holding the state, or under
+// `OwnerPages::cold`, from whichever thread holds it. No thread-affine data
+// (no Rc, no TLS-derived pointer) is held.
 unsafe impl Send for AllocatorCold {}
 
 /// A cons block adoption registers, with its closed runs.
@@ -267,6 +284,21 @@ impl AllocatorCold {
             charges: Charges::default(),
             open_runs: 0,
         }
+    }
+
+    /// Take over an owner's pending state LOCAL, every run of which is
+    /// closed: its blocks, pages, boxed objects and charges.
+    fn absorb(&mut self, local: &mut AllocatorCold) {
+        debug_assert_eq!(local.open_runs, 0, "an owner hands over closed runs");
+        debug_assert!(local.blocks.iter().all(|pending| pending.open_runs == 0));
+        self.blocks.append(&mut local.blocks);
+        local.carving_block = None;
+        self.floats.absorb(&mut local.floats);
+        self.strings.absorb(&mut local.strings);
+        self.vectors.absorb(&mut local.vectors);
+        self.bignums.absorb(&mut local.bignums);
+        self.boxed.append(&mut local.boxed);
+        self.charges.add(&std::mem::take(&mut local.charges));
     }
 
     fn carve(&mut self, class: OwnerClass, sizes: OwnerRunSizes) -> OwnerRun {
@@ -406,6 +438,7 @@ pub(crate) struct OwnerPages {
     cold: parking_lot::Mutex<AllocatorCold>,
     sizes: OwnerRunSizes,
     refills: AtomicU64,
+    locks: AtomicU64,
     lock_wait_ns: AtomicU64,
     adoptions: AtomicU64,
     /// The bytes the cold state's charges hold, not yet adopted: the
@@ -420,6 +453,7 @@ impl OwnerPages {
             cold: parking_lot::Mutex::new(AllocatorCold::new()),
             sizes,
             refills: AtomicU64::new(0),
+            locks: AtomicU64::new(0),
             lock_wait_ns: AtomicU64::new(0),
             adoptions: AtomicU64::new(0),
             pending_bytes: AtomicUsize::new(0),
@@ -441,7 +475,7 @@ impl OwnerPages {
 
     /// Take the cold mutex, counting the acquisition and any wait.
     fn lock(&self) -> parking_lot::MutexGuard<'_, AllocatorCold> {
-        self.refills.fetch_add(1, Ordering::Relaxed);
+        self.locks.fetch_add(1, Ordering::Relaxed);
         if let Some(guard) = self.cold.try_lock() {
             return guard;
         }
@@ -455,6 +489,7 @@ impl OwnerPages {
     pub(crate) fn stats(&self) -> OwnerAllocStats {
         OwnerAllocStats {
             refills: self.refills.load(Ordering::Relaxed),
+            locks: self.locks.load(Ordering::Relaxed),
             lock_wait_ns: self.lock_wait_ns.load(Ordering::Relaxed),
             adoptions: self.adoptions.load(Ordering::Relaxed),
         }
@@ -474,10 +509,18 @@ pub(super) fn installed_owner() -> *mut OwnerAllocState {
     OWNER_ALLOC.with(Cell::get)
 }
 
-/// One owner thread's allocation state: its open runs, its uncharged counts
-/// and the boxed objects it allocated since its last refill.
+/// One owner thread's allocation state: its open runs, the blocks and pages
+/// it carves them from, its uncharged counts and the boxed objects it
+/// allocated since its last close.
 pub(crate) struct OwnerAllocState {
     shared: Arc<OwnerPages>,
+    /// The run sizes, copied from `shared` so a refill reads nothing shared.
+    sizes: OwnerRunSizes,
+    /// This owner's own blocks, pages and closed runs' charges, handed to
+    /// `shared`'s cold state at each close.
+    local: AllocatorCold,
+    /// Refills since the last close.
+    refills: u64,
     cons: OwnerRun,
     float: OwnerRun,
     string: OwnerRun,
@@ -536,16 +579,17 @@ impl OwnerAllocState {
         }
     }
 
-    /// Hand our charges and boxed objects to the cold state.
-    fn flush(&mut self, cold: &mut AllocatorCold) {
-        cold.charges.add(&std::mem::take(&mut self.charges));
-        cold.boxed.append(&mut self.boxed);
+    /// Hand our charges and boxed objects to our pending state.
+    fn flush(&mut self) {
+        self.local.charges.add(&std::mem::take(&mut self.charges));
+        self.local.boxed.append(&mut self.boxed);
     }
 
     /// The run of `class` is exhausted or closed: close it, carve the next
-    /// one under the cold mutex, and read the parity it stamps. When what
-    /// owners allocated since the last adoption makes a collection due, the
-    /// detached thread's World defers one ([`crate::detached::defer_collection`]).
+    /// one from our own blocks and pages (no lock), and read the parity it
+    /// stamps. When what owners allocated since the last adoption makes a
+    /// collection due, the detached thread's World defers one
+    /// ([`crate::detached::defer_collection`]).
     #[cold]
     #[inline(never)]
     fn refill(&mut self, class: OwnerClass, heap: *const TaggedHeap) {
@@ -559,14 +603,13 @@ impl OwnerAllocState {
             )
         };
         self.parity = parity;
-        let shared = Arc::clone(&self.shared);
-        let mut cold = shared.lock();
-        self.flush(&mut cold);
+        self.flush();
         let old = std::mem::take(self.run_mut(class));
-        cold.close(class, old);
-        let run = cold.carve(class, shared.sizes);
-        let pending = shared.publish_pending(&cold);
-        drop(cold);
+        self.local.close(class, old);
+        let run = self.local.carve(class, self.sizes);
+        self.refills += 1;
+        // What other owners handed over, and what we hold.
+        let pending = self.shared.pending_bytes() + self.local.charges.bytes;
         if pending >= threshold {
             crate::detached::defer_collection(pending as u64);
         }
@@ -748,11 +791,10 @@ pub(crate) fn new_detached_owner(heap: &mut TaggedHeap) -> std::ptr::NonNull<Own
 
 /// Close every open run of `state` (cursor = limit, handed-out slots charged
 /// and marked allocated, unused cells returned at adoption) and hand its
-/// boxed objects over. An owner calls this when it parks for a collection.
+/// blocks, pages and boxed objects to the cold state, under its mutex. An
+/// owner calls this when it parks for a collection.
 pub(crate) fn close_owner_regions(state: &mut OwnerAllocState) {
-    let shared = Arc::clone(&state.shared);
-    let mut cold = shared.lock();
-    state.flush(&mut cold);
+    state.flush();
     for class in [
         OwnerClass::Cons,
         OwnerClass::Float,
@@ -761,8 +803,14 @@ pub(crate) fn close_owner_regions(state: &mut OwnerAllocState) {
         OwnerClass::Bignum,
     ] {
         let run = std::mem::take(state.run_mut(class));
-        cold.close(class, run);
+        state.local.close(class, run);
     }
+    let shared = Arc::clone(&state.shared);
+    shared
+        .refills
+        .fetch_add(std::mem::take(&mut state.refills), Ordering::Relaxed);
+    let mut cold = shared.lock();
+    cold.absorb(&mut state.local);
     shared.publish_pending(&cold);
 }
 
@@ -804,6 +852,7 @@ impl TaggedHeap {
         sizes: OwnerRunSizes,
     ) -> Box<OwnerAllocState> {
         let shared = self.owner_pages_with(sizes);
+        let sizes = shared.sizes;
         let empty = |kind| {
             self.canonical_empty_strings
                 .get(kind)
@@ -811,6 +860,9 @@ impl TaggedHeap {
         };
         Box::new(OwnerAllocState {
             shared,
+            sizes,
+            local: AllocatorCold::new(),
+            refills: 0,
             cons: OwnerRun::default(),
             float: OwnerRun::default(),
             string: OwnerRun::default(),
@@ -904,8 +956,8 @@ impl TaggedHeap {
 /// each with the calling thread's heap and its own owner state installed
 /// (installation is serialized, standing in for an attach), then close every
 /// state, reinstall the heap on the caller (the keeper) and adopt. Returns
-/// the cold mutex's acquisitions and contended wait nanoseconds the section
-/// added. The caller allocates nothing while the section runs.
+/// the refills (runs carved) and the cold mutex's contended wait nanoseconds
+/// the section added. The caller allocates nothing while the section runs.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn run_detached_owners_for_test(threads: usize, body: impl Fn(usize) + Sync) -> (u64, u64) {

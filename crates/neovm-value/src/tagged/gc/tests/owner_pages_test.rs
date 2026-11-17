@@ -412,3 +412,102 @@ fn owner_threads_allocate_bignums_that_pace_and_are_adopted() {
         assert_eq!(value(bits).as_bignum(), Some(&owner_bignum(0, i)));
     }
 }
+
+/// One owner allocates N conses into a list it keeps and N floats it keeps;
+/// returns the list's and the floats' bits and the refills and cold-mutex
+/// acquisitions the section added (the owner's close included).
+fn one_owner_conses_and_floats(heap: &mut TestHeap, n: usize) -> (usize, Vec<usize>, u64, u64) {
+    let mut states = vec![heap.new_owner_alloc_state()];
+    let before = heap.owner_alloc_stats();
+    let mut got = detached_section(heap, &mut states, |_| {
+        let mut list = Value::NIL;
+        for i in 0..n {
+            list = Value::cons(Value::fixnum(i as i64), list);
+        }
+        let floats = (0..n)
+            .map(|i| Value::make_float(i as f64 + 0.5).bits())
+            .collect::<Vec<_>>();
+        (list.bits(), floats)
+    });
+    heap.close_alloc_regions();
+    let after = heap.owner_alloc_stats();
+    let (list, floats) = got.pop().expect("one owner");
+    (
+        list,
+        floats,
+        after.refills - before.refills,
+        after.locks - before.locks,
+    )
+}
+
+/// A refill hands an owner a whole cons block or object page of its own:
+/// N allocations of one class cost about N over the block's cells (or the
+/// page's slots) refills, and none of them takes the owners' one mutex,
+/// which the owner takes once, to hand everything over when it closes.
+#[test]
+fn an_owner_refills_once_per_cons_block_and_float_page() {
+    crate::test_utils::init_test_tracing();
+    const BLOCKS: usize = 8;
+    let mut heap = TestHeap::new();
+    heap.install();
+    let float_page = ObjectPage::<FloatObj>::SLOTS;
+    let n = BLOCKS * CONS_BLOCK_SIZE.max(float_page);
+    let (list, floats, refills, locks) = one_owner_conses_and_floats(&mut heap, n);
+    let mut cell = value(list);
+    for i in (0..n).rev() {
+        assert_eq!(cell.cons_car().as_fixnum(), Some(i as i64));
+        cell = cell.cons_cdr();
+    }
+    assert!(cell.is_nil());
+    for (i, &bits) in floats.iter().enumerate() {
+        assert_eq!(value(bits).as_float(), Some(i as f64 + 0.5));
+    }
+    // One refill per block and page the allocations fill or start.
+    let bound = n.div_ceil(CONS_BLOCK_SIZE) + n.div_ceil(float_page);
+    assert!(
+        refills <= bound as u64,
+        "{n} conses and {n} floats took {refills} refills, more than {bound}"
+    );
+    assert_eq!(locks, 1, "{refills} refills took {locks} cold-mutex locks");
+}
+
+/// The owner allocator alone, in a test build: one owner allocating
+/// everything, then 8 owners at once allocating the same total, each a
+/// short list of conses (garbage) and floats. Prints wall time, refills and
+/// the cold mutex's contended wait; asserts only the allocations.
+#[test]
+#[ignore = "a measurement: run with --run-ignored only"]
+fn measure_owner_allocation_one_owner_versus_eight() {
+    crate::test_utils::init_test_tracing();
+    const TOTAL: usize = 8_000_000;
+    let mut heap = TestHeap::new();
+    heap.install();
+    for owners in [1_usize, 8] {
+        let mut states: Vec<_> = (0..owners).map(|_| heap.new_owner_alloc_state()).collect();
+        let before = heap.owner_alloc_stats();
+        let started = std::time::Instant::now();
+        let sums = detached_section(&heap, &mut states, |_| {
+            let mut list = Value::NIL;
+            let mut sum = 0.0;
+            for i in 0..TOTAL / owners {
+                list = if i % 64 == 0 {
+                    Value::NIL
+                } else {
+                    Value::cons(Value::fixnum(i as i64), list)
+                };
+                sum += Value::make_float(i as f64).as_float().unwrap_or(0.0);
+            }
+            sum
+        });
+        let elapsed = started.elapsed();
+        heap.close_alloc_regions();
+        let after = heap.owner_alloc_stats();
+        assert_eq!(sums.len(), owners);
+        println!(
+            "| {owners} owners | {elapsed:.2?} | refills {} | locks {} | lock wait {} ns |",
+            after.refills - before.refills,
+            after.locks - before.locks,
+            after.lock_wait_ns - before.lock_wait_ns
+        );
+    }
+}
