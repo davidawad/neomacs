@@ -269,11 +269,18 @@ impl TaggedHeap {
 ))]
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
+    // The `shared-heap` experiment appends one field (`owner_pages`).
+    #[cfg(feature = "shared-heap")]
+    const OWNER_PAGES_FIELD_BYTES: usize =
+        size_of::<Option<std::sync::Arc<super::owner_pages::OwnerPages>>>();
+    #[cfg(not(feature = "shared-heap"))]
+    const OWNER_PAGES_FIELD_BYTES: usize = 0;
     assert!(
         size_of::<TaggedHeap>()
             == 4576
                 + size_of::<super::super::collection_reads::StoreState>()
                 + size_of::<crate::heap_types::OverlaySerialCounter>()
+                + OWNER_PAGES_FIELD_BYTES
     );
     assert!(align_of::<TaggedHeap>() == 8);
     assert!(offset_of!(TaggedHeap, mutator_gc) == 24);
