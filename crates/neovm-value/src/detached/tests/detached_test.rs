@@ -65,6 +65,14 @@ fn a_detached_access_attaches_once_and_detaches_on_unwind() {
     note(AttachReason::Blv);
     assert_eq!(NOTES.load(Ordering::Relaxed), 1);
 
+    assert!(pin_at(4), "a detached thread pins");
+    assert!(!is_detached() && running_detached());
+    assert!(!pin_at(5), "a pinned thread is attached already");
+    assert!(unpin_at(5).is_none(), "still inside the pinned binding");
+    let gate = unpin_at(4).expect("the binding unwound");
+    resume_detached(gate);
+    assert!(is_detached());
+
     let suspended = suspend_detached().expect("detached");
     assert!(!is_detached() && running_detached());
     resume_detached(suspended);

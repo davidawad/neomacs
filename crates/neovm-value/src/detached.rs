@@ -56,11 +56,14 @@ struct Placement {
     /// Whether the thread is inside its detached body at all, attached for
     /// a moment or not: its stack holds roots no collector can see.
     running_detached: bool,
+    /// The gate and binding depth while the thread stays attached for a
+    /// dynamic binding of a shared cell ([`pin_at`]).
+    pinned: Option<(DetachedGate, usize)>,
 }
 
 thread_local! {
     static PLACEMENT: Cell<Placement> = const {
-        Cell::new(Placement { gate: None, running_detached: false })
+        Cell::new(Placement { gate: None, running_detached: false, pinned: None })
     };
 }
 
@@ -96,6 +99,7 @@ pub fn begin_detached(gate: DetachedGate) {
         slot.set(Placement {
             gate: Some(gate),
             running_detached: true,
+            pinned: None,
         });
     });
 }
@@ -119,6 +123,45 @@ pub fn suspend_detached() -> Option<DetachedGate> {
 #[doc(hidden)]
 pub fn resume_detached(gate: DetachedGate) {
     set_gate(Some(gate));
+}
+
+/// The detached thread binds a shared cell dynamically at binding depth
+/// DEPTH: it stays attached until the binding unwinds ([`unpin_at`]).
+/// False (and nothing changes) when the thread does not run detached; when
+/// true, the caller attaches.
+#[doc(hidden)]
+pub fn pin_at(depth: usize) -> bool {
+    let placement = placement();
+    let Some(gate) = placement.gate else {
+        return false;
+    };
+    PLACEMENT.with(|slot| {
+        slot.set(Placement {
+            gate: None,
+            pinned: Some((gate, depth)),
+            ..placement
+        });
+    });
+    true
+}
+
+/// The thread's bindings unwound to DEPTH: when that ends a pin, the gate
+/// to detach with (the caller detaches, then [`resume_detached`]).
+#[doc(hidden)]
+#[inline]
+pub fn unpin_at(depth: usize) -> Option<DetachedGate> {
+    let placement = placement();
+    let (gate, pinned) = placement.pinned?;
+    if depth > pinned {
+        return None;
+    }
+    PLACEMENT.with(|slot| {
+        slot.set(Placement {
+            pinned: None,
+            ..placement
+        });
+    });
+    Some(gate)
 }
 
 /// Count REASON on the thread's World when the thread runs detached.
