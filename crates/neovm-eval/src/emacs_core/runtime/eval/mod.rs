@@ -7499,6 +7499,8 @@ pub(crate) use green::GreenStartError;
 pub use green::switch::MainNativeHandoff;
 #[doc(hidden)]
 pub use green::{SelectTurn, green_make_thread, green_world};
+#[cfg(feature = "shared-heap")]
+pub use green::{parallel_make_thread, parallel_world};
 mod keyboard_forwarding;
 mod owner_bindings;
 pub(crate) use owner_bindings::{Channel, UndoTarget};

@@ -418,6 +418,10 @@ fn expect_cv_id(manager: &ThreadManager, value: &Value) -> Result<CondVarHandle,
 /// (:1146-1160) before it has run.
 #[doc(hidden)]
 pub fn builtin_make_thread(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+    #[cfg(feature = "shared-heap")]
+    if super::eval::parallel_world(eval) {
+        return super::eval::parallel_make_thread(eval, &args);
+    }
     // A Green World runs threads as owners on their own OS threads; the
     // simulated exchange never runs beside admission.
     if super::eval::green_world(eval) {

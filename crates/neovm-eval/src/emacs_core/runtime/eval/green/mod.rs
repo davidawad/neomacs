@@ -30,6 +30,8 @@ pub(super) mod switch;
 
 #[doc(hidden)]
 pub use api::{green_make_thread, green_world};
+#[cfg(feature = "shared-heap")]
+pub use api::{parallel_make_thread, parallel_world};
 pub(crate) use bootstrap::GreenBootstrap;
 #[cfg(debug_assertions)]
 pub(crate) use bootstrap::debug_assert_native_tables_open;
@@ -194,7 +196,7 @@ impl Context {
     #[cold]
     #[inline(never)]
     pub(crate) fn start_green_runtime(&mut self) -> Result<super::world::Baton, GreenStartError> {
-        if self.threading_mode() != ThreadingMode::Green {
+        if !self.threading_mode().uses_owner_threads() {
             return Err(GreenStartError::NotGreen);
         }
         if self.display_host.is_some() || self.input_rx.as_ref().is_some() {
