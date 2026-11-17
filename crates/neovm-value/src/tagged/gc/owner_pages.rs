@@ -792,3 +792,54 @@ impl TaggedHeap {
         }
     }
 }
+
+/// Test-support detached section for crates above this one: run
+/// `body(i)` for `i` in `0..threads` on that many owner OS threads at once,
+/// each with the calling thread's heap and its own owner state installed
+/// (installation is serialized, standing in for an attach), then close every
+/// state, reinstall the heap on the caller (the keeper) and adopt. Returns
+/// the cold mutex's acquisitions and contended wait nanoseconds the section
+/// added. The caller allocates nothing while the section runs.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn run_detached_owners_for_test(threads: usize, body: impl Fn(usize) + Sync) -> (u64, u64) {
+    let root = std::ptr::NonNull::new(TAGGED_HEAP.with(Cell::get)).expect("a heap is installed");
+    let (mut states, before) = {
+        // SAFETY: the installed root of the caller's live heap; the loan ends
+        // before any owner thread starts.
+        let heap = unsafe { &mut *root.as_ptr() };
+        let states: Vec<_> = (0..threads).map(|_| heap.new_owner_alloc_state()).collect();
+        (states, heap.owner_alloc_stats())
+    };
+    let address = root.as_ptr() as usize;
+    let baton = std::sync::Mutex::new(());
+    let start = std::sync::Barrier::new(threads);
+    std::thread::scope(|scope| {
+        for (index, state) in states.iter_mut().enumerate() {
+            let (baton, start, body) = (&baton, &start, &body);
+            scope.spawn(move || {
+                {
+                    let _attached = baton.lock().expect("the stand-in Baton");
+                    let root =
+                        std::ptr::NonNull::new(address as *mut TaggedHeap).expect("a heap root");
+                    set_tagged_heap_root(root);
+                }
+                {
+                    let _installed = state.install();
+                    start.wait();
+                    body(index);
+                }
+                close_owner_regions(state);
+            });
+        }
+    });
+    set_tagged_heap_root(root);
+    // SAFETY: every owner thread has joined; the keeper's loan is exclusive.
+    let heap = unsafe { &mut *root.as_ptr() };
+    heap.close_alloc_regions();
+    let after = heap.owner_alloc_stats();
+    (
+        after.refills - before.refills,
+        after.lock_wait_ns - before.lock_wait_ns,
+    )
+}

@@ -2608,6 +2608,9 @@ mod owner_pages;
 #[cfg(all(test, feature = "shared-heap"))]
 #[path = "gc/tests/owner_pages_test.rs"]
 mod owner_pages_tests;
+#[cfg(all(feature = "shared-heap", feature = "test-support"))]
+#[doc(hidden)]
+pub use owner_pages::run_detached_owners_for_test;
 
 mod collector_tables;
 #[cfg(not(feature = "test-support"))]
