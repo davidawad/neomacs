@@ -629,6 +629,23 @@ impl<T: PagedObject> ObjectPage<T> {
     }
 }
 
+#[cfg(feature = "shared-heap")]
+impl<T: PagedObject> ObjectPage<T> {
+    /// Every allocated slot of this page (allocated-bit-first).
+    pub(super) fn allocated_slots(&self) -> impl Iterator<Item = *mut T> + '_ {
+        (0..Self::ALLOC_WORDS).flat_map(move |word_index| {
+            let mut bits = self.alloc_bits[word_index];
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    self.slot_ptr(word_index * usize::BITS as usize + bit)
+                })
+            })
+        })
+    }
+}
+
 impl<T: PagedObject> Drop for ObjectPage<T> {
     fn drop(&mut self) {
         // TEARDOWN OWNS THE PAYLOADS: walk the allocated slots (bit-first —
@@ -1191,6 +1208,38 @@ impl<T: PagedObject> ObjectArena<T> {
         }
 
         old_len - self.pages.len()
+    }
+
+    /// Adopt a page owner threads carved (`owner_pages.rs`): its alloc bits
+    /// name exactly the slots they handed out, and no owner writes it any
+    /// more. Its never-handed slots below the bump cursor are threaded onto
+    /// its free list (ascending, so the list descends as the sweep leaves
+    /// it) and the page joins the partial chain if it has any; then it is
+    /// registered like a new page. Returns its index.
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn adopt_page(&mut self, mut page: ObjectPage<T>) -> usize {
+        debug_assert_eq!(page.free_head, PAGE_NONE);
+        for index in 0..page.next_index {
+            if !page.is_allocated(index) {
+                // SAFETY: a never-handed slot of this page; only its trailing
+                // link word is written (allocated-bit-first).
+                unsafe { page.free_link_ptr(index).write(page.free_head) };
+                page.free_head = index;
+            }
+        }
+        let base = page.base_addr();
+        self.pages.push(page);
+        let index = self.pages.len() - 1;
+        let prev = self.page_index_by_base.insert(base, index);
+        debug_assert!(prev.is_none(), "arena page base registered twice");
+        self.chunk_map_set(base, index);
+        let page = &mut self.pages[index];
+        if page.free_head != PAGE_NONE {
+            page.on_partial = true;
+            page.next_partial = self.partial_head;
+            self.partial_head = index;
+        }
+        index
     }
 
     /// Collect raw pointers to every ALLOCATED slot (allocated-bit-first;

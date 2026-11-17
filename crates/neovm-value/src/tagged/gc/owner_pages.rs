@@ -691,3 +691,104 @@ pub(crate) fn reopen_owner_regions(state: &mut OwnerAllocState) {
         "reopen without close"
     );
 }
+
+impl TaggedHeap {
+    /// The owner allocator, made on first use with `sizes`.
+    fn owner_pages_with(&mut self, sizes: OwnerRunSizes) -> Arc<OwnerPages> {
+        Arc::clone(
+            self.owner_pages
+                .get_or_insert_with(|| Arc::new(OwnerPages::new(sizes))),
+        )
+    }
+
+    /// A new owner's allocation state (made by the keeper, used by the owner).
+    pub(crate) fn new_owner_alloc_state(&mut self) -> Box<OwnerAllocState> {
+        self.new_owner_alloc_state_with(OwnerRunSizes::DEFAULT)
+    }
+
+    /// [`Self::new_owner_alloc_state`]; `sizes` apply if this is the heap's
+    /// first owner.
+    pub(crate) fn new_owner_alloc_state_with(
+        &mut self,
+        sizes: OwnerRunSizes,
+    ) -> Box<OwnerAllocState> {
+        let shared = self.owner_pages_with(sizes);
+        let empty = |kind| {
+            self.canonical_empty_strings
+                .get(kind)
+                .map_or(0, TaggedValue::bits)
+        };
+        Box::new(OwnerAllocState {
+            shared,
+            cons: OwnerRun::default(),
+            float: OwnerRun::default(),
+            string: OwnerRun::default(),
+            vector: OwnerRun::default(),
+            parity: self.mark_parity,
+            charges: Charges::default(),
+            boxed: Vec::new(),
+            canonical_empty_bits: [
+                empty(LispStringStorageKind::Unibyte),
+                empty(LispStringStorageKind::Multibyte),
+            ],
+        })
+    }
+
+    /// The owner allocator's counters (zeros before the first owner).
+    pub(crate) fn owner_alloc_stats(&self) -> OwnerAllocStats {
+        self.owner_pages
+            .as_deref()
+            .map(OwnerPages::stats)
+            .unwrap_or_default()
+    }
+
+    /// Move every owner block, page and boxed object no open run still
+    /// writes into this heap's registries, and fold the owners' charges into
+    /// the consing counters. Keeper only (`&mut self`).
+    pub(crate) fn adopt_owner_pages(&mut self) {
+        let Some(shared) = self.owner_pages.clone() else {
+            return;
+        };
+        let adoption = shared.cold.lock().drain();
+        let Adoption {
+            blocks,
+            floats,
+            strings,
+            vectors,
+            boxed,
+            charges,
+        } = adoption;
+        let moved = blocks.len() + floats.len() + strings.len() + vectors.len() + boxed.len();
+        for pending in blocks {
+            self.adopt_owner_cons_block(pending);
+        }
+        for page in floats {
+            self.float_arena.adopt_page(page);
+        }
+        for page in strings {
+            self.string_arena.adopt_page(page);
+        }
+        for page in vectors {
+            let base = page.base_addr();
+            let index = self.vector_arena.adopt_page(page);
+            debug_assert_eq!(self.vector_arena.pages[index].base_addr(), base);
+            for slot in self.vector_arena.pages[index].allocated_slots() {
+                let registered = self.vector_object_addrs.insert(slot as usize);
+                debug_assert!(registered, "owner vector registered twice");
+            }
+        }
+        for header in boxed {
+            self.link_veclike(header);
+        }
+        for (slot, n) in charges.counts.iter().enumerate() {
+            let counts = &mut self.current_mutator_gc_mut().memory_use_counts;
+            counts[slot] = counts[slot].wrapping_add(*n);
+        }
+        self.current_mutator_gc_mut().allocated_count += charges.allocated;
+        self.cons_live_count += charges.cons_live;
+        self.note_allocation_bytes(charges.bytes);
+        if moved > 0 {
+            shared.adoptions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}

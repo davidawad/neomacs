@@ -381,6 +381,60 @@ impl TaggedHeap {
         (cell, n, ConsRegionSource::BlockTail { block: block_index })
     }
 
+    /// Register a cons block owner threads carved (`owner_pages.rs`), as
+    /// [`Self::reserve_cons_run_in_fresh_block`] registers a fresh one, then
+    /// record it young, pre-mark what owners handed out when the heap
+    /// allocates black, and put their unused tails on its free list.
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn adopt_owner_cons_block(&mut self, pending: owner_pages::AdoptedBlock) {
+        let owner_pages::AdoptedBlock {
+            block,
+            handed,
+            unused,
+        } = pending;
+        let block_base = block.base_addr();
+        let base = ConsBlockBase::of(&block);
+        self.cons_allocator.register(&block);
+        self.cons_blocks.push(block);
+        let block_index = self.cons_blocks.len() - 1;
+        self.cons_block_index_by_base
+            .insert(block_base, block_index);
+        if self.generational.enabled
+            && let Some(slots) = self.card_slots_mut()
+        {
+            slots.insert_block(block_base);
+        }
+        if let Some(map) = self.chunk_map.as_deref() {
+            map.set(block_base, ChunkEntry::new(ChunkClass::Cons, block_index));
+        }
+        if self.generational.enabled {
+            let identity = self.heap_identity();
+            let recorded = match self._satb_layout_reserve.current_young_log_mut() {
+                Ok(log) if log.id().heap_identity() != identity => {
+                    Err(young_registry::YoungRegistryError::WrongHeap)
+                }
+                Ok(log) => self.cons_allocator.note_carve(base, log),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = recorded {
+                panic!("canonical young recording refused an owner cons block: {error:?}");
+            }
+        }
+        if self.allocates_black() {
+            for &(start, n) in &handed {
+                ConsBlock::mark_run_at(block_base, start, n, true);
+            }
+        }
+        for (start, n) in unused {
+            // SAFETY: never-handed cells of a block just registered, unmarked
+            // and on no free list; no collector is sweeping it.
+            unsafe {
+                let first = ConsBlock::cell_ptr_at(block_base, start);
+                self.cons_allocator.return_unused(first, n);
+            }
+        }
+    }
+
     /// How many objects of `size` bytes the next region may take, at most
     /// `max`: never enough to charge the consing counter past the collection
     /// threshold while the region is open, so the charged counter crosses it
@@ -443,6 +497,10 @@ impl TaggedHeap {
         }
         if self.region_book.float != FloatRegionSource::Closed {
             self.close_float_region();
+        }
+        #[cfg(feature = "shared-heap")]
+        if self.owner_pages.is_some() {
+            self.adopt_owner_pages();
         }
     }
 
