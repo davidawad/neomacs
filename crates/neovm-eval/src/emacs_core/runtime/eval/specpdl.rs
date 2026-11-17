@@ -739,6 +739,10 @@ impl Context {
     #[inline]
     #[doc(hidden)]
     pub fn specbind_plain_untrapped_fast(&mut self, sym_id: SymId, value: Value) -> bool {
+        // A Parallel thread binding a shared cell holds the Baton until it
+        // unwinds.
+        #[cfg(feature = "shared-heap")]
+        self.parallel_pin_for_binding(sym_id);
         let Some(old) = self.obarray.swap_plain_untrapped_value_id(sym_id, value) else {
             return false;
         };
@@ -806,6 +810,8 @@ impl Context {
     #[inline(never)]
     #[doc(hidden)]
     pub fn specbind_uncached(&mut self, sym_id: SymId, value: Value) -> Result<(), Flow> {
+        #[cfg(feature = "shared-heap")]
+        self.parallel_pin_for_binding(sym_id);
         if sym_id != buffer_undo_list_symbol()
             && let Some(sym) = self.obarray.get_by_id(sym_id)
             && let Some(old_plain) = sym.plain_value()
@@ -1816,6 +1822,8 @@ impl Context {
                 PoppedBindingPolicy::LispCleanup => self.unbind_popped_with_recovery()?,
             }
         }
+        #[cfg(feature = "shared-heap")]
+        self.parallel_unpin_after_unbind();
         Ok(())
     }
 

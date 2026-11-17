@@ -7007,6 +7007,13 @@ impl Context {
     #[inline(always)]
     #[doc(hidden)]
     pub fn assign_setq_dynamic_by_id(&mut self, sym_id: SymId, value: Value) -> EvalResult {
+        // A Parallel thread's dynamic `setq` writes shared state: attached.
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::detached::is_detached() {
+            return self.with_parallel_attach(neovm_value::detached::AttachReason::Class, |ctx| {
+                ctx.assign_setq_dynamic_by_id(sym_id, value)
+            });
+        }
         let resolved_id = super::builtins::resolve_variable_alias_id(self, sym_id)?;
         if self.obarray.is_constant_id(resolved_id)
             && !self.has_local_binding_by_id(sym_id)

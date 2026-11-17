@@ -633,6 +633,10 @@ impl Context {
     #[inline(always)]
     #[doc(hidden)]
     pub fn specbind_cached_impl<const COMPILED: bool>(&mut self, id: SymId, value: Value) -> bool {
+        // A Parallel thread binding a shared cell holds the Baton until it
+        // unwinds.
+        #[cfg(feature = "shared-heap")]
+        self.parallel_pin_for_binding(id);
         if !var_cache_tier_on(VarCacheTier::Bind) {
             return false;
         }
