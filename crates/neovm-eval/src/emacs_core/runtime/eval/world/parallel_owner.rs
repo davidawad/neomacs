@@ -22,13 +22,13 @@ use std::time::Instant;
 /// A copy of the counters `neomacs-shared-heap-stats` reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ParallelStats {
-    pub threads: u64,
-    pub attach_count: u64,
-    pub attach_wait_ns: u64,
-    pub detached_ns: u64,
-    pub safepoint_stops: u64,
-    pub collections: u64,
-    pub deferred_bytes: u64,
+    pub(crate) threads: u64,
+    pub(crate) attach_count: u64,
+    pub(crate) attach_wait_ns: u64,
+    pub(crate) detached_ns: u64,
+    pub(crate) safepoint_stops: u64,
+    pub(crate) collections: u64,
+    pub(crate) deferred_bytes: u64,
 }
 
 /// Where the Baton is, under the lock.

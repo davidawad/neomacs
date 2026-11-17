@@ -31,7 +31,7 @@ pub(super) mod switch;
 #[doc(hidden)]
 pub use api::{green_make_thread, green_world};
 #[cfg(feature = "shared-heap")]
-pub use api::{parallel_make_thread, parallel_world};
+pub(crate) use api::{parallel_make_thread, parallel_world};
 pub(crate) use bootstrap::GreenBootstrap;
 #[cfg(debug_assertions)]
 pub(crate) use bootstrap::debug_assert_native_tables_open;

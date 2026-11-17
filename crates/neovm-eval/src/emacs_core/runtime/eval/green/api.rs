@@ -270,14 +270,14 @@ pub fn green_world(ctx: &Context) -> bool {
 
 /// Whether `make-thread` takes the experimental Parallel path.
 #[cfg(feature = "shared-heap")]
-pub fn parallel_world(ctx: &Context) -> bool {
+pub(crate) fn parallel_world(ctx: &Context) -> bool {
     ctx.threading_mode() == super::super::ThreadingMode::Parallel
         && ctx.green_admission_readiness().is_ok()
 }
 
 /// `make-thread` in the experimental Parallel World.
 #[cfg(feature = "shared-heap")]
-pub fn parallel_make_thread(ctx: &mut Context, args: &[Value]) -> EvalResult {
+pub(crate) fn parallel_make_thread(ctx: &mut Context, args: &[Value]) -> EvalResult {
     // Green's admission, owner setup and waits; `green_spawn` gives the
     // thread a dedicated OS thread and the Baton lock in a Parallel World.
     ctx.green_spawn(args)
