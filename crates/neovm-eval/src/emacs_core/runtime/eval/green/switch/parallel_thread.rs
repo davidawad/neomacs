@@ -86,13 +86,14 @@ fn run_detached_body(
     neovm_value::detached::begin_detached(detached_gate(lock));
     let outcome = run_body(owner, function);
     // A body that unwound while attached for a primitive still holds the
-    // Baton; every other one attaches for the epilogue.
+    // Baton and left the detached count then; every other one attaches for
+    // the epilogue.
     let detached = neovm_value::detached::is_detached();
     neovm_value::detached::end_detached();
     if detached {
         owner.parallel_seat_baton(lock.attach().into_baton());
+        lock.body_attached();
     }
-    lock.body_attached();
     outcome
 }
 

@@ -77,8 +77,9 @@ pub(crate) struct BatonLock {
     detached_ns: AtomicU64,
     threads: AtomicU64,
     deferred_bytes: AtomicU64,
-    /// Lisp threads inside their detached body: their stacks hold roots no
-    /// collection can see, so none may run (slice S3's limitation).
+    /// Lisp threads running their detached body without the Baton: their
+    /// stacks hold roots no collection can see, so none may run (slice S3's
+    /// limitation). A body attached for World work is not counted.
     detached_threads: AtomicU64,
     /// A collection was deferred and has not run yet.
     collection_deferred: AtomicBool,
@@ -278,17 +279,17 @@ impl BatonLock {
         self.attach_by[index].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A Lisp thread's body starts running detached.
+    /// A Lisp thread's body starts running detached, or detaches again.
     pub(crate) fn body_detached(&self) {
         self.detached_threads.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// A Lisp thread's detached body ended.
+    /// A Lisp thread's detached body attached, for World work or its end.
     pub(crate) fn body_attached(&self) {
         self.detached_threads.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// How many Lisp threads are inside their detached body.
+    /// How many Lisp threads run their detached body without the Baton.
     pub(crate) fn detached_threads(&self) -> u64 {
         self.detached_threads.load(Ordering::Acquire)
     }

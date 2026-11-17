@@ -438,12 +438,14 @@ impl Context {
         let gate = neovm_value::detached::suspend_detached()?;
         lock.count_attach(reason);
         self.parallel_seat_baton(lock.attach().into_baton());
+        lock.body_attached();
         Some(ParallelAttach { lock, gate })
     }
 
     /// The second half of [`Self::with_parallel_attach`].
     pub(crate) fn parallel_detach(&mut self, attach: ParallelAttach) {
         let baton = self.parallel_unseat_baton();
+        attach.lock.body_detached();
         attach.lock.detach(baton);
         neovm_value::detached::resume_detached(attach.gate);
     }
@@ -486,11 +488,11 @@ impl Context {
         false
     }
 
-    /// Detached bodies other than this OS thread's own (whose roots the
-    /// collection it runs does see).
+    /// Bodies running detached now. This OS thread, attached, is not one:
+    /// a body that seats the Baton leaves the count, and a peer that then
+    /// parks in a wait has published its roots in the parked registry.
     fn detached_peers(lock: &BatonLock) -> u64 {
-        let own = u64::from(neovm_value::detached::running_detached());
-        lock.detached_threads().saturating_sub(own)
+        lock.detached_threads()
     }
 
     /// A detached thread binds SYM dynamically. A projected variable binds
@@ -509,6 +511,7 @@ impl Context {
         if neovm_value::detached::pin_at(self.specpdl.len()) {
             lock.count_attach(AttachReason::Class);
             self.parallel_seat_baton(lock.attach().into_baton());
+            lock.body_attached();
         }
     }
 
@@ -523,7 +526,9 @@ impl Context {
         let Some(lock) = self.parallel_lock_shared() else {
             return;
         };
-        lock.detach(self.parallel_unseat_baton());
+        let baton = self.parallel_unseat_baton();
+        lock.body_detached();
+        lock.detach(baton);
         neovm_value::detached::resume_detached(gate);
     }
 
