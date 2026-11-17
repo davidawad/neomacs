@@ -225,6 +225,14 @@ impl TaggedHeap {
     /// and cdr. Nothing is charged or marked per cell (the region was).
     #[inline(always)]
     pub(super) fn take_cons_cell(&mut self) -> *mut ConsCell {
+        #[cfg(feature = "shared-heap")]
+        {
+            let owner = owner_pages::installed_owner();
+            if !owner.is_null() {
+                // SAFETY: an installed state is this thread's own (`install`).
+                return unsafe { (*owner).take_cons_cell(std::ptr::from_mut(self)) };
+            }
+        }
         let cur = self.jit.cons_cur.get();
         if cur < self.jit.cons_lim.get() {
             self.jit.cons_cur.set(cur + size_of::<ConsCell>());

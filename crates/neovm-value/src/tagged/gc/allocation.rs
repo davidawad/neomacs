@@ -84,6 +84,14 @@ impl TaggedHeap {
     /// string reclaimer (it `drop_in_place`s dead slots, freeing the byte
     /// storage and interval table the string owns).
     pub fn alloc_string(&mut self, s: crate::heap_types::LispString) -> TaggedValue {
+        #[cfg(feature = "shared-heap")]
+        {
+            let owner = owner_pages::installed_owner();
+            if !owner.is_null() {
+                // SAFETY: an installed state is this thread's own (`install`).
+                return unsafe { (*owner).alloc_string(std::ptr::from_mut(self), s) };
+            }
+        }
         let empty_kind = (s.sbytes() == 0).then(|| s.storage_kind());
         if let Some(value) = empty_kind.and_then(|kind| self.canonical_empty_strings.get(kind)) {
             return value;
@@ -149,6 +157,14 @@ impl TaggedHeap {
     #[inline(always)]
     #[doc(hidden)]
     pub fn alloc_float_inline(&mut self, value: f64) -> TaggedValue {
+        #[cfg(feature = "shared-heap")]
+        {
+            let owner = owner_pages::installed_owner();
+            if !owner.is_null() {
+                // SAFETY: an installed state is this thread's own (`install`).
+                return unsafe { (*owner).alloc_float(std::ptr::from_mut(self), value) };
+            }
+        }
         let ptr = self.take_float_slot();
         // SAFETY: a reserved slot of an owned float page whose header the
         // region wrote; only the value is left.
@@ -174,6 +190,14 @@ impl TaggedHeap {
     /// `non_cons_object_addrs`; the page sweep is their only reclaimer (its
     /// `drop_in_place` frees the element `Vec` the vector owns).
     pub fn alloc_vector(&mut self, items: Vec<TaggedValue>) -> TaggedValue {
+        #[cfg(feature = "shared-heap")]
+        {
+            let owner = owner_pages::installed_owner();
+            if !owner.is_null() {
+                // SAFETY: an installed state is this thread's own (`install`).
+                return unsafe { (*owner).alloc_vector(std::ptr::from_mut(self), items) };
+            }
+        }
         self.add_memory_use_count(MemoryUseCountSlot::VectorCells, items.len() as u64);
         let ptr = self.vector_arena.alloc_slot();
         unsafe {
@@ -273,6 +297,14 @@ impl TaggedHeap {
 
     /// Allocate a hash table.
     pub fn alloc_hash_table(&mut self, table: crate::value::LispHashTable) -> TaggedValue {
+        #[cfg(feature = "shared-heap")]
+        {
+            let owner = owner_pages::installed_owner();
+            if !owner.is_null() {
+                // SAFETY: an installed state is this thread's own (`install`).
+                return unsafe { (*owner).alloc_hash_table(table) };
+            }
+        }
         self.add_memory_use_count(MemoryUseCountSlot::VectorCells, 1);
         let obj = Box::new(HashTableObj {
             header: VecLikeHeader::new(VecLikeType::HashTable),

@@ -430,3 +430,264 @@ impl OwnerPages {
         }
     }
 }
+
+thread_local! {
+    /// The owner allocation state installed on this OS thread, or null: the
+    /// allocation entry points' one branch. Raw pointer only, no `Value`;
+    /// [`InstalledOwner`] sets it and restores the previous value on drop.
+    static OWNER_ALLOC: Cell<*mut OwnerAllocState> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// This thread's installed owner state, null on the keeper path.
+#[inline(always)]
+pub(super) fn installed_owner() -> *mut OwnerAllocState {
+    OWNER_ALLOC.with(Cell::get)
+}
+
+/// One owner thread's allocation state: its open runs, its uncharged counts
+/// and the boxed objects it allocated since its last refill.
+pub(crate) struct OwnerAllocState {
+    shared: Arc<OwnerPages>,
+    cons: OwnerRun,
+    float: OwnerRun,
+    string: OwnerRun,
+    vector: OwnerRun,
+    /// The parity the last refill read; every run stamps it.
+    parity: MarkParity,
+    charges: Charges,
+    boxed: Vec<*mut VecLikeHeader>,
+    /// Bits of the heap's canonical empty strings (unibyte, multibyte) when
+    /// the state was made: permanent runtime roots, copied, never traced from
+    /// here. Zero when the heap had none.
+    canonical_empty_bits: [usize; 2],
+}
+
+// SAFETY: the state is built by the keeper and then used by exactly one owner
+// thread; its raw pointers name runs in storage the cold state keeps alive and
+// boxed objects only this state links. Nothing in it is thread-affine.
+unsafe impl Send for OwnerAllocState {}
+
+/// Guard of an installed [`OwnerAllocState`]: uninstalls on drop.
+#[must_use]
+pub(crate) struct InstalledOwner<'state> {
+    _state: std::marker::PhantomData<&'state mut OwnerAllocState>,
+    previous: *mut OwnerAllocState,
+}
+
+impl Drop for InstalledOwner<'_> {
+    fn drop(&mut self) {
+        OWNER_ALLOC.with(|slot| slot.set(self.previous));
+    }
+}
+
+impl OwnerAllocState {
+    /// Route this OS thread's allocations through this state until the guard
+    /// drops. The thread must also have the heap installed.
+    pub(crate) fn install(&mut self) -> InstalledOwner<'_> {
+        let previous = OWNER_ALLOC.with(|slot| slot.replace(std::ptr::from_mut(self)));
+        InstalledOwner {
+            _state: std::marker::PhantomData,
+            previous,
+        }
+    }
+
+    pub(crate) fn stats(&self) -> OwnerAllocStats {
+        self.shared.stats()
+    }
+
+    fn run_mut(&mut self, class: OwnerClass) -> &mut OwnerRun {
+        match class {
+            OwnerClass::Cons => &mut self.cons,
+            OwnerClass::Float => &mut self.float,
+            OwnerClass::String => &mut self.string,
+            OwnerClass::Vector => &mut self.vector,
+        }
+    }
+
+    /// Hand our charges and boxed objects to the cold state.
+    fn flush(&mut self, cold: &mut AllocatorCold) {
+        cold.charges.add(&std::mem::take(&mut self.charges));
+        cold.boxed.append(&mut self.boxed);
+    }
+
+    /// The run of `class` is exhausted or closed: close it, carve the next
+    /// one under the cold mutex, and read the parity it stamps.
+    #[cold]
+    #[inline(never)]
+    fn refill(&mut self, class: OwnerClass, heap: *const TaggedHeap) {
+        // SAFETY: `mark_parity` changes only inside a collection, and every
+        // owner has closed its runs and is parked for the whole collection,
+        // so no write to it races this read.
+        self.parity = unsafe { std::ptr::addr_of!((*heap).mark_parity).read() };
+        let shared = Arc::clone(&self.shared);
+        let mut cold = shared.lock();
+        self.flush(&mut cold);
+        let old = std::mem::take(self.run_mut(class));
+        cold.close(class, old);
+        let run = cold.carve(class, shared.sizes);
+        drop(cold);
+        if class == OwnerClass::Float {
+            let mut slot = run.start;
+            while slot < run.lim {
+                // SAFETY: a reserved slot of a page only this run writes.
+                // FULL-HEADER WRITE, as `refill_float_region` does.
+                unsafe {
+                    std::ptr::write(
+                        slot as *mut FloatObj,
+                        FloatObj {
+                            header: GcHeader::new_marked(HeapObjectKind::Float, self.parity),
+                            value: 0.0,
+                        },
+                    );
+                }
+                slot += FLOAT_SLOT_BYTES;
+            }
+        }
+        *self.run_mut(class) = run;
+    }
+
+    #[inline(always)]
+    fn take(&mut self, class: OwnerClass, stride: usize, heap: *const TaggedHeap) -> usize {
+        if let Some(slot) = self.run_mut(class).take(stride) {
+            return slot;
+        }
+        self.refill(class, heap);
+        self.run_mut(class)
+            .take(stride)
+            .expect("a fresh run has a slot")
+    }
+
+    #[inline(always)]
+    pub(super) fn take_cons_cell(&mut self, heap: *const TaggedHeap) -> *mut ConsCell {
+        self.take(OwnerClass::Cons, size_of::<ConsCell>(), heap) as *mut ConsCell
+    }
+
+    #[inline(always)]
+    pub(super) fn alloc_float(&mut self, heap: *const TaggedHeap, value: f64) -> TaggedValue {
+        let ptr = self.take(OwnerClass::Float, FLOAT_SLOT_BYTES, heap) as *mut FloatObj;
+        // SAFETY: a slot of our open run whose header the refill wrote.
+        unsafe {
+            std::ptr::addr_of_mut!((*ptr).value).write(value);
+            TaggedValue::from_float_ptr(ptr)
+        }
+    }
+
+    /// `TaggedHeap::alloc_string` on a slot of our string run. Its alloc bit
+    /// is set when the run closes; nothing reads the bit before adoption.
+    pub(super) fn alloc_string(
+        &mut self,
+        heap: *const TaggedHeap,
+        s: crate::heap_types::LispString,
+    ) -> TaggedValue {
+        if s.sbytes() == 0 {
+            let bits = self.canonical_empty_bits[match s.storage_kind() {
+                LispStringStorageKind::Unibyte => 0,
+                LispStringStorageKind::Multibyte => 1,
+            }];
+            if bits != 0 {
+                // SAFETY: the bits of a canonical empty string, a permanent
+                // runtime root of this heap.
+                return unsafe { TaggedValue::from_bits(bits) };
+            }
+        }
+        self.charges.count(MemoryUseCountSlot::Strings, 1);
+        self.charges
+            .count(MemoryUseCountSlot::StringChars, s.sbytes() as u64);
+        let ptr = self.take(
+            OwnerClass::String,
+            <StringObj as PagedObject>::SLOT_BYTES,
+            heap,
+        ) as *mut StringObj;
+        // SAFETY: a never-used slot of our open run, written whole before the
+        // value escapes, as the keeper path does.
+        unsafe {
+            std::ptr::write(
+                ptr,
+                StringObj {
+                    header: GcHeader::new(HeapObjectKind::String),
+                    data: s,
+                },
+            );
+            (*ptr).header.set_marked(self.parity);
+            self.charges.allocated += 1;
+            self.charges.bytes += TaggedHeap::string_object_bytes(&*ptr);
+            TaggedValue::from_string_ptr(ptr)
+        }
+    }
+
+    /// `TaggedHeap::alloc_vector` on a slot of our vector run; adoption adds
+    /// it to the vector registry.
+    pub(super) fn alloc_vector(
+        &mut self,
+        heap: *const TaggedHeap,
+        items: Vec<TaggedValue>,
+    ) -> TaggedValue {
+        self.charges
+            .count(MemoryUseCountSlot::VectorCells, items.len() as u64);
+        let ptr = self.take(
+            OwnerClass::Vector,
+            <VectorObj as PagedObject>::SLOT_BYTES,
+            heap,
+        ) as *mut VectorObj;
+        // SAFETY: as in `alloc_string`.
+        unsafe {
+            std::ptr::write(
+                ptr,
+                VectorObj {
+                    header: VecLikeHeader::new(VecLikeType::Vector),
+                    data: items.into(),
+                },
+            );
+            (*ptr).header.gc.set_marked(self.parity);
+            self.charges.allocated += 1;
+            self.charges.bytes += size_of::<VectorObj>()
+                .saturating_add(TaggedHeap::lisp_value_vec_storage_bytes(&(*ptr).data));
+            TaggedValue::from_veclike_ptr(ptr as *const VecLikeHeader)
+        }
+    }
+
+    /// `TaggedHeap::alloc_hash_table` without the `all_objects` link, which
+    /// adoption makes.
+    pub(super) fn alloc_hash_table(&mut self, table: crate::value::LispHashTable) -> TaggedValue {
+        self.charges.count(MemoryUseCountSlot::VectorCells, 1);
+        let ptr = Box::into_raw(Box::new(HashTableObj {
+            header: VecLikeHeader::new(VecLikeType::HashTable),
+            table,
+        }));
+        self.boxed.push(ptr.cast());
+        self.charges.allocated += 1;
+        // SAFETY: the box was just made and is ours.
+        self.charges.bytes += TaggedHeap::hash_table_object_bytes(unsafe { &*ptr });
+        // SAFETY: a live boxed hash table.
+        unsafe { TaggedValue::from_veclike_ptr(ptr as *const VecLikeHeader) }
+    }
+}
+
+/// Close every open run of `state` (cursor = limit, handed-out slots charged
+/// and marked allocated, unused cells returned at adoption) and hand its
+/// boxed objects over. An owner calls this when it parks for a collection.
+pub(crate) fn close_owner_regions(state: &mut OwnerAllocState) {
+    let shared = Arc::clone(&state.shared);
+    let mut cold = shared.lock();
+    state.flush(&mut cold);
+    for class in [
+        OwnerClass::Cons,
+        OwnerClass::Float,
+        OwnerClass::String,
+        OwnerClass::Vector,
+    ] {
+        let run = std::mem::take(state.run_mut(class));
+        cold.close(class, run);
+    }
+}
+
+/// Resume allocating after a collection. Runs reopen lazily: the next
+/// allocation of each class refills, reading the collection's new parity.
+pub(crate) fn reopen_owner_regions(state: &mut OwnerAllocState) {
+    debug_assert!(
+        [state.cons, state.float, state.string, state.vector]
+            .iter()
+            .all(|run| run.start == 0),
+        "reopen without close"
+    );
+}
