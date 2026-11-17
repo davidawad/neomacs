@@ -230,6 +230,13 @@ impl BatonLock {
         self.attach().into_baton()
     }
 
+    /// Whether an owner waits to attach: a detached thread that needs the
+    /// Baton for World work is runnable, as a GNU thread waiting for the
+    /// global lock is.
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.lock_slot().waiting > 0
+    }
+
     /// Whether this OS thread holds the Baton.
     pub(crate) fn is_attached_here(&self) -> bool {
         self.lock_slot().holder == Some(std::thread::current().id())

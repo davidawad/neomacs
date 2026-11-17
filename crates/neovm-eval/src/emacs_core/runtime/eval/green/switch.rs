@@ -1167,6 +1167,17 @@ impl Context {
         Ok(SelectTurn::Switched)
     }
 
+    /// A Parallel World's thread waits on the Baton lock to attach. GNU's
+    /// `Fthread_yield` releases the global lock to such a waiter
+    /// (src/thread.c, `yield_callback`); Green's ready queue never holds it.
+    fn parallel_attach_waiting(&self) -> bool {
+        #[cfg(feature = "shared-heap")]
+        if let Some(lock) = self.parallel_lock() {
+            return lock.has_waiters();
+        }
+        false
+    }
+
     /// Yield only when another owner can run. A sleeping selector remains
     /// watched at this safepoint, but an owner that reacquires its own turn
     /// needs no binding exchange or parked-root publication (GNU's
@@ -1182,6 +1193,7 @@ impl Context {
         }
         if self.with_green_runtime(|runtime| runtime.exit.get().is_some())
             || control.yield_peer_ready(key)
+            || self.parallel_attach_waiting()
         {
             return self.green_wait(Wait::Runnable);
         }
