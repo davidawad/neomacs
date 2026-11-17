@@ -4609,6 +4609,10 @@ fn shared_heap_stats(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
         Value::fixnum(i64::try_from(parallel.attach_by_intern).unwrap_or(i64::MAX)),
         Value::symbol(":attach-by-blv"),
         Value::fixnum(i64::try_from(parallel.attach_by_blv).unwrap_or(i64::MAX)),
+        Value::symbol(":stop-wait-ns"),
+        Value::fixnum(i64::try_from(parallel.stop_wait_ns).unwrap_or(i64::MAX)),
+        Value::symbol(":stop-max-ns"),
+        Value::fixnum(i64::try_from(parallel.stop_max_ns).unwrap_or(i64::MAX)),
     ]))
 }
 

@@ -14,6 +14,7 @@
 //! acquisition of it is counted in [`ParallelStats`].
 
 use super::Baton;
+use super::parallel_gc::StopWorld;
 use neovm_value::detached::AttachReason;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -39,6 +40,10 @@ pub(crate) struct ParallelStats {
     /// Buffer-local reads of detached threads (no attach: the read skips
     /// the shared cache).
     pub(crate) attach_by_blv: u64,
+    /// Time from collection requests to every detached thread parked.
+    pub(crate) stop_wait_ns: u64,
+    /// The longest stop, from request to resume.
+    pub(crate) stop_max_ns: u64,
 }
 
 /// Where the Baton is, under the lock.
@@ -71,8 +76,6 @@ pub(crate) struct BatonLock {
     attach_wait_ns: AtomicU64,
     detached_ns: AtomicU64,
     threads: AtomicU64,
-    safepoint_stops: AtomicU64,
-    collections: AtomicU64,
     deferred_bytes: AtomicU64,
     /// Lisp threads inside their detached body: their stacks hold roots no
     /// collection can see, so none may run (slice S3's limitation).
@@ -81,6 +84,8 @@ pub(crate) struct BatonLock {
     collection_deferred: AtomicBool,
     /// Per [`AttachReason`], in declaration order.
     attach_by: [AtomicU64; 4],
+    /// The collections' rendezvous, with their counters.
+    stop: StopWorld,
 }
 
 fn elapsed_ns(since: Instant) -> u64 {
@@ -107,12 +112,11 @@ impl BatonLock {
             attach_wait_ns: AtomicU64::new(0),
             detached_ns: AtomicU64::new(0),
             threads: AtomicU64::new(1),
-            safepoint_stops: AtomicU64::new(0),
-            collections: AtomicU64::new(0),
             deferred_bytes: AtomicU64::new(0),
             detached_threads: AtomicU64::new(0),
             collection_deferred: AtomicBool::new(false),
             attach_by: Default::default(),
+            stop: StopWorld::new(),
         }
     }
 
@@ -245,18 +249,21 @@ impl BatonLock {
     /// The counters now.
     pub(crate) fn stats(&self) -> ParallelStats {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let stop = self.stop.counters();
         ParallelStats {
             threads: load(&self.threads),
             attach_count: load(&self.attach_count),
             attach_wait_ns: load(&self.attach_wait_ns),
             detached_ns: load(&self.detached_ns),
-            safepoint_stops: load(&self.safepoint_stops),
-            collections: load(&self.collections),
+            safepoint_stops: stop.safepoint_stops,
+            collections: stop.collections,
             deferred_bytes: load(&self.deferred_bytes),
             attach_by_class: load(&self.attach_by[0]),
             attach_by_alloc: load(&self.attach_by[1]),
             attach_by_intern: load(&self.attach_by[2]),
             attach_by_blv: load(&self.attach_by[3]),
+            stop_wait_ns: stop.stop_wait_ns,
+            stop_max_ns: stop.stop_max_ns,
         }
     }
 
@@ -294,11 +301,15 @@ impl BatonLock {
         }
     }
 
-    /// A collection runs; count it when it is one that was deferred.
+    /// A collection runs: a deferred one is no longer pending. The stop
+    /// counts every collection ([`StopWorld`]).
     pub(crate) fn collection_runs(&self) {
-        if self.collection_deferred.swap(false, Ordering::AcqRel) {
-            self.collections.fetch_add(1, Ordering::Relaxed);
-        }
+        self.collection_deferred.store(false, Ordering::Release);
+    }
+
+    /// The rendezvous every collection in this World stops at.
+    pub(crate) fn stop(&self) -> &StopWorld {
+        &self.stop
     }
 
     /// A Lisp thread is about to start on its own OS thread.
