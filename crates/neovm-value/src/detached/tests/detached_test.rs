@@ -8,25 +8,25 @@ static ATTACHES: AtomicUsize = AtomicUsize::new(0);
 static DETACHES: AtomicUsize = AtomicUsize::new(0);
 static NOTES: AtomicUsize = AtomicUsize::new(0);
 
-unsafe fn attach(_lock: *const (), _reason: AttachReason) -> *mut () {
+unsafe fn test_attach(_lock: *const (), _reason: AttachReason) -> *mut () {
     ATTACHES.fetch_add(1, Ordering::Relaxed);
     std::ptr::null_mut()
 }
 
-unsafe fn detach(_lock: *const (), _token: *mut ()) {
+unsafe fn test_detach(_lock: *const (), _token: *mut ()) {
     DETACHES.fetch_add(1, Ordering::Relaxed);
 }
 
-unsafe fn note(_lock: *const (), _reason: AttachReason) {
+unsafe fn test_note(_lock: *const (), _reason: AttachReason) {
     NOTES.fetch_add(1, Ordering::Relaxed);
 }
 
 fn gate() -> DetachedGate {
     DetachedGate {
         lock: std::ptr::null(),
-        attach,
-        detach,
-        note,
+        attach: test_attach,
+        detach: test_detach,
+        note: test_note,
     }
 }
 
