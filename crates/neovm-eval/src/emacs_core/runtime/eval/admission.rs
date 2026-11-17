@@ -63,15 +63,29 @@ pub(crate) enum ThreadingMode {
     Sim,
     /// Lisp threads are owners with owner-local bindings, after admission.
     Green,
+    /// One permanently dedicated OS thread per Lisp thread, serialized by a locked Baton.
+    #[cfg(feature = "shared-heap")]
+    Parallel,
 }
 
 impl ThreadingMode {
-    /// The mode `NEOVM_THREADS` selects for a new World: `green`, or `sim`
+    pub(crate) fn uses_owner_threads(self) -> bool {
+        match self {
+            Self::Green => true,
+            #[cfg(feature = "shared-heap")]
+            Self::Parallel => true,
+            Self::Sim => false,
+        }
+    }
+
+    /// The mode `NEOVM_THREADS` selects for a new World: `green`, `parallel`, or `sim`
     /// (the default, also when unset). Any other value warns once and
     /// selects `sim`.
     pub(crate) fn from_env() -> Self {
         match std::env::var("NEOVM_THREADS").as_deref() {
             Ok("green") => Self::Green,
+            #[cfg(feature = "shared-heap")]
+            Ok("parallel") => Self::Parallel,
             Ok("sim") | Err(_) => Self::Sim,
             Ok(other) => {
                 static WARNED: std::sync::Once = std::sync::Once::new();
@@ -246,6 +260,12 @@ impl Context {
         self.set_threading_mode_at_construction(ThreadingMode::Green);
     }
 
+    /// Test-support: fix a freshly constructed Context to Parallel threading.
+    #[cfg(all(any(test, feature = "test-support"), feature = "shared-heap"))]
+    pub fn set_parallel_threading_mode_at_construction_for_test(&mut self) {
+        self.set_threading_mode_at_construction(ThreadingMode::Parallel);
+    }
+
     /// Admit Lisp threads in this Green World: the one-time, sticky move to
     /// owner-local dynamic bindings, this Context being the first owner.
     /// Reachable from tests and the green-thread runtime only.
@@ -269,7 +289,7 @@ impl Context {
         &mut self,
         reservation: Reservation,
     ) -> Result<(), AdmissionError> {
-        if self.threading_mode() != ThreadingMode::Green {
+        if !self.threading_mode().uses_owner_threads() {
             return Err(AdmissionError::NotGreen);
         }
         if self.threads_admitted() {
@@ -298,7 +318,7 @@ impl Context {
     #[cold]
     #[inline(never)]
     pub(crate) fn fix_standard_case_table_cell(&mut self) {
-        if self.threading_mode() != ThreadingMode::Green || self.threads_admitted() {
+        if !self.threading_mode().uses_owner_threads() || self.threads_admitted() {
             return;
         }
         self.setup_thread_locals();

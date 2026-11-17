@@ -53,6 +53,7 @@ default = ["jit", "sqlite"]
 gc-memory-telemetry = ["dep:serde_json"]
 jit = []
 perf-probes = []
+shared-heap = []
 sqlite = []
 # Markers matching core's forwarding: value's source branches on the dbus and
 # wkwebview host cfgs, so its build script must reach the same host view.

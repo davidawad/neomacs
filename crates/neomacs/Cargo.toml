@@ -65,6 +65,7 @@ dbus-vendored = ["neovm-core/dbus-vendored"]
 # thread-local histogram bump per dispatched op/call (real cost — profiling
 # builds only). Run profiling sessions with `NEOVM_JIT=0`.
 vm-profile = ["neovm-core/vm-profile"]
+shared-heap = ["neovm-core/shared-heap"]
 neo-term = ["neomacs-display-runtime/neo-term"]
 video = ["neomacs-display-runtime/video"]
 webview = ["neomacs-display-runtime/webview", "neovm-core/webview"]
