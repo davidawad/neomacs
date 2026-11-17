@@ -12,6 +12,7 @@ pub(crate) mod rust_lsp;
 pub(crate) mod scrolling;
 pub(crate) mod search_shape;
 pub(crate) mod sustained_native_video;
+pub(crate) mod threads;
 pub(crate) mod vm_loop;
 
 /// Omitted fields are legacy; a present field must be an unsigned integer.

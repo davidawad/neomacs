@@ -134,6 +134,23 @@ impl RunRequest {
         if self.scenario == ScenarioId::BytecodeCallLoop {
             environment.insert("NEOVM_JIT".to_owned(), "0".into());
         }
+        if matches!(
+            self.scenario,
+            ScenarioId::ThreadsNumericLoop
+                | ScenarioId::ThreadsJsonParse
+                | ScenarioId::ThreadsStress
+        ) {
+            if let Some(value) = std::env::var_os("NEOVM_THREADS") {
+                environment.insert("NEOVM_THREADS".to_owned(), value);
+            }
+        }
+        if self.scenario == ScenarioId::ThreadsStress {
+            if !environment.contains_key("NEOVM_GC_THRESHOLD") {
+                if let Some(threshold) = std::env::var_os("NEOVM_GC_THRESHOLD") {
+                    environment.insert("NEOVM_GC_THRESHOLD".to_owned(), threshold);
+                }
+            }
+        }
         environment
     }
 
@@ -652,6 +669,11 @@ impl PerfHarness {
             ScenarioId::BytecodeCallLoop => {
                 scenarios::bytecode::prepare(&self.workspace_root, request, run_directory)
             }
+            ScenarioId::ThreadsNumericLoop
+            | ScenarioId::ThreadsJsonParse
+            | ScenarioId::ThreadsStress => {
+                scenarios::threads::prepare(&self.workspace_root, request, run_directory)
+            }
             ScenarioId::ElispBenchmarks => {
                 scenarios::elisp_benchmarks::prepare(&self.workspace_root, request, run_directory)
             }
@@ -1067,6 +1089,7 @@ enum PreparedWorkload {
     MxTabCompletionSteady,
     Scrolling,
     BytecodeCallLoop,
+    Threads,
     VmLoop,
     BuiltinCall,
     SearchShape,
@@ -1753,6 +1776,7 @@ enum ScenarioResult {
     MxTabCompletionSteady(scenarios::mx_tab::MxTabCompletionSteadyResult),
     Scrolling(scenarios::scrolling::ScrollingResult),
     BytecodeCallLoop(scenarios::bytecode::BytecodeCallLoopResult),
+    Threads(scenarios::threads::ThreadsResult),
     VmLoop(scenarios::vm_loop::VmLoopResult),
     BuiltinCall(scenarios::builtin_call::BuiltinCallResult),
     SearchShape(scenarios::search_shape::SearchShapeResult),
@@ -1773,13 +1797,14 @@ impl ScenarioResult {
     }
 
     #[cfg(test)]
-    const fn elapsed_us(&self) -> u64 {
+    fn elapsed_us(&self) -> u64 {
         match self {
             Self::RustLspTyping(result) => result.elapsed_us,
             Self::MxTabCompletion(result) => result.elapsed_us,
             Self::MxTabCompletionSteady(result) => result.base.elapsed_us,
             Self::Scrolling(result) => result.elapsed_us,
             Self::BytecodeCallLoop(result) => result.elapsed_us,
+            Self::Threads(result) => result.elapsed_us(),
             Self::VmLoop(result) => result.elapsed_us(),
             Self::BuiltinCall(result) => result.elapsed_us(),
             Self::SearchShape(result) => result.elapsed_us(),
@@ -1848,6 +1873,9 @@ fn parse_scenario_result(
         ScenarioId::BytecodeCallLoop => {
             serde_json::from_str(raw).map(ScenarioResult::BytecodeCallLoop)
         }
+        ScenarioId::ThreadsNumericLoop
+        | ScenarioId::ThreadsJsonParse
+        | ScenarioId::ThreadsStress => serde_json::from_str(raw).map(ScenarioResult::Threads),
         ScenarioId::ElispBenchmarks => {
             serde_json::from_str(raw).map(ScenarioResult::ElispBenchmarks)
         }
@@ -2091,6 +2119,7 @@ fn result_verdict(
         ScenarioResult::BytecodeCallLoop(result) => {
             scenarios::bytecode::validate_bytecode_call_loop_result(request, result)
         }
+        ScenarioResult::Threads(result) => scenarios::threads::validate(request, result),
         ScenarioResult::ElispBenchmarks(result) => {
             scenarios::elisp_benchmarks::validate_elisp_benchmarks_result(request, result)
         }
@@ -2160,6 +2189,7 @@ fn valid_measurements(result: &ScenarioResult, wall_elapsed_us: u128) -> Vec<Mea
         ScenarioResult::BytecodeCallLoop(result) => {
             scenarios::bytecode::valid_bytecode_call_loop_measurements(result, wall_elapsed_us)
         }
+        ScenarioResult::Threads(result) => scenarios::threads::measurements(result),
         ScenarioResult::ElispBenchmarks(result) => {
             scenarios::elisp_benchmarks::valid_elisp_benchmarks_measurements(
                 result,

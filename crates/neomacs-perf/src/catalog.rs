@@ -205,6 +205,12 @@ pub enum ScenarioId {
     /// this row necessarily pays from contaminating the steady-state
     /// number. One operation is one scroll command.
     Scrolling,
+    /// Numeric Elisp work on the main, Lisp-thread, and worker-isolate paths.
+    ThreadsNumericLoop,
+    /// Deterministic JSON parsing on the main, Lisp-thread, and isolate paths.
+    ThreadsJsonParse,
+    /// Correctness and GC stress across the editor's Lisp threads.
+    ThreadsStress,
 }
 
 impl ScenarioId {
@@ -778,6 +784,30 @@ const SCENARIOS: &[ScenarioSpec] = &[
         primary_metric: MetricName::PerOperationWallTime,
         cross_editor_parity_metrics: &[],
     },
+    ScenarioSpec {
+        id: ScenarioId::ThreadsNumericLoop,
+        description: "numeric Elisp loop across serial, Lisp-thread, and worker-isolate execution",
+        default_frontend: Frontend::Batch,
+        default_iterations: NonZeroU32::new(3_000_000).expect("non-zero scenario default"),
+        primary_metric: MetricName::ThreadsElapsedWallTime,
+        cross_editor_parity_metrics: &[],
+    },
+    ScenarioSpec {
+        id: ScenarioId::ThreadsJsonParse,
+        description: "deterministic JSON parsing across serial, Lisp-thread, and worker-isolate execution",
+        default_frontend: Frontend::Batch,
+        default_iterations: NonZeroU32::new(20).expect("non-zero scenario default"),
+        primary_metric: MetricName::ThreadsElapsedWallTime,
+        cross_editor_parity_metrics: &[],
+    },
+    ScenarioSpec {
+        id: ScenarioId::ThreadsStress,
+        description: "multi-threaded Elisp allocation, binding, mutation, buffer, and GC stress",
+        default_frontend: Frontend::Batch,
+        default_iterations: NonZeroU32::new(20).expect("non-zero scenario default"),
+        primary_metric: MetricName::ThreadIterations,
+        cross_editor_parity_metrics: &[],
+    },
 ];
 
 pub fn scenarios() -> &'static [ScenarioSpec] {
@@ -847,6 +877,10 @@ pub const fn scenario(id: ScenarioId) -> &'static ScenarioSpec {
         ScenarioId::OrgEditingHeavy => &SCENARIOS[17],
         ScenarioId::MxTabCompletionSteady => &SCENARIOS[52],
         ScenarioId::Scrolling => &SCENARIOS[53],
+
+        ScenarioId::ThreadsNumericLoop => &SCENARIOS[54],
+        ScenarioId::ThreadsJsonParse => &SCENARIOS[55],
+        ScenarioId::ThreadsStress => &SCENARIOS[56],
     }
 }
 

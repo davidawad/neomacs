@@ -143,6 +143,19 @@ pub enum MetricName {
     VideoSurfacePoolReuses,
     VideoSurfacePoolBackpressuredAcquires,
     VideoSurfacePoolInFlightHighWater,
+    ThreadsElapsedWallTime,
+    SerialElapsedWallTime,
+    IsolatesElapsedWallTime,
+    AlistSerialElapsedWallTime,
+    AlistThreadsElapsedWallTime,
+    AlistIsolatesElapsedWallTime,
+    ThreadSpeedup,
+    IsolatesSpeedup,
+    AlistThreadSpeedup,
+    AlistIsolatesSpeedup,
+    ThreadCount,
+    ThreadIterations,
+    GarbageCollections,
 }
 
 impl MetricName {
@@ -178,6 +191,12 @@ impl MetricName {
             | Self::P95VideoPresentationInterval
             | Self::P99VideoPresentationInterval
             | Self::MaxVideoPresentationInterval => MetricUnit::Microseconds,
+            Self::ThreadsElapsedWallTime
+            | Self::SerialElapsedWallTime
+            | Self::IsolatesElapsedWallTime
+            | Self::AlistSerialElapsedWallTime
+            | Self::AlistThreadsElapsedWallTime
+            | Self::AlistIsolatesElapsedWallTime => MetricUnit::Microseconds,
             Self::PerEditCpuTime | Self::PerEditWallTime => MetricUnit::MicrosecondsPerEdit,
             Self::PerCompletionCpuTime => MetricUnit::MicrosecondsPerCompletion,
             Self::PerBytecodeCallCpuTime => MetricUnit::MicrosecondsPerBytecodeCall,
@@ -209,6 +228,13 @@ impl MetricName {
             | Self::L1DataCacheLoadMisses
             | Self::L1InstructionCacheMisses
             | Self::DataTlbLoadMisses => MetricUnit::Count,
+            Self::ThreadCount | Self::ThreadIterations | Self::GarbageCollections => {
+                MetricUnit::Count
+            }
+            Self::ThreadSpeedup
+            | Self::IsolatesSpeedup
+            | Self::AlistThreadSpeedup
+            | Self::AlistIsolatesSpeedup => MetricUnit::Ratio,
             Self::OperationCount
             | Self::InputLatencyOverBudgetCount
             | Self::VideoDecodedFrames
@@ -238,6 +264,7 @@ pub enum MetricUnit {
     FramesPerSecond,
     Bytes,
     Count,
+    Ratio,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
