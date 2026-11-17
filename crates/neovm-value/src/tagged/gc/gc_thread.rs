@@ -1970,6 +1970,14 @@ unsafe fn installed_heap_generational_enabled(heap: *const TaggedHeap) -> bool {
 /// never had it.
 #[inline]
 pub fn with_tagged_heap<R>(f: impl FnOnce(&mut TaggedHeap) -> R) -> R {
+    // A Parallel World's detached thread holds no Baton: it reaches the one
+    // shared heap only attached, for this access.
+    #[cfg(feature = "shared-heap")]
+    if crate::detached::is_detached() {
+        return crate::detached::with_attached(crate::detached::AttachReason::Alloc, || {
+            with_tagged_heap(f)
+        });
+    }
     TAGGED_HEAP.with(|h| {
         let ptr = h.get();
         if !ptr.is_null() {

@@ -1,0 +1,178 @@
+//! A Parallel World's detached OS thread (feature `shared-heap`).
+//!
+//! A Lisp thread of a Parallel World runs its Scalar- and Sealed-class code
+//! without the World's Baton. While it does, this crate must not hand it the
+//! shared heap: every OS thread's [`with_tagged_heap`] reaches the one
+//! `TaggedHeap` by `&mut`, and the heap's allocation regions are not per
+//! owner yet. So the evaluator marks the OS thread detached here, with a
+//! [`DetachedGate`] naming how to attach, and this crate attaches for the
+//! duration of every heap access the thread makes while detached.
+//!
+//! The gate is per OS thread and is installed only by the evaluator's
+//! Parallel thread body: an OS thread without one (every thread of a Sim or
+//! Green World) never takes a branch past the slot's load.
+//!
+//! [`with_tagged_heap`]: crate::tagged::gc::with_tagged_heap
+
+use std::cell::Cell;
+
+/// Why a detached thread attached (or, for [`AttachReason::Blv`], read
+/// shared state on the detached path): one counter per reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum AttachReason {
+    /// A `World`-class primitive.
+    Class,
+    /// A heap access: an allocation, or a primitive whose class would run
+    /// detached but which allocates or writes heap metadata.
+    Alloc,
+    /// A primitive that interns.
+    Intern,
+    /// A buffer-local read that would have swapped the shared BLV cache.
+    Blv,
+}
+
+/// How a detached OS thread attaches to its World's Baton lock. The
+/// evaluator owns the lock; this crate sees it only through these entries.
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct DetachedGate {
+    /// The World's lock, erased.
+    pub lock: *const (),
+    /// Attach for REASON, blocking; returns the token `detach` takes back.
+    pub attach: unsafe fn(lock: *const (), reason: AttachReason) -> *mut (),
+    /// Detach again with the token `attach` returned.
+    pub detach: unsafe fn(lock: *const (), token: *mut ()),
+    /// Count REASON without attaching.
+    pub note: unsafe fn(lock: *const (), reason: AttachReason),
+}
+
+/// This OS thread's place in a Parallel World.
+#[derive(Clone, Copy, Debug, Default)]
+struct Placement {
+    /// The gate while the thread runs detached; `None` while it holds the
+    /// Baton (or is in no Parallel World).
+    gate: Option<DetachedGate>,
+    /// Whether the thread is inside its detached body at all, attached for
+    /// a moment or not: its stack holds roots no collector can see.
+    running_detached: bool,
+}
+
+thread_local! {
+    static PLACEMENT: Cell<Placement> = const {
+        Cell::new(Placement { gate: None, running_detached: false })
+    };
+}
+
+fn placement() -> Placement {
+    PLACEMENT.with(Cell::get)
+}
+
+fn set_gate(gate: Option<DetachedGate>) {
+    PLACEMENT.with(|slot| {
+        slot.set(Placement { gate, ..slot.get() });
+    });
+}
+
+/// Whether this OS thread runs detached now (without the Baton).
+#[doc(hidden)]
+#[inline(always)]
+pub fn is_detached() -> bool {
+    PLACEMENT.with(|slot| slot.get().gate.is_some())
+}
+
+/// Whether this OS thread is inside a detached body, attached for a
+/// moment or not.
+#[doc(hidden)]
+#[inline]
+pub fn running_detached() -> bool {
+    placement().running_detached
+}
+
+/// The thread's body starts running detached through GATE.
+#[doc(hidden)]
+pub fn begin_detached(gate: DetachedGate) {
+    PLACEMENT.with(|slot| {
+        slot.set(Placement {
+            gate: Some(gate),
+            running_detached: true,
+        });
+    });
+}
+
+/// The thread's body ends; it holds the Baton again.
+#[doc(hidden)]
+pub fn end_detached() {
+    PLACEMENT.with(|slot| slot.set(Placement::default()));
+}
+
+/// The thread attached for a while: it holds the Baton until
+/// [`resume_detached`]. Returns the gate to resume with.
+#[doc(hidden)]
+pub fn suspend_detached() -> Option<DetachedGate> {
+    let gate = placement().gate;
+    set_gate(None);
+    gate
+}
+
+/// The thread detaches again through GATE.
+#[doc(hidden)]
+pub fn resume_detached(gate: DetachedGate) {
+    set_gate(Some(gate));
+}
+
+/// Count REASON on the thread's World when the thread runs detached.
+#[doc(hidden)]
+#[inline]
+pub fn note(reason: AttachReason) {
+    if let Some(gate) = placement().gate {
+        // SAFETY: the evaluator installed GATE with its World's live lock,
+        // which outlives the thread's detached body.
+        unsafe { (gate.note)(gate.lock, reason) };
+    }
+}
+
+/// Holds the Baton for a scope when this OS thread runs detached: entering
+/// attaches for a reason, dropping (also on unwind) detaches and
+/// reinstalls the gate. A no-op on an attached thread.
+#[doc(hidden)]
+#[must_use = "dropping the scope detaches at once"]
+pub struct AttachedScope(Option<(DetachedGate, *mut ())>);
+
+impl AttachedScope {
+    /// Attach for REASON if this OS thread runs detached.
+    #[inline]
+    pub fn enter(reason: AttachReason) -> Self {
+        let Some(gate) = placement().gate else {
+            return Self(None);
+        };
+        set_gate(None);
+        // SAFETY: as in `note`; the gate is cleared first, so accesses made
+        // inside the scope do not attach again.
+        let token = unsafe { (gate.attach)(gate.lock, reason) };
+        Self(Some((gate, token)))
+    }
+}
+
+impl Drop for AttachedScope {
+    fn drop(&mut self) {
+        if let Some((gate, token)) = self.0.take() {
+            // SAFETY: TOKEN came from this gate's `attach`, once.
+            unsafe { (gate.detach)(gate.lock, token) };
+            set_gate(Some(gate));
+        }
+    }
+}
+
+/// Run F holding the Baton when this OS thread runs detached (attaching
+/// for REASON and detaching after, also when F unwinds), else just run F.
+#[doc(hidden)]
+#[inline]
+pub fn with_attached<R>(reason: AttachReason, f: impl FnOnce() -> R) -> R {
+    let _scope = AttachedScope::enter(reason);
+    f()
+}
+
+#[cfg(test)]
+#[path = "detached/tests/detached_test.rs"]
+mod tests;

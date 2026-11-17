@@ -9,6 +9,8 @@ pub mod boolvec;
 pub mod builtin_frontend;
 pub mod chartab;
 pub mod cold_retained;
+#[cfg(feature = "shared-heap")]
+pub mod detached;
 pub mod display_vocab;
 pub mod emacs_char;
 pub mod error;
