@@ -3,7 +3,7 @@
 //! the World's Baton lock, builds its owner, runs its function and records
 //! the outcome as a Green carrier job does, then detaches for good.
 
-use super::super::super::world::BatonLock;
+use super::super::super::world::{Baton, BatonLock};
 use super::super::carrier_tls;
 use super::{
     AbortOnPanic, Context, Control, Flow, Lifecycle, ThreadKey, Value, Wake, signal,
@@ -56,6 +56,30 @@ fn run_body(owner: &mut Context, function: Value) -> Result<Value, Flow> {
         owner.apply(function, Vec::new())
     }))
     .unwrap_or_else(|_| Err(signal("error", vec![Value::string("Lisp thread panicked")])))
+}
+
+impl Context {
+    /// Seat BATON, which this Parallel thread has just attached for: the
+    /// World's carried and warm state arrive with it, as on a resume.
+    pub(crate) fn parallel_seat_baton(&mut self, baton: Baton) {
+        unstow_carried_state(&baton);
+        unstow_owner_state(self, &baton);
+        let seat = self.green_seat().expect("a Parallel thread is seated");
+        debug_assert!(seat.baton.is_none(), "the World has one Baton");
+        seat.baton = Some(baton);
+    }
+
+    /// Take the seated Baton, to put it back in the lock: the World's warm
+    /// and carried state leave with it, as on a park.
+    pub(crate) fn parallel_unseat_baton(&mut self) -> Baton {
+        let Some(baton) = self.green_seat().and_then(|seat| seat.baton.take()) else {
+            // Detaching without the Baton would lose it for every thread.
+            std::process::abort();
+        };
+        stow_owner_state(self, &baton);
+        stow_carried_state(&baton);
+        baton
+    }
 }
 
 /// KEY's whole life on its OS thread (Green's `run_carrier_job`, with the

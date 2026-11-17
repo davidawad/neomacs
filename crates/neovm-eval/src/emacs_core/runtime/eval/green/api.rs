@@ -96,6 +96,14 @@ impl Context {
         self.threads
             .set_thread_error_for_value(thread, symbol, data);
         let key = ThreadKey::from_id(id);
+        // A Parallel thread running detached never switches: its quit poll
+        // finds the signal instead.
+        #[cfg(feature = "shared-heap")]
+        self.with_green_runtime(|runtime| {
+            if let Some(quit) = runtime.parallel_quits.borrow().get(&key) {
+                quit.request();
+            }
+        });
         let control = self.green_control();
         if matches!(
             control.wait_of(key),

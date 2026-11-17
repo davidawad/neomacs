@@ -83,6 +83,12 @@ pub(crate) struct GreenRuntime {
     pub(super) deferred_errors: std::cell::RefCell<
         rustc_hash::FxHashMap<ThreadKey, (neovm_value::value::Value, neovm_value::value::Value)>,
     >,
+    /// A Parallel World's running threads' quit requests: `thread-signal`
+    /// raises its target's, which a detached target sees at its next quit
+    /// poll.
+    #[cfg(feature = "shared-heap")]
+    pub(super) parallel_quits:
+        std::cell::RefCell<rustc_hash::FxHashMap<ThreadKey, neovm_value::quit::QuitRequest>>,
 }
 
 impl std::fmt::Debug for GreenRuntime {
@@ -224,6 +230,8 @@ impl Context {
             outgoing_constant_error: std::cell::Cell::new(None),
             deferred_errors: Default::default(),
             carriers: carrier::CarrierPool::new(),
+            #[cfg(feature = "shared-heap")]
+            parallel_quits: Default::default(),
         }));
         Ok(baton)
     }
