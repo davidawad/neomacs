@@ -1596,3 +1596,7 @@ pub fn builtin_json_insert<H: EditHost>(host: &mut H, args: Vec<Value>) -> EvalR
 #[cfg(test)]
 #[path = "tests/json_test.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "shared-heap"))]
+#[path = "tests/json_parse_owners_test.rs"]
+mod owners_tests;
