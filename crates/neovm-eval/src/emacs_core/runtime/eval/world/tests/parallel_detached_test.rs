@@ -302,3 +302,67 @@ fn collections_wait_for_detached_threads_and_run_after_the_join() {
     println!("parallel stats after a deferred collection: {collected:?}");
     assert!(collected.collections >= 1, "{collected:?}");
 }
+
+/// Item 8's measurement in a test binary: the numeric loop on N threads
+/// versus the same loops one after another on main, with each thread's
+/// binding conses allocated next to each other's and, padded, apart.
+/// Prints; the only assertions are on values.
+#[test]
+#[ignore = "a measurement: run with --run-ignored only"]
+fn measure_the_numeric_loop_serial_versus_parallel() {
+    const ITERATIONS: i64 = 1_000_000;
+    // `NEOVM_MEASURE_THREADS` (the pod's `nproc`), else every CPU the
+    // process may use.
+    let threads = std::env::var("NEOVM_MEASURE_THREADS")
+        .ok()
+        .and_then(|threads| threads.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+    let mut ev = parallel();
+    let expected = numeric_loop(ITERATIONS);
+    let all = format!("({})", vec![expected.to_string(); threads].join(" "));
+    println!(
+        "| nproc | binding conses | serial (main, {threads} loops) | parallel ({threads} threads) | speedup |"
+    );
+    for (padding, label) in [(0, "adjacent"), (4096, "padded apart")] {
+        eval(
+            &mut ev,
+            &format!(
+                "(fset 'tpd-loop
+                       (lambda ()
+                         (let ((pad (make-list {padding} nil)))
+                           (let ((s 0) (i 0))
+                             (while (< i {ITERATIONS})
+                               (setq s (logand (+ s (* i i)) #xffffff))
+                               (setq i (1+ i)))
+                             s))))"
+            ),
+        );
+        let serial_form = format!(
+            "(let ((k 0) (r nil))
+               (while (< k {threads}) (setq r (cons (tpd-loop) r)) (setq k (1+ k)))
+               r)"
+        );
+        let parallel_form = format!(
+            "(let ((k 0) (ts nil) (r nil))
+               (while (< k {threads}) (setq ts (cons (make-thread 'tpd-loop) ts)) (setq k (1+ k)))
+               (while ts (setq r (cons (thread-join (car ts)) r)) (setq ts (cdr ts)))
+               r)"
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(eval(&mut ev, &serial_form), all);
+        let serial = started.elapsed();
+        let started = std::time::Instant::now();
+        assert_eq!(eval(&mut ev, &parallel_form), all);
+        let parallel = started.elapsed();
+        println!(
+            "| {threads} | {label} | {serial:.2?} | {parallel:.2?} | {:.2} |",
+            serial.as_secs_f64() / parallel.as_secs_f64()
+        );
+    }
+    let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!(
+        "loadavg: {}stats: {}",
+        loadavg,
+        eval(&mut ev, "(neomacs-shared-heap-stats)")
+    );
+}
