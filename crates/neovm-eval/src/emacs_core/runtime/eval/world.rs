@@ -41,6 +41,8 @@ mod green_owner;
 #[cfg(feature = "shared-heap")]
 mod parallel_classify;
 #[cfg(feature = "shared-heap")]
+pub(crate) mod parallel_gc;
+#[cfg(feature = "shared-heap")]
 mod parallel_owner;
 mod slot;
 // Crate-visible so the public test-support re-export in eval/mod.rs can name
