@@ -92,15 +92,25 @@ impl Context {
         let seat = self.green_seat().expect("a Parallel thread is seated");
         debug_assert!(seat.baton.is_none(), "the World has one Baton");
         seat.baton = Some(baton);
+        let key = seat.key;
+        // The thread manager's current thread is the Baton holder's, as
+        // after a resume: `mutex-lock` and `current-thread` read it.
+        self.threads.enter_thread(key.id());
     }
 
     /// Take the seated Baton, to put it back in the lock: the World's warm
     /// and carried state leave with it, as on a park.
     pub(crate) fn parallel_unseat_baton(&mut self) -> Baton {
-        let Some(baton) = self.green_seat().and_then(|seat| seat.baton.take()) else {
+        let Some((key, baton)) = self
+            .green_seat()
+            .and_then(|seat| Some((seat.key, seat.baton.take()?)))
+        else {
             // Detaching without the Baton would lose it for every thread.
             std::process::abort();
         };
+        // As at a park: the record keeps the buffer other threads may read.
+        let current = self.edit.buffers.current_buffer_id();
+        self.threads.set_thread_current_buffer(key.id(), current);
         stow_owner_state(self, &baton);
         stow_carried_state(&baton);
         baton
