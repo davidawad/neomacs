@@ -2605,6 +2605,9 @@ mod allocation;
     )
 )]
 mod owner_pages;
+#[cfg(all(test, feature = "shared-heap"))]
+#[path = "gc/tests/owner_pages_test.rs"]
+mod owner_pages_tests;
 
 mod collector_tables;
 #[cfg(not(feature = "test-support"))]

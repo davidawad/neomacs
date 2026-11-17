@@ -1,0 +1,361 @@
+//! Per-owner allocation (`owner_pages.rs`): owner threads allocate through
+//! the ordinary `Value` constructors at the same time, the keeper adopts and
+//! reads everything back, and a collection between close and reopen reclaims
+//! the owners' garbage.
+//!
+//! The detached section here is the test's: the keeper holds the heap, each
+//! owner thread installs it and its owner state under a stand-in for the
+//! Baton (a mutex), then releases it and allocates while the keeper waits.
+
+use super::owner_pages::{
+    OwnerAllocState, OwnerRunSizes, close_owner_regions, reopen_owner_regions,
+};
+use super::*;
+use crate::heap_types::LispString;
+use crate::value::{HashKey, HashTableTest, Value};
+use std::ptr::NonNull;
+use std::sync::{Barrier, Mutex};
+
+/// What one owner allocated, as raw bits (a `Value` is thread-confined).
+#[derive(Default)]
+struct Allocated {
+    list: usize,
+    strings: Vec<usize>,
+    vectors: Vec<usize>,
+    tables: Vec<usize>,
+    floats: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct Counts {
+    conses: usize,
+    strings: usize,
+    vectors: usize,
+    vector_len: usize,
+    tables: usize,
+    table_entries: usize,
+    floats: usize,
+}
+
+const FULL: Counts = Counts {
+    conses: 100_000,
+    strings: 10_000,
+    vectors: 1_000,
+    vector_len: 100,
+    tables: 100,
+    table_entries: 1_000,
+    floats: 50_000,
+};
+
+fn value(bits: usize) -> Value {
+    // SAFETY: bits of a live object this test allocated and keeps reachable.
+    unsafe { Value::from_bits(bits) }
+}
+
+fn key(i: usize) -> String {
+    format!("k{i}")
+}
+
+/// Allocate `counts` through the ordinary entry points; `tag` makes every
+/// owner's contents distinct.
+fn allocate(tag: usize, counts: Counts) -> Allocated {
+    let mut list = Value::NIL;
+    for i in 0..counts.conses {
+        list = Value::cons(Value::fixnum((tag * 1_000_000 + i) as i64), list);
+    }
+    let strings = (0..counts.strings)
+        .map(|i| Value::string(format!("s{tag}-{i}")).bits())
+        .collect();
+    let vectors = (0..counts.vectors)
+        .map(|i| {
+            let items = (0..counts.vector_len)
+                .map(|j| Value::fixnum((tag + i + j) as i64))
+                .collect();
+            Value::vector(items).bits()
+        })
+        .collect();
+    let tables = (0..counts.tables)
+        .map(|t| {
+            let table = Value::hash_table(HashTableTest::Equal);
+            for i in 0..counts.table_entries {
+                let k = key(i);
+                let key_value = Value::heap_string(LispString::new(k.clone(), false));
+                let hash_key = HashKey::from_str(&k);
+                let entry = Value::fixnum((tag * 7 + t + i) as i64);
+                table.with_hash_table_mut(|table| {
+                    table.insert(hash_key, key_value, entry);
+                });
+            }
+            table.bits()
+        })
+        .collect();
+    let floats = (0..counts.floats)
+        .map(|i| Value::make_float(tag as f64 * 1e6 + i as f64 + 0.5).bits())
+        .collect();
+    Allocated {
+        list: list.bits(),
+        strings,
+        vectors,
+        tables,
+        floats,
+    }
+}
+
+/// Check every object `allocate(tag, counts)` made.
+fn verify(tag: usize, counts: Counts, got: &Allocated) {
+    let mut cell = value(got.list);
+    for i in (0..counts.conses).rev() {
+        assert_eq!(
+            cell.cons_car().as_fixnum(),
+            Some((tag * 1_000_000 + i) as i64)
+        );
+        cell = cell.cons_cdr();
+    }
+    assert!(cell.is_nil());
+    for (i, &bits) in got.strings.iter().enumerate() {
+        assert_eq!(
+            value(bits).as_utf8_str(),
+            Some(format!("s{tag}-{i}").as_str())
+        );
+    }
+    for (i, &bits) in got.vectors.iter().enumerate() {
+        let data = value(bits).as_vector_data().expect("a vector");
+        assert_eq!(data.len(), counts.vector_len);
+        for (j, item) in data.iter().enumerate() {
+            assert_eq!(item.as_fixnum(), Some((tag + i + j) as i64));
+        }
+    }
+    for (t, &bits) in got.tables.iter().enumerate() {
+        let table = value(bits).as_hash_table().expect("a hash table");
+        assert_eq!(table.data.len(), counts.table_entries);
+        for i in 0..counts.table_entries {
+            let entry = table.data.get(&HashKey::from_str(&key(i))).copied();
+            assert_eq!(
+                entry.and_then(Value::as_fixnum),
+                Some((tag * 7 + t + i) as i64)
+            );
+        }
+    }
+    for (i, &bits) in got.floats.iter().enumerate() {
+        assert_eq!(
+            value(bits).as_float(),
+            Some(tag as f64 * 1e6 + i as f64 + 0.5)
+        );
+    }
+}
+
+fn roots(got: &Allocated) -> impl Iterator<Item = TaggedValue> + '_ {
+    std::iter::once(got.list)
+        .chain(got.strings.iter().copied())
+        .chain(got.vectors.iter().copied())
+        .chain(got.tables.iter().copied())
+        .chain(got.floats.iter().copied())
+        .map(value)
+}
+
+/// The heap root as an address an owner thread can carry.
+struct HeapRoot(usize);
+
+impl HeapRoot {
+    fn of(heap: &TestHeap) -> Self {
+        Self(heap.root().as_ptr() as usize)
+    }
+
+    /// Install the heap on this thread under `baton` (the stand-in for an
+    /// attach: installation writes the heap's store protocol).
+    fn install(&self, baton: &Mutex<()>) {
+        let _attached = baton.lock().unwrap();
+        set_tagged_heap_root(NonNull::new(self.0 as *mut TaggedHeap).unwrap());
+    }
+}
+
+/// Run `body` on one OS thread per owner state, all allocating at once,
+/// each with its state installed; close every state at the end.
+fn detached_section<R: Send>(
+    heap: &TestHeap,
+    states: &mut [Box<OwnerAllocState>],
+    body: impl Fn(usize) -> R + Sync,
+) -> Vec<R> {
+    let root = HeapRoot::of(heap);
+    let baton = Mutex::new(());
+    let start = Barrier::new(states.len());
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = states
+            .iter_mut()
+            .enumerate()
+            .map(|(tag, state)| {
+                let (root, baton, start, body) = (&root, &baton, &start, &body);
+                scope.spawn(move || {
+                    root.install(baton);
+                    let result = {
+                        let _installed = state.install();
+                        start.wait();
+                        body(tag)
+                    };
+                    // Park: close every run before the keeper may collect.
+                    close_owner_regions(state);
+                    result
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    // The keeper attaches again: reinstall its heap and adopt.
+    heap.install();
+    results
+}
+
+#[test]
+fn two_owner_threads_allocate_every_class_at_once() {
+    crate::test_utils::init_test_tracing();
+    let mut heap = TestHeap::new();
+    heap.install();
+    let mut states = vec![heap.new_owner_alloc_state(), heap.new_owner_alloc_state()];
+    let got = detached_section(&heap, &mut states, |tag| allocate(tag + 1, FULL));
+    heap.close_alloc_regions();
+    for (tag, got) in got.iter().enumerate() {
+        verify(tag + 1, FULL, got);
+    }
+    let stats = heap.owner_alloc_stats();
+    assert!(stats.refills > 0);
+    assert!(stats.adoptions > 0);
+    // Adoption registered every owner block, page and object.
+    for got in &got {
+        let cell = value(got.list).as_cons_ptr().unwrap();
+        let base = ConsBlock::block_base_for_ptr(cell);
+        assert!(heap.cons_block_index_by_base.contains_key(&base));
+        let string = value(got.strings[0]).as_string_ptr().unwrap();
+        assert!(heap.string_arena.owns(string.cast()));
+        let float = value(got.floats[0]).as_float_ptr().unwrap();
+        assert!(heap.float_arena.owns(float.cast()));
+        let vector = value(got.vectors[0]).as_veclike_ptr().unwrap();
+        assert!(heap.vector_arena.owns(vector.cast()));
+        assert!(heap.vector_object_addrs.contains(&(vector as usize)));
+        let table = value(got.tables[0]).as_veclike_ptr().unwrap();
+        assert!(heap.non_cons_object_addrs.contains(&(table as usize)));
+    }
+    // Every owner object is the heap's now: a collection keeps them all.
+    heap.collect_exact(got.iter().flat_map(roots));
+    for (tag, got) in got.iter().enumerate() {
+        verify(tag + 1, FULL, got);
+    }
+    let floats = got.iter().map(|got| got.floats.len()).sum::<usize>();
+    assert!(heap.float_arena.pages.len() * FLOAT_PAGE_SLOTS >= floats);
+}
+
+#[test]
+fn refills_under_contention_keep_every_object() {
+    crate::test_utils::init_test_tracing();
+    let mut heap = TestHeap::new();
+    heap.install();
+    let small = OwnerRunSizes {
+        cons_cells: 4,
+        slots: 2,
+    };
+    let mut states: Vec<_> = (0..8)
+        .map(|_| heap.new_owner_alloc_state_with(small))
+        .collect();
+    let counts = Counts {
+        conses: 2_000,
+        strings: 500,
+        vectors: 200,
+        vector_len: 3,
+        tables: 4,
+        table_entries: 50,
+        floats: 500,
+    };
+    let got = detached_section(&heap, &mut states, |tag| allocate(tag, counts));
+    heap.close_alloc_regions();
+    for (tag, got) in got.iter().enumerate() {
+        verify(tag, counts, got);
+    }
+    let stats = heap.owner_alloc_stats();
+    // 8 owners x (500 conses + 250 + 250 + 100 slot runs) at least.
+    assert!(stats.refills >= 8 * 1_100, "refills: {stats:?}");
+    heap.collect_exact(got.iter().flat_map(roots));
+    for (tag, got) in got.iter().enumerate() {
+        verify(tag, counts, got);
+    }
+}
+
+#[test]
+fn close_and_reopen_around_a_collection() {
+    crate::test_utils::init_test_tracing();
+    let mut heap = TestHeap::new();
+    heap.install();
+    let counts = Counts {
+        conses: 20_000,
+        strings: 2_000,
+        vectors: 200,
+        vector_len: 10,
+        tables: 10,
+        table_entries: 100,
+        floats: 5_000,
+    };
+    let mut states = vec![heap.new_owner_alloc_state(), heap.new_owner_alloc_state()];
+    // Each owner keeps one set and drops another, then parks closed.
+    let first = detached_section(&heap, &mut states, |tag| {
+        (allocate(tag, counts), allocate(tag + 10, counts))
+    });
+    // Every owner is parked with its runs closed: collect as the keeper.
+    heap.collect_exact(
+        first
+            .iter()
+            .flat_map(|(kept, dropped)| roots(kept).chain(roots(dropped))),
+    );
+    let with_garbage = heap.live_bytes();
+    heap.collect_exact(first.iter().flat_map(|(kept, _)| roots(kept)));
+    let without = heap.live_bytes();
+    assert!(
+        without < with_garbage,
+        "live bytes {without} after dropping the owners' garbage, {with_garbage} before"
+    );
+    for (tag, (kept, _)) in first.iter().enumerate() {
+        verify(tag, counts, kept);
+    }
+    // Resume: runs reopen lazily with the new parity; allocate more.
+    for state in &mut states {
+        reopen_owner_regions(state);
+    }
+    let second = detached_section(&heap, &mut states, |tag| allocate(tag + 20, counts));
+    heap.collect_exact(
+        first
+            .iter()
+            .flat_map(|(kept, _)| roots(kept))
+            .chain(second.iter().flat_map(roots)),
+    );
+    for (tag, (kept, _)) in first.iter().enumerate() {
+        verify(tag, counts, kept);
+    }
+    for (tag, got) in second.iter().enumerate() {
+        verify(tag + 20, counts, got);
+    }
+}
+
+#[test]
+fn keeper_without_owners_takes_the_old_path() {
+    crate::test_utils::init_test_tracing();
+    let mut heap = TestHeap::new();
+    heap.install();
+    let got = allocate(
+        3,
+        Counts {
+            conses: 1_000,
+            strings: 100,
+            vectors: 10,
+            vector_len: 5,
+            tables: 2,
+            table_entries: 10,
+            floats: 300,
+        },
+    );
+    assert!(heap.owner_pages.is_none());
+    assert_eq!(heap.owner_alloc_stats(), Default::default());
+    assert!(heap.region_stats.cons_refills > 0);
+    assert!(heap.region_stats.float_refills > 0);
+    heap.collect_exact(roots(&got));
+    assert!(heap.owner_pages.is_none());
+}
