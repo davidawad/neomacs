@@ -30,7 +30,8 @@ use crate::error::{Flow, LispCondition, signal};
 use crate::heap_types::LispString;
 use crate::intern::{SymId, intern};
 use crate::tagged::gc::{
-    HeapWriteKind, MEMORY_USE_COUNT_LEN, MemoryUseCountSlot, note_heap_write, with_tagged_heap,
+    HeapWriteKind, MEMORY_USE_COUNT_LEN, MemoryUseCountSlot, note_heap_write, with_allocating_heap,
+    with_tagged_heap,
 };
 use crate::tagged::header::{
     BoolVectorObj, BufferObj, ByteCodeObj, CHAR_TABLE_TOP_SLOTS, CharTableObj, ConsCell, FontObj,
@@ -2733,24 +2734,24 @@ impl TaggedValue {
     pub fn make_string(s: impl Into<String>) -> Self {
         let s = s.into();
         let multibyte = !s.is_ascii();
-        with_tagged_heap(|h| h.alloc_string(LispString::new(s, multibyte)))
+        with_allocating_heap(|h| h.alloc_string(LispString::new(s, multibyte)))
     }
 
     /// Allocate a string from a pre-built LispString.
     pub fn heap_string(s: LispString) -> Self {
-        with_tagged_heap(|h| h.alloc_string(s))
+        with_allocating_heap(|h| h.alloc_string(s))
     }
 
     /// Allocate a multibyte string.
     pub fn multibyte_string(s: impl Into<String>) -> Self {
         let s = s.into();
-        with_tagged_heap(|h| h.alloc_string(LispString::new(s, true)))
+        with_allocating_heap(|h| h.alloc_string(LispString::new(s, true)))
     }
 
     /// Allocate a unibyte string.
     pub fn unibyte_string(s: impl Into<String>) -> Self {
         let s = s.into();
-        with_tagged_heap(|h| h.alloc_string(LispString::new(s, false)))
+        with_allocating_heap(|h| h.alloc_string(LispString::new(s, false)))
     }
 
     /// Allocate a string with text properties.
@@ -2775,7 +2776,7 @@ impl TaggedValue {
 
     /// Allocate a float on the heap.
     pub fn make_float(f: f64) -> Self {
-        with_tagged_heap(|h| h.alloc_float(f))
+        with_allocating_heap(|h| h.alloc_float(f))
     }
 
     /// Allocate a bignum on the heap. Caller is responsible for ensuring
@@ -2785,7 +2786,7 @@ impl TaggedValue {
     /// fixnum when the value fits and only allocating a bignum on
     /// promotion.
     pub fn bignum(value: Integer) -> Self {
-        with_tagged_heap(|h| h.alloc_bignum(value))
+        with_allocating_heap(|h| h.alloc_bignum(value))
     }
 
     /// [`Self::bignum`] with the arena allocation inlined into the caller:
@@ -2795,7 +2796,7 @@ impl TaggedValue {
     #[inline(always)]
     #[doc(hidden)]
     pub fn bignum_inline(value: Integer) -> Self {
-        with_tagged_heap(|h| h.alloc_bignum_inline(value))
+        with_allocating_heap(|h| h.alloc_bignum_inline(value))
     }
 
     /// Canonical "make a Lisp integer from this machine integer" fast
@@ -2900,7 +2901,7 @@ impl TaggedValue {
                 );
             }
         }
-        with_tagged_heap(|h| h.alloc_cons(car, cdr))
+        with_allocating_heap(|h| h.alloc_cons(car, cdr))
     }
 
     /// Build a proper list from a Vec.
@@ -2921,7 +2922,7 @@ impl TaggedValue {
         if values.is_empty() {
             return Value::NIL;
         }
-        with_tagged_heap(|heap| heap.list_from_slice(values))
+        with_allocating_heap(|heap| heap.list_from_slice(values))
     }
 
     /// Allocate a vector (old API name).
@@ -2931,7 +2932,7 @@ impl TaggedValue {
 
     /// Allocate a vector.
     pub fn make_vector(values: Vec<Value>) -> Self {
-        with_tagged_heap(|h| h.alloc_vector(values))
+        with_allocating_heap(|h| h.alloc_vector(values))
     }
 
     /// Allocate a GNU-shaped char-table.
@@ -3004,7 +3005,7 @@ impl TaggedValue {
 
     /// Allocate a hash table.
     pub fn hash_table(test: HashTableTest) -> Self {
-        with_tagged_heap(|h| h.alloc_hash_table(LispHashTable::new(test)))
+        with_allocating_heap(|h| h.alloc_hash_table(LispHashTable::new(test)))
     }
 
     /// Allocate a hash table with options.
@@ -3015,7 +3016,7 @@ impl TaggedValue {
         rehash_size: f64,
         rehash_threshold: f64,
     ) -> Self {
-        with_tagged_heap(|h| {
+        with_allocating_heap(|h| {
             h.alloc_hash_table(LispHashTable::new_with_options(
                 test,
                 size,
@@ -3038,7 +3039,7 @@ impl TaggedValue {
         let data = HashTableStorage::try_with_capacity(size)?;
         let table =
             LispHashTable::with_storage(test, size.capacity() as i64, weakness, 1.5, 0.8125, data);
-        Ok(with_tagged_heap(|h| h.alloc_hash_table(table)))
+        Ok(with_allocating_heap(|h| h.alloc_hash_table(table)))
     }
 
     /// Allocate a GNU-shaped obarray object.

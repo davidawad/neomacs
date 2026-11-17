@@ -1960,6 +1960,37 @@ unsafe fn installed_heap_generational_enabled(heap: *const TaggedHeap) -> bool {
     unsafe { *flag }
 }
 
+/// [`with_tagged_heap`] for F that only allocates, through the entry points
+/// that route to an installed owner state (`alloc_cons`, `list_from_slice`,
+/// `alloc_string`, `alloc_float`, `alloc_vector`, `alloc_hash_table`,
+/// `alloc_bignum`). On a Parallel World's detached thread F runs on the
+/// thread's own allocation runs without the Baton (`crate::detached`).
+#[inline]
+pub(crate) fn with_allocating_heap<R>(f: impl FnOnce(&mut TaggedHeap) -> R) -> R {
+    #[cfg(feature = "shared-heap")]
+    if crate::detached::is_detached() {
+        return with_detached_allocation(f);
+    }
+    with_tagged_heap(f)
+}
+
+/// [`with_allocating_heap`] on a detached thread.
+#[cfg(feature = "shared-heap")]
+fn with_detached_allocation<R>(f: impl FnOnce(&mut TaggedHeap) -> R) -> R {
+    let root = TAGGED_HEAP.with(Cell::get);
+    assert!(!root.is_null(), "a detached thread has its World's heap");
+    crate::detached::with_owner_allocation(
+        // SAFETY: called attached, so this thread may borrow the heap.
+        || owner_pages::new_detached_owner(unsafe { &mut *root }),
+        // SAFETY: F reaches the heap only through the owner-routed entry
+        // points, which read nothing of it but the mark parity and the
+        // threshold, both stable while any thread runs detached (no
+        // collection runs then); the objects come from runs only this
+        // thread writes. The S5 owner sections allocate the same way.
+        || f(unsafe { &mut *root }),
+    )
+}
+
 /// Access the thread-local tagged heap.
 ///
 /// In a cfg(test) build, or after the dedicated test-thread-fallback-heap

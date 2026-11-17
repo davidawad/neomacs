@@ -734,6 +734,18 @@ impl OwnerAllocState {
     }
 }
 
+/// This OS thread's installed owner state becomes STATE (null: none), for
+/// a detached thread's placement (`crate::detached`), which owns it.
+pub(crate) fn set_installed_owner(state: *mut OwnerAllocState) {
+    OWNER_ALLOC.with(|slot| slot.set(state));
+}
+
+/// A detached thread's allocation state, made attached from HEAP and owned
+/// by the thread's placement until its body ends (`crate::detached`).
+pub(crate) fn new_detached_owner(heap: &mut TaggedHeap) -> std::ptr::NonNull<OwnerAllocState> {
+    std::ptr::NonNull::from(Box::leak(heap.new_owner_alloc_state()))
+}
+
 /// Close every open run of `state` (cursor = limit, handed-out slots charged
 /// and marked allocated, unused cells returned at adoption) and hand its
 /// boxed objects over. An owner calls this when it parks for a collection.

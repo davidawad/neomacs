@@ -2601,10 +2601,12 @@ mod allocation;
     not(test),
     allow(
         dead_code,
-        reason = "slices S3/S4 install and park owners; this slice's tests do"
+        reason = "the install guard, the run sizes and the stats serve the tests"
     )
 )]
 mod owner_pages;
+#[cfg(feature = "shared-heap")]
+pub(crate) use owner_pages::{OwnerAllocState, close_owner_regions, set_installed_owner};
 #[cfg(all(test, feature = "shared-heap"))]
 #[path = "gc/tests/owner_pages_test.rs"]
 mod owner_pages_tests;
