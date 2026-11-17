@@ -140,6 +140,29 @@ fn two_threads_counting_under_a_mutex_reach_twenty_thousand() {
         ),
         "20000"
     );
+    // A measurement, printed for the delivery notes; never asserted.
+    eprintln!(
+        "parallel stats after 2 x 10000 mutex rounds: {}",
+        eval(&mut ev, "(neomacs-shared-heap-stats)")
+    );
+}
+
+#[test]
+fn thread_identity_primitives_answer_as_in_green() {
+    let form = "(let ((th (make-thread
+                           (lambda ()
+                             (list (eq (current-thread) main-thread)
+                                   (thread-name (current-thread))
+                                   (length (all-threads))))
+                           \"worker\")))
+                  (list (thread-live-p th)
+                        (thread-join th)
+                        (thread-live-p th)
+                        (length (all-threads))
+                        (eq (current-thread) main-thread)))";
+    let green = eval(&mut world(ThreadingMode::Green), form);
+    assert_eq!(green, "(t (nil \"worker\" 2) nil 1 t)");
+    assert_eq!(eval(&mut parallel(), form), green);
 }
 
 #[test]
