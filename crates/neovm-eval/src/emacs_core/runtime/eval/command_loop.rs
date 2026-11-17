@@ -1315,6 +1315,11 @@ impl Context {
     pub fn gc_collect_from_current_roots_impl(&mut self, force_complete: bool) {
         #[cfg(debug_assertions)]
         neovm_value::tagged::mutate::debug_assert_no_heap_mut_closure();
+        // A Parallel World collects only while no thread runs detached.
+        #[cfg(feature = "shared-heap")]
+        if self.parallel_defers_collection() {
+            return;
+        }
         // Collection also compacts undo state, materializes thread buffer
         // objects and publishes GC statistics. Those operations can allocate
         // or consult semantic TLS, so activate the collecting Context before
@@ -2280,6 +2285,12 @@ impl Context {
     pub fn gc_safe_point_exact_should_collect(&mut self) -> bool {
         #[cfg(debug_assertions)]
         neovm_value::tagged::mutate::debug_assert_no_heap_mut_closure();
+        // A Parallel World's detached thread reads no heap state here, and
+        // no collection runs while one exists.
+        #[cfg(feature = "shared-heap")]
+        if self.parallel_defers_safe_point() {
+            return false;
+        }
         // The common answer, decided from plain fields without a call: no
         // collection is in flight, none is pending or forced, and the
         // allocation pacing has not tripped. Everything else takes the
@@ -2463,6 +2474,9 @@ impl Context {
             self.poll_pending_input_for_throw_on_input()?;
         }
 
+        // A Parallel thread's quit request may carry a `thread-signal`.
+        #[cfg(feature = "shared-heap")]
+        self.parallel_raise_thread_signal()?;
         // Drain the cross-thread quit-request atomic into `Vquit_flag`.
         // Set by the input-bridge thread when it observes a `quit-char`
         // keystroke while the evaluator is busy (e.g. deep in bytecode

@@ -1,9 +1,10 @@
 //! A Parallel World's Lisp thread (feature `shared-heap`): one dedicated OS
 //! thread for the Lisp thread's whole life, never pooled. It attaches to
-//! the World's Baton lock, builds its owner, runs its function and records
-//! the outcome as a Green carrier job does, then detaches for good.
+//! the World's Baton lock, builds its owner, runs its function detached
+//! (attaching only for `World`-class work, `world::parallel_classify`) and
+//! records the outcome as a Green carrier job does, then detaches for good.
 
-use super::super::super::world::{Baton, BatonLock};
+use super::super::super::world::{Baton, BatonLock, detached_gate, prepare_detached_table};
 use super::super::carrier_tls;
 use super::{
     AbortOnPanic, Context, Control, Flow, Lifecycle, ThreadKey, Value, Wake, signal,
@@ -56,6 +57,30 @@ fn run_body(owner: &mut Context, function: Value) -> Result<Value, Flow> {
         owner.apply(function, Vec::new())
     }))
     .unwrap_or_else(|_| Err(signal("error", vec![Value::string("Lisp thread panicked")])))
+}
+
+/// Run FUNCTION on OWNER detached: the prologue ran attached; the Baton
+/// goes back to LOCK for the body and is seated again for the epilogue.
+fn run_detached_body(
+    owner: &mut Context,
+    function: Value,
+    lock: &BatonLock,
+) -> Result<Value, Flow> {
+    prepare_detached_table();
+    // Counted before the Baton goes back, so no collection starts in between.
+    lock.body_detached();
+    lock.detach(owner.parallel_unseat_baton());
+    neovm_value::detached::begin_detached(detached_gate(lock));
+    let outcome = run_body(owner, function);
+    // A body that unwound while attached for a primitive still holds the
+    // Baton; every other one attaches for the epilogue.
+    let detached = neovm_value::detached::is_detached();
+    neovm_value::detached::end_detached();
+    if detached {
+        owner.parallel_seat_baton(lock.attach().into_baton());
+    }
+    lock.body_attached();
+    outcome
 }
 
 impl Context {
@@ -141,6 +166,12 @@ fn run(key: ThreadKey, control: &Arc<Control>, receiver: mpsc::Receiver<Wake>, l
         }
         runtime.pending_starts.borrow_mut().remove(&key)
     });
+    if let Some(runtime) = baton.green_runtime().as_ref() {
+        runtime
+            .parallel_quits
+            .borrow_mut()
+            .insert(key, owner.quit_requested.clone());
+    }
     owner.take_green_seat(key, Arc::clone(control), receiver, baton);
     let outcome = match (outgoing_error, function) {
         (Some(symbol), _) => Err(signal(
@@ -150,7 +181,7 @@ fn run(key: ThreadKey, control: &Arc<Control>, receiver: mpsc::Receiver<Wake>, l
         (None, Some(function)) => {
             owner.push_vm_root_frame();
             owner.push_vm_frame_root(function);
-            let outcome = run_body(&mut owner, function);
+            let outcome = run_detached_body(&mut owner, function, lock);
             owner.pop_vm_root_frame();
             outcome
         }
@@ -177,6 +208,7 @@ fn run(key: ThreadKey, control: &Arc<Control>, receiver: mpsc::Receiver<Wake>, l
         .expect("a finishing thread holds the Baton");
     owner.restore_deferred_error(&baton, key);
     if let Some(runtime) = baton.green_runtime().as_ref() {
+        runtime.parallel_quits.borrow_mut().remove(&key);
         // GNU clears prev_thread when a thread exits: no outgoing unbind.
         runtime.outgoing_constant_error.set(None);
     }
