@@ -368,11 +368,21 @@ impl CellWord {
     }
 
     /// The whole word, as one plain owner load.
+    #[cfg(not(feature = "shared-heap"))]
     #[inline(always)]
     fn load(&self) -> usize {
         // SAFETY: owner reads are sequenced with the owner's stores, and the
         // GC only reads.
         unsafe { *self.0.get() }
+    }
+
+    /// The whole word, as one Acquire atomic load: with `shared-heap`, a
+    /// Parallel World's detached thread reads canonical values while the
+    /// Baton's holder stores them, at the Release publish seam.
+    #[cfg(feature = "shared-heap")]
+    #[inline(always)]
+    fn load(&self) -> usize {
+        self.load_acquire()
     }
 
     /// The whole word, as one Acquire atomic load for the scan.

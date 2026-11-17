@@ -560,6 +560,27 @@ fn swap_in_blv(
     blv.alist_epoch = epoch;
 }
 
+/// [`swap_in_blv`]'s answer without its cache update, for a Parallel
+/// World's detached thread (feature `shared-heap`): the cache lives in the
+/// shared obarray, which only the Baton's holder writes. The alist walk
+/// runs on every such read; each one is counted.
+#[cfg(feature = "shared-heap")]
+fn blv_value_without_swap(
+    obarray: &Obarray,
+    sym_id: SymId,
+    local_var_alist: Value,
+) -> Option<Value> {
+    crate::detached::note(crate::detached::AttachReason::Blv);
+    let blv = obarray.blv(sym_id)?;
+    let found_cell = assq(Value::from_sym_id(sym_id), local_var_alist);
+    let cell = if found_cell.is_nil() {
+        blv.defcell.get()
+    } else {
+        found_cell
+    };
+    Some(cell.cons_cdr())
+}
+
 /// Walk an alist looking for the cons whose car is `eq` to `key`.
 /// Returns the matching cons or `Value::NIL`. Mirrors GNU `Fassq`.
 ///
@@ -3643,6 +3664,10 @@ impl Obarray {
                     // local_var_alist for `(sym . val)` and update
                     // valcell. Mirrors GNU
                     // `swap_in_symval_forwarding`.
+                    #[cfg(feature = "shared-heap")]
+                    if crate::detached::is_detached() {
+                        return blv_value_without_swap(self, current, local_var_alist);
+                    }
                     swap_in_blv(self, current, current_buffer_value, local_var_alist);
                     let blv = self.blv(current)?;
                     return Some(blv.valcell.get().cons_cdr());
