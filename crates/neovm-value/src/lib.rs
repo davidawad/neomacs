@@ -10,6 +10,7 @@ pub mod builtin_frontend;
 pub mod chartab;
 pub mod cold_retained;
 #[cfg(feature = "shared-heap")]
+#[doc(hidden)]
 pub mod detached;
 pub mod display_vocab;
 pub mod emacs_char;

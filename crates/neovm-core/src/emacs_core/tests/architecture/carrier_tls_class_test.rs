@@ -977,6 +977,13 @@ const TLS_CLASSIFICATION: &[(&str, &str, TlsClass)] = &[
         "QUIT_REDIRECT",
         TlsClass::SourceOnly,
     ),
+    // A Parallel World's detached-thread gate (feature `shared-heap`): raw
+    // pointers to the World's lock and its entries, no Lisp Value.
+    (
+        "neovm-value/src/detached.rs",
+        "PLACEMENT",
+        TlsClass::SourceOnly,
+    ),
     (
         "neovm-value/src/quit.rs",
         "QUIT_REQUESTED_TLS",

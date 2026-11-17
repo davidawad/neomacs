@@ -22,12 +22,7 @@ unsafe fn test_note(_lock: *const (), _reason: AttachReason) {
 }
 
 fn gate() -> DetachedGate {
-    DetachedGate {
-        lock: std::ptr::null(),
-        attach: test_attach,
-        detach: test_detach,
-        note: test_note,
-    }
+    DetachedGate::new(std::ptr::null(), test_attach, test_detach, test_note)
 }
 
 #[test]

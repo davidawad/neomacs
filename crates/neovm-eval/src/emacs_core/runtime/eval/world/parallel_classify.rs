@@ -405,12 +405,12 @@ unsafe fn gate_note(lock: *const (), reason: AttachReason) {
 /// The gate a detached thread of LOCK's World runs behind. LOCK must
 /// outlive the thread's detached body (the World holds it).
 pub(crate) fn detached_gate(lock: &BatonLock) -> DetachedGate {
-    DetachedGate {
-        lock: std::ptr::from_ref(lock).cast(),
-        attach: gate_attach,
-        detach: gate_detach,
-        note: gate_note,
-    }
+    DetachedGate::new(
+        std::ptr::from_ref(lock).cast(),
+        gate_attach,
+        gate_detach,
+        gate_note,
+    )
 }
 
 impl Context {

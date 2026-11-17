@@ -38,13 +38,32 @@ pub enum AttachReason {
 #[doc(hidden)]
 pub struct DetachedGate {
     /// The World's lock, erased.
-    pub lock: *const (),
+    lock: *const (),
     /// Attach for REASON, blocking; returns the token `detach` takes back.
-    pub attach: unsafe fn(lock: *const (), reason: AttachReason) -> *mut (),
+    attach: unsafe fn(lock: *const (), reason: AttachReason) -> *mut (),
     /// Detach again with the token `attach` returned.
-    pub detach: unsafe fn(lock: *const (), token: *mut ()),
+    detach: unsafe fn(lock: *const (), token: *mut ()),
     /// Count REASON without attaching.
-    pub note: unsafe fn(lock: *const (), reason: AttachReason),
+    note: unsafe fn(lock: *const (), reason: AttachReason),
+}
+
+impl DetachedGate {
+    /// The gate of LOCK, an erased lock the three entries take back. LOCK
+    /// must outlive every thread that runs detached behind the gate.
+    #[doc(hidden)]
+    pub fn new(
+        lock: *const (),
+        attach: unsafe fn(lock: *const (), reason: AttachReason) -> *mut (),
+        detach: unsafe fn(lock: *const (), token: *mut ()),
+        note: unsafe fn(lock: *const (), reason: AttachReason),
+    ) -> Self {
+        Self {
+            lock,
+            attach,
+            detach,
+            note,
+        }
+    }
 }
 
 /// This OS thread's place in a Parallel World.
@@ -184,6 +203,7 @@ pub struct AttachedScope(Option<(DetachedGate, *mut ())>);
 
 impl AttachedScope {
     /// Attach for REASON if this OS thread runs detached.
+    #[doc(hidden)]
     #[inline]
     pub fn enter(reason: AttachReason) -> Self {
         let Some(gate) = placement().gate else {
