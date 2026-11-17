@@ -506,8 +506,19 @@ impl LeafWitness {
                     buf.modified_tick(),
                 )
             }),
-            allocated: ctx.tagged_heap.allocated_count(),
+            allocated: Self::allocated(ctx),
         }
+    }
+
+    /// The heap's allocation count; 0 on a Parallel World's detached
+    /// thread, which shares the heap with attached peers whose allocations
+    /// change the count while the leaf runs (and reads it only attached).
+    fn allocated(ctx: &Context) -> usize {
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::detached::is_detached() {
+            return 0;
+        }
+        ctx.tagged_heap.allocated_count()
     }
 }
 
