@@ -25,6 +25,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 mod completion_exit;
+#[cfg(feature = "shared-heap")]
+mod parallel_turn;
 
 /// A Lisp thread's identity in the scheduler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
