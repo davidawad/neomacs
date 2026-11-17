@@ -6812,6 +6812,11 @@ impl<'a> Vm<'a> {
                         // directly instead of Value::cons's thread-local
                         // heap lookup (a TLS access per cons on the hottest
                         // allocation opcode).
+                        // A Parallel World's detached thread attaches for it.
+                        #[cfg(feature = "shared-heap")]
+                        let _attached = neovm_value::detached::AttachedScope::enter(
+                            neovm_value::detached::AttachReason::Alloc,
+                        );
                         stk!()[len - 2] = self.ctx.tagged_heap.alloc_cons(car_val, cdr_val);
                         stk!().pop();
                     }
@@ -8806,6 +8811,10 @@ impl<'a> Vm<'a> {
                 // SAFETY (owner chain): (c) fails: this WorldView<TaggedHeap> field loan is last used
                 // by alloc_cons in the rest-building loop. Only copied rest bits reach slots
                 // afterward; neither the raw native call nor fallback below reuses this field owner.
+                #[cfg(feature = "shared-heap")]
+                let _attached = neovm_value::detached::AttachedScope::enter(
+                    neovm_value::detached::AttachReason::Alloc,
+                );
                 let heap = unsafe { &mut (*ctx_ptr).tagged_heap };
                 let mut rest = Value::NIL;
                 for i in (nonrest..nargs).rev() {
@@ -9561,6 +9570,17 @@ impl<'a> Vm<'a> {
         args_start: usize,
         nargs: usize,
     ) -> EvalResult {
+        // A Parallel World's detached thread attaches for a World-class
+        // primitive (`world::parallel_classify`).
+        #[cfg(feature = "shared-heap")]
+        if let Some(reason) = crate::emacs_core::eval::world::subr_attach_reason(
+            func,
+            &ctx.bc_buf[args_start..args_start + nargs],
+        ) {
+            return ctx.with_parallel_attach(reason, |ctx| {
+                Self::dispatch_builtin_subr_from_stack_args_unchecked(ctx, func, args_start, nargs)
+            });
+        }
         let args = &ctx.bc_buf;
         macro_rules! stack_arg {
             ($idx:expr) => {{
@@ -10309,6 +10329,11 @@ impl<'a> Vm<'a> {
     #[inline(never)]
     #[doc(hidden)]
     pub fn op_point(&mut self) -> EvalResult {
+        // A buffer read: a Parallel World's detached thread attaches.
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::detached::is_detached() {
+            return self.with_parallel_attach_vm(Self::op_point);
+        }
         #[cfg(test)]
         INLINE_BUILTIN_DIRECT_COUNT.with(|count| count.set(count.get() + 1));
         match self.ctx.edit.buffers.current_buffer() {
@@ -10320,6 +10345,11 @@ impl<'a> Vm<'a> {
     #[inline(never)]
     #[doc(hidden)]
     pub fn op_point_min(&mut self) -> EvalResult {
+        // A buffer read: a Parallel World's detached thread attaches.
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::detached::is_detached() {
+            return self.with_parallel_attach_vm(Self::op_point_min);
+        }
         #[cfg(test)]
         INLINE_BUILTIN_DIRECT_COUNT.with(|count| count.set(count.get() + 1));
         match self.ctx.edit.buffers.current_buffer() {
@@ -10331,6 +10361,11 @@ impl<'a> Vm<'a> {
     #[inline(never)]
     #[doc(hidden)]
     pub fn op_point_max(&mut self) -> EvalResult {
+        // A buffer read: a Parallel World's detached thread attaches.
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::detached::is_detached() {
+            return self.with_parallel_attach_vm(Self::op_point_max);
+        }
         #[cfg(test)]
         INLINE_BUILTIN_DIRECT_COUNT.with(|count| count.set(count.get() + 1));
         match self.ctx.edit.buffers.current_buffer() {
@@ -10342,6 +10377,11 @@ impl<'a> Vm<'a> {
     #[inline(never)]
     #[doc(hidden)]
     pub fn op_current_buffer(&mut self) -> EvalResult {
+        // A buffer read: a Parallel World's detached thread attaches.
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::detached::is_detached() {
+            return self.with_parallel_attach_vm(Self::op_current_buffer);
+        }
         #[cfg(test)]
         INLINE_BUILTIN_DIRECT_COUNT.with(|count| count.set(count.get() + 1));
         Ok(match self.ctx.edit.buffers.current_buffer() {
@@ -10361,6 +10401,15 @@ impl<'a> Vm<'a> {
         args_start: usize,
         nargs: usize,
     ) -> EvalResult {
+        #[cfg(feature = "shared-heap")]
+        if let Some(reason) = crate::emacs_core::eval::world::symbol_attach_reason(
+            sym,
+            &ctx.bc_buf[args_start..args_start + nargs],
+        ) {
+            return ctx.with_parallel_attach(reason, |ctx| {
+                Self::call_fixed_builtin_direct(ctx, function, sym, args_start, nargs)
+            });
+        }
         #[cfg(test)]
         INLINE_BUILTIN_DIRECT_COUNT.with(|count| count.set(count.get() + 1));
         let arg = |i: usize| {
@@ -10402,6 +10451,19 @@ impl<'a> Vm<'a> {
             Ok(value) => Ok(value),
             Err(flow) => ctx.dispatch_signal_flow_cold(flow),
         }
+    }
+
+    /// Run F attached when this OS thread runs detached in a Parallel World.
+    #[cfg(feature = "shared-heap")]
+    fn with_parallel_attach_vm<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let attach = self
+            .ctx
+            .parallel_attach(neovm_value::detached::AttachReason::Class);
+        let result = f(self);
+        if let Some(attach) = attach {
+            self.ctx.parallel_detach(attach);
+        }
+        result
     }
 
     #[doc(hidden)]

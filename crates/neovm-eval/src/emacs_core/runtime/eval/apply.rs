@@ -3795,6 +3795,17 @@ impl Context {
         args_start: usize,
         nargs: usize,
     ) -> EvalResult {
+        // A Parallel World's detached thread attaches for a World-class
+        // primitive (`world::parallel_classify`).
+        #[cfg(feature = "shared-heap")]
+        if let Some(reason) = crate::emacs_core::eval::world::subr_attach_reason(
+            function,
+            &self.bc_buf[args_start..args_start + nargs],
+        ) {
+            return self.with_parallel_attach(reason, |ctx| {
+                ctx.dispatch_subr_fn_from_bc_stack(function, args_start, nargs)
+            });
+        }
         match function {
             SubrFn::ManySlice(func) => self.call_many_slice_from_bc_stack(func, args_start, nargs),
             SubrFn::Many(func) => {
@@ -3870,6 +3881,15 @@ impl Context {
         args_start: usize,
         nargs: usize,
     ) -> Option<EvalResult> {
+        #[cfg(feature = "shared-heap")]
+        if let Some(reason) = crate::emacs_core::eval::world::subr_attach_reason(
+            function,
+            &self.bc_buf[args_start..args_start + nargs],
+        ) {
+            return self.with_parallel_attach(reason, |ctx| {
+                ctx.dispatch_fixed_subr_fn_from_bc_stack(function, args_start, nargs)
+            });
+        }
         let arg = |ctx: &Self, i: usize| {
             if i < nargs {
                 ctx.bc_buf[args_start + i]
@@ -3952,6 +3972,11 @@ impl Context {
         func: crate::emacs_core::eval::subr_abi::SubrFn,
         args: &[Value],
     ) -> EvalResult {
+        #[cfg(feature = "shared-heap")]
+        if let Some(reason) = crate::emacs_core::eval::world::subr_attach_reason(func, args) {
+            return self
+                .with_parallel_attach(reason, |ctx| ctx.dispatch_subr_func_unchecked(func, args));
+        }
         match func {
             crate::emacs_core::eval::subr_abi::SubrFn::Many(func) => func(self, args.to_vec()),
             crate::emacs_core::eval::subr_abi::SubrFn::ManyNoContext(func) => func(args.to_vec()),
