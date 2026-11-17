@@ -1341,6 +1341,12 @@ impl Context {
         // cannot clear the OUTER driver extent's flag on its way out.
         let prev = self.gc_driver_active;
         self.gc_driver_active = true;
+        // A Parallel World stops every detached thread around the body.
+        #[cfg(feature = "shared-heap")]
+        self.collect_with_world_stopped(|ctx| {
+            ctx.gc_collect_from_current_roots_body(force_complete)
+        });
+        #[cfg(not(feature = "shared-heap"))]
         self.gc_collect_from_current_roots_body(force_complete);
         self.gc_driver_active = prev;
     }
@@ -2256,6 +2262,12 @@ impl Context {
     pub fn gc_safe_point_exact(&mut self) {
         crate::emacs_core::subr::leaf::debug_assert_no_leaf_active!("a GC safe point");
         if self.gc_safe_point_exact_should_collect() {
+            // The requester of a Parallel World's stop-the-world collection.
+            #[cfg(feature = "shared-heap")]
+            if self.parallel_lock().is_some() {
+                super::world::parallel_gc::on_threshold_tripped(self);
+                return;
+            }
             self.gc_collect_from_current_roots();
         }
     }
@@ -2440,6 +2452,12 @@ impl Context {
     #[doc(hidden)]
     pub fn maybe_quit_slow(&mut self) -> Result<(), Flow> {
         crate::emacs_core::subr::leaf::debug_assert_no_leaf_active!("a quit poll");
+        // A Parallel World's collection asks detached threads to park here.
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::quit::ASYNC_ATTENTION.is_raised(neovm_value::quit::AsyncSource::StopRequest)
+        {
+            super::world::parallel_gc::stop_safepoint(self);
+        }
         // GNU fatal_error_signal calls Fkill_emacs(signal-number, nil), even
         // with inhibit-quit bound. Hooks run on the Lisp owner, and Shutdown
         // unwinds to the ordinary host terminal/process cleanup boundary.

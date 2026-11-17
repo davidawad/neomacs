@@ -27,6 +27,7 @@
 //! this adds; every stop is counted (`safepoint_stops`, `collections`,
 //! `stop_wait_ns`, `stop_max_ns` in [`super::ParallelStats`]).
 
+use super::super::Context;
 use neovm_value::quit::{ASYNC_ATTENTION, AsyncSource};
 use neovm_value::value::Value;
 use std::collections::HashMap;
@@ -280,5 +281,208 @@ impl Drop for ResumeOnDrop<'_> {
     fn drop(&mut self) {
         self.stop
             .end_stop(self.requested, self.waited, self.stopped);
+    }
+}
+
+/// The roots only CTX's own thread knows: its private execution state and
+/// its thread-local roots (Green's parked census, without the World's).
+fn owner_image(ctx: &Context) -> Vec<usize> {
+    let mut roots = Vec::new();
+    ctx.trace_private_roots(&mut roots);
+    let heap = ctx.tagged_heap.tagged_heap_identity();
+    let epoch = ctx.tagged_heap.gc_collections();
+    let scan = neovm_value::tagged::gc::CacheRootScan::Parked;
+    super::super::for_each_thread_local_root_source(heap, epoch, scan, |_, collect| {
+        collect(&mut roots);
+    });
+    roots.into_iter().map(Value::bits).collect()
+}
+
+impl Context {
+    /// Run the collector body on this thread, the Baton holder, with every
+    /// other thread of a Parallel World stopped. Outside one, run it as is.
+    pub(crate) fn collect_with_world_stopped(&mut self, collect: impl FnOnce(&mut Self)) {
+        let Some(lock) = self.parallel_lock_shared() else {
+            collect(self);
+            return;
+        };
+        lock.stop().collect_stopped(|roots| {
+            let saved = super::super::save_scratch_gc_roots();
+            super::super::push_scratch_gc_roots(roots);
+            collect(self);
+            super::super::restore_scratch_gc_roots(saved);
+        });
+    }
+}
+
+/// The integration point for a thread whose allocation tripped the
+/// collection threshold (S3 calls it once it has attached; this tree calls
+/// it from the threshold check every allocation reaches, the GC safe point):
+/// the thread becomes the requester of a stop-the-world collection.
+pub(crate) fn on_threshold_tripped(ctx: &mut Context) {
+    request_collection(ctx);
+}
+
+/// Collect now, as the requester: the caller holds the Baton.
+pub(crate) fn request_collection(ctx: &mut Context) {
+    ctx.gc_collect_from_current_roots();
+}
+
+/// `maybe_quit_slow`'s part: a stop is requested. A thread running detached
+/// Lisp parks here with its roots; the Baton holder (the requester itself,
+/// or a holder that saw a stale hint) has nothing to do.
+pub(crate) fn stop_safepoint(ctx: &mut Context) {
+    let Some(lock) = ctx.parallel_lock_shared() else {
+        return;
+    };
+    if lock.is_attached_here() {
+        return;
+    }
+    lock.stop().park(owner_image(ctx));
+    lock.stop().resume();
+    // The collector changed heap state this thread mirrors.
+    ctx.tagged_heap.install_tagged_heap();
+}
+
+#[cfg(test)]
+pub(crate) mod detached {
+    //! The test-only detached section: a Lisp thread of a Parallel World
+    //! puts the Baton back and runs a Rust closure over values it holds,
+    //! polling the stop at its safe points, until the closure returns.
+    //! Slice S3 owns the real detached execution; this is the collector's
+    //! test of it.
+
+    use super::super::BatonLock;
+    use super::{Context, StopWorld};
+    use neovm_value::value::Value;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread::ThreadId;
+
+    /// What a section that panicked returns.
+    const SECTION_PANICKED: i64 = i64::MIN;
+
+    type SectionBody = Box<dyn FnOnce(&mut Section<'_>) -> i64 + Send>;
+    type ThreadBody = Box<dyn FnOnce(&mut Context) -> i64 + Send>;
+
+    /// The detached section each Lisp OS thread is about to run.
+    static PENDING: Mutex<Vec<(ThreadId, PendingSection)>> = Mutex::new(Vec::new());
+    /// Rust bodies for Lisp threads, by the symbol `make-thread` received.
+    static BODIES: Mutex<Vec<(String, ThreadBody)>> = Mutex::new(Vec::new());
+
+    pub(crate) struct PendingSection {
+        held: Vec<usize>,
+        body: SectionBody,
+        out: Arc<AtomicI64>,
+    }
+
+    /// What a detached section's closure sees.
+    pub(crate) struct Section<'a> {
+        stop: &'a StopWorld,
+        held: Vec<usize>,
+    }
+
+    impl Section<'_> {
+        /// The INDEXth value the section was given.
+        pub(crate) fn held(&self, index: usize) -> Value {
+            // SAFETY: the word is a Value this thread gave the section; the
+            // section's image roots it in every collection while it runs.
+            unsafe { Value::from_bits(self.held[index]) }
+        }
+
+        /// A safe point: park here when a stop is requested.
+        pub(crate) fn safepoint(&mut self) {
+            let held = &self.held;
+            self.stop.safepoint(|| held.clone());
+        }
+    }
+
+    /// Run BODY detached on CTX's thread over HELD, and return its result.
+    pub(crate) fn with_detached(
+        ctx: &mut Context,
+        held: &[Value],
+        body: impl FnOnce(&mut Section<'_>) -> i64 + Send + 'static,
+    ) -> i64 {
+        let out = Arc::new(AtomicI64::new(0));
+        let me = std::thread::current().id();
+        PENDING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((
+                me,
+                PendingSection {
+                    held: held.iter().map(|value| value.bits()).collect(),
+                    body: Box::new(body),
+                    out: Arc::clone(&out),
+                },
+            ));
+        // A runnable park whose transfer finds the pending section runs it
+        // between its detach and its attach.
+        ctx.green_park_runnable_for_test()
+            .expect("a Parallel thread parks runnable");
+        assert!(
+            take_pending_section().is_none(),
+            "the park ran the detached section"
+        );
+        let result = out.load(Ordering::Relaxed);
+        assert_ne!(result, SECTION_PANICKED, "the detached section panicked");
+        result
+    }
+
+    /// The section this OS thread asked to run, if any.
+    pub(crate) fn take_pending_section() -> Option<PendingSection> {
+        let me = std::thread::current().id();
+        let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+        let index = pending.iter().position(|(thread, _)| *thread == me)?;
+        Some(pending.swap_remove(index).1)
+    }
+
+    impl PendingSection {
+        /// Called with the Baton held, from the runnable park's transfer:
+        /// put it back, run the section detached, and take it again.
+        pub(crate) fn run(
+            self,
+            lock: &BatonLock,
+            baton: super::super::Baton,
+        ) -> super::super::Baton {
+            let stop = lock.stop();
+            stop.enter_parked(self.held.clone());
+            lock.detach(baton);
+            let mut section = Section {
+                stop,
+                held: stop.resume(),
+            };
+            // A failed assertion inside the body must still leave and
+            // attach, or every other thread would wait for this one.
+            let body = self.body;
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut section)));
+            stop.leave();
+            self.out
+                .store(result.unwrap_or(SECTION_PANICKED), Ordering::Relaxed);
+            lock.attach().into_baton()
+        }
+    }
+
+    /// Make a Lisp thread started on the symbol NAME run BODY instead.
+    pub(crate) fn register_thread_body(
+        name: &str,
+        body: impl FnOnce(&mut Context) -> i64 + Send + 'static,
+    ) {
+        BODIES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((name.to_owned(), Box::new(body)));
+    }
+
+    /// The registered body of a thread started on FUNCTION.
+    pub(crate) fn take_thread_body(ctx: &Context, function: Value) -> Option<ThreadBody> {
+        let symbol = function.as_symbol_id(ctx.symbol_mode())?;
+        let name = neovm_value::intern::resolve_sym(symbol);
+        let mut bodies = BODIES.lock().unwrap_or_else(PoisonError::into_inner);
+        let index = bodies
+            .iter()
+            .position(|(known, _)| known.as_str() == name)?;
+        Some(bodies.swap_remove(index).1)
     }
 }
