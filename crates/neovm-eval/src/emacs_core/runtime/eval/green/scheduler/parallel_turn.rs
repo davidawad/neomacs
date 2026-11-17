@@ -27,7 +27,8 @@ impl Control {
     /// peer attaches first (GNU's FIFO order is not kept: the lock's wake
     /// order decides among several). Like Green's `transfer`, a
     /// blocking wait no other thread could ever end returns the Baton as
-    /// `NoRunnable` without detaching.
+    /// `NoRunnable` without detaching, and once main is ending a blocking
+    /// wait returns it as a wake.
     pub(crate) fn transfer_parallel(
         &self,
         lock: &BatonLock,
@@ -45,6 +46,16 @@ impl Control {
             Self::set_wait(&mut state, me, wait);
             match wait {
                 Wait::Runnable => Self::enqueue_ready(&mut state, me),
+                // Main is ending: `close` woke every thread waiting then.
+                // This one ran detached meanwhile and waits only now, so it
+                // is woken at once too and ends as it resumes; detached, it
+                // would wait for a wake that never comes, and main's join
+                // of its OS thread with it.
+                _ if state.closing => {
+                    Self::set_wait(&mut state, me, Wait::Runnable);
+                    state.physical.insert(me, OwnerLocation::Running);
+                    return Ok(Wake::Resume(baton));
+                }
                 Wait::Select { .. } => {}
                 _ if !Self::parallel_peer_can_run(&state, me) => {
                     let invariant = Self::verify_invariants(&state);

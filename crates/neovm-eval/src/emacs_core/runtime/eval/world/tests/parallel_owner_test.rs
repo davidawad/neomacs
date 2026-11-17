@@ -520,6 +520,45 @@ fn main_ending_ends_every_thread_and_joins_its_os_thread() {
     drop(ev);
 }
 
+/// The ordering `main_ending_ends_every_thread_and_joins_its_os_thread`
+/// only sometimes takes: thread a runs detached when main's end wakes
+/// every waiting thread, and blocks on main's mutex only after that wake.
+/// Main's join of its OS thread must still end.
+#[test]
+fn a_wait_begun_after_main_ended_ends_and_its_os_thread_joins() {
+    let mut ev = parallel();
+    let setup = eval(
+        &mut ev,
+        "(progn
+           (setq tpe-m (make-mutex) tpe-started nil tpe-go nil tpe-ran nil)
+           (mutex-lock tpe-m)
+           (setq tpe-a (make-thread (lambda ()
+                                      (setq tpe-started t)
+                                      (while (null tpe-go))
+                                      (unwind-protect (mutex-lock tpe-m)
+                                        (setq tpe-ran 'a)))))
+           (while (null tpe-started) (thread-yield))
+           (setq tpe-go t))",
+    );
+    assert_eq!(setup, "t");
+    // Main keeps the Baton from here to its end: thread a, past its start,
+    // waits for it to attach for `mutex-lock`.
+    assert!(ev.attached());
+    let lock = ev.parallel_lock().expect("a Parallel World has a lock");
+    while !lock.has_waiters() {
+        std::thread::yield_now();
+    }
+    ev.green_teardown();
+    assert!(ev.visible_variable_value_or_nil("tpe-ran").is_nil());
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(list (thread-live-p tpe-a) (plist-get (neomacs-shared-heap-stats) :threads))"
+        ),
+        "(nil 1)"
+    );
+}
+
 /// GNU test/src/thread-tests.el `threads-condvar-wait`, its observations
 /// collected in one list (`with-mutex` spelled out: the unit runtime
 /// loads no Lisp; the GNU test's second `sleep-for` is a `thread-join`, so
