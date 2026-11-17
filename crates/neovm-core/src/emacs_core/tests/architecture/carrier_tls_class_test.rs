@@ -835,6 +835,15 @@ const TLS_CLASSIFICATION: &[(&str, &str, TlsClass)] = &[
         "OWNED",
         TlsClass::SourceOnly,
     ),
+    // OwnerCarried: the shared-heap experiment's per-owner allocation state
+    // (`owner_pages.rs`), a raw pointer to the owner's runs with no Lisp
+    // Value; compiled only with the `shared-heap` feature and installed by
+    // the owner's guard, which restores the previous value on drop.
+    (
+        "neovm-value/src/tagged/gc/owner_pages.rs",
+        "OWNER_ALLOC",
+        TlsClass::OwnerCarried,
+    ),
     (BINARY_CENSUS, "PASS_TIME", TlsClass::CarrierIntrinsic),
     (
         "neovm-eval/src/emacs_core/runtime/pdump/convert.rs",
