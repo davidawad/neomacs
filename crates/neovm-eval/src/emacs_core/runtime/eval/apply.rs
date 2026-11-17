@@ -2063,6 +2063,10 @@ impl Context {
                 },
             }
         }
+        // A Parallel thread attached for a shared binding detaches once the
+        // binding unwound (no Lisp heap allocation, no Lisp).
+        #[cfg(feature = "shared-heap")]
+        self.parallel_unpin_after_unbind();
     }
 
     /// Drain every specbinding down to COUNT while carrying RESULT through

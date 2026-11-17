@@ -493,6 +493,49 @@ impl Context {
         lock.detached_threads().saturating_sub(own)
     }
 
+    /// A detached thread binds SYM dynamically. A projected variable binds
+    /// in the thread's owner slab and stays detached; any other binding is
+    /// the shared cell's, which every thread reads, so the thread attaches
+    /// and stays attached until the binding unwinds
+    /// ([`Self::parallel_unpin_after_unbind`]), as GNU's thread holds the
+    /// global lock across it.
+    pub(crate) fn parallel_pin_for_binding(&mut self, sym: SymId) {
+        if !neovm_value::detached::is_detached() || self.binds_in_owner_slab(sym) {
+            return;
+        }
+        let Some(lock) = self.parallel_lock_shared() else {
+            return;
+        };
+        if neovm_value::detached::pin_at(self.specpdl.len()) {
+            lock.count_attach(AttachReason::Class);
+            self.parallel_seat_baton(lock.attach().into_baton());
+        }
+    }
+
+    /// The bindings unwound: a thread pinned below them detaches again.
+    pub(crate) fn parallel_unpin_after_unbind(&mut self) {
+        if !neovm_value::detached::running_detached() || neovm_value::detached::is_detached() {
+            return;
+        }
+        let Some(gate) = neovm_value::detached::unpin_at(self.specpdl.len()) else {
+            return;
+        };
+        let Some(lock) = self.parallel_lock_shared() else {
+            return;
+        };
+        lock.detach(self.parallel_unseat_baton());
+        neovm_value::detached::resume_detached(gate);
+    }
+
+    /// Whether a dynamic binding of SYM lands in this thread's owner slab.
+    fn binds_in_owner_slab(&self, sym: SymId) -> bool {
+        matches!(
+            self.obarray.get_by_id(sym).map(|symbol| symbol.value_cell()),
+            Some(neovm_value::symbol::ValueCell::Forwarded(fwd))
+                if fwd.thread_projection().is_some()
+        )
+    }
+
     /// GNU `thread-signal` reaches a detached thread through its quit
     /// request: at its next quit poll the thread raises the signal stored
     /// for it, attached. Any other quit request is left for the ordinary
