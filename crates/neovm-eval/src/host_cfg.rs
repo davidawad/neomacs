@@ -36,6 +36,8 @@ pub enum HostCfgClass {
     /// subrs exist only in such a build. No reference profile enables it.
     Xwidgets,
     VmProfile,
+    /// The experimental shared-heap Parallel World (`--features shared-heap`).
+    SharedHeap,
     /// Every window-system surface except the macOS NS one.  GNU's W32 and X11
     /// builds both define these names (e.g. w32fns.c's x-change-window-property),
     /// while the NS object set does not; the NS build leaves them void.
@@ -49,7 +51,7 @@ pub enum HostCfgClass {
 
 impl HostCfgClass {
     /// Every class, in the label vocabulary's declaration order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Always,
         Self::Macos,
         Self::Windows,
@@ -59,6 +61,7 @@ impl HostCfgClass {
         Self::Sqlite,
         Self::Xwidgets,
         Self::VmProfile,
+        Self::SharedHeap,
         Self::NotMacos,
         Self::X11Only,
     ];
@@ -75,6 +78,7 @@ impl HostCfgClass {
             Self::Sqlite => "sqlite",
             Self::Xwidgets => "xwidgets",
             Self::VmProfile => "vm-profile",
+            Self::SharedHeap => "shared-heap",
             Self::NotMacos => "not-macos",
             Self::X11Only => "x11-only",
         }
@@ -93,6 +97,7 @@ impl HostCfgClass {
             "sqlite" => Self::Sqlite,
             "xwidgets" => Self::Xwidgets,
             "vm-profile" => Self::VmProfile,
+            "shared-heap" => Self::SharedHeap,
             "not-macos" => Self::NotMacos,
             "x11-only" => Self::X11Only,
             _ => return None,

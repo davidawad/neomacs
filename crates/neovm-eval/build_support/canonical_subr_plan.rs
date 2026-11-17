@@ -399,6 +399,9 @@ fn cfg_from_directive(line: &str) -> Option<&'static str> {
     if line.contains("neomacs_have_lcms2") {
         return Some("lcms2");
     }
+    if line.contains("\"shared-heap\"") {
+        return Some("shared-heap");
+    }
     if line.contains("\"vm-profile\"") || line.contains("vm-profile") {
         return Some("vm-profile");
     }

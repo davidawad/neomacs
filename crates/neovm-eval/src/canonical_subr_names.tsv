@@ -19,6 +19,7 @@ lcms-temp->white-point	1	1	eval	lcms2
 default-boundp	1	1	eval	always
 default-value	1	1	eval	always
 set-default	2	2	eval	always
+neomacs-shared-heap-stats	0	0	eval	shared-heap
 neovm--vm-profile-reset	0	0	eval	vm-profile
 neovm--vm-profile-dump	0	1	eval	vm-profile
 neovm--internal-panic	0	1	eval	always
