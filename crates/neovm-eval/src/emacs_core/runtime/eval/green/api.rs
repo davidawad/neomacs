@@ -278,7 +278,7 @@ pub fn parallel_world(ctx: &Context) -> bool {
 /// `make-thread` in the experimental Parallel World.
 #[cfg(feature = "shared-heap")]
 pub fn parallel_make_thread(ctx: &mut Context, args: &[Value]) -> EvalResult {
-    // Until its detached execution slice lands, Parallel uses the Green
-    // scheduler's single-runner semantics and owner-local Context setup.
-    green_make_thread(ctx, args)
+    // Green's admission, owner setup and waits; `green_spawn` gives the
+    // thread a dedicated OS thread and the Baton lock in a Parallel World.
+    ctx.green_spawn(args)
 }

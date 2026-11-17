@@ -52,7 +52,7 @@ pub(crate) use green_owner::OwnedProofProjection;
 #[allow(unused_imports)]
 pub(crate) use green_owner::{FrozenLegacyRoots, OwnedParallelError, OwnedParallelProjection};
 #[cfg(feature = "shared-heap")]
-pub(crate) use parallel_owner::{Attached, BatonLock, ParallelStats};
+pub(crate) use parallel_owner::{BatonLock, ParallelStats};
 pub(crate) use slot::WorldSlot;
 pub(crate) use sole_owner::{
     PublishedSoleOwnerDriver, SoleOwnerDriver, SoleOwnerRegistration, SoleOwnerVm,
@@ -90,8 +90,9 @@ struct World {
     threading: Cell<super::admission::ThreadingMode>,
     /// The Green runtime (round 3d), once started.
     green: std::cell::RefCell<Option<Box<super::green::GreenRuntime>>>,
+    /// The Baton's lock, once a Parallel World started its runtime.
     #[cfg(feature = "shared-heap")]
-    parallel: std::sync::OnceLock<parallel_owner::BatonLock>,
+    parallel: std::sync::OnceLock<Arc<parallel_owner::BatonLock>>,
     /// The OS thread holding the World's Baton, in a Green World
     /// (`green_owner`'s safety argument; checked in debug builds).
     baton_holder: Cell<Option<std::thread::ThreadId>>,
@@ -127,29 +128,35 @@ pub(crate) struct WorldLease(Arc<World>);
 static_assertions::assert_not_impl_any!(WorldLease: Send, Sync, Clone);
 static_assertions::assert_eq_size!(WorldLease, Arc<World>);
 
+#[cfg(feature = "shared-heap")]
 impl Context {
-    /// The World's lock-based Baton authority, when this is a Parallel World.
-    #[cfg(feature = "shared-heap")]
+    /// The World's Baton lock, when this is a started Parallel World.
     pub(crate) fn parallel_lock(&self) -> Option<&BatonLock> {
-        self.obarray.lease.0.parallel.get()
+        self.obarray.lease.0.parallel.get().map(Arc::as_ref)
     }
 
-    /// Whether the calling OS thread currently owns this World's Baton.
-    #[cfg(feature = "shared-heap")]
+    /// The World's Baton lock, for an OS thread that waits on it before it
+    /// has a Context of its own.
+    pub(crate) fn parallel_lock_shared(&self) -> Option<Arc<BatonLock>> {
+        self.obarray.lease.0.parallel.get().cloned()
+    }
+
+    /// Whether the calling OS thread holds this Parallel World's Baton.
     pub(crate) fn attached(&self) -> bool {
         self.parallel_lock()
             .is_some_and(BatonLock::is_attached_here)
     }
 
-    /// Install the World's lock-based Baton authority exactly once.
-    #[cfg(feature = "shared-heap")]
-    pub(crate) fn install_parallel_lock(&self, baton: Baton) -> Result<(), ()> {
-        self.obarray
-            .lease
-            .0
-            .parallel
-            .set(BatonLock::new(baton))
-            .map_err(|_| ())
+    /// Put the World's issued BATON behind its lock, once, as the Parallel
+    /// runtime starts.
+    pub(crate) fn install_parallel_lock(&self, baton: Baton) -> &BatonLock {
+        let lock = &self.obarray.lease.0.parallel;
+        assert!(
+            lock.set(Arc::new(BatonLock::new(baton))).is_ok(),
+            "a World starts its Parallel runtime once"
+        );
+        self.parallel_lock()
+            .expect("the Baton lock was installed above")
     }
 }
 

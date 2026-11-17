@@ -69,6 +69,8 @@ pub(crate) enum ThreadingMode {
 }
 
 impl ThreadingMode {
+    /// Whether Lisp threads are owners with owner-local bindings, each on
+    /// its own OS thread: Green, and the experimental Parallel.
     pub(crate) fn uses_owner_threads(self) -> bool {
         match self {
             Self::Green => true,
