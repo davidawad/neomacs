@@ -905,7 +905,17 @@ impl Context {
             return Err(flow);
         }
         match self.threads.take_pending_thread_signal(key.id()) {
-            Some(flow) => Err(flow),
+            Some(flow) => {
+                // A Parallel `thread-signal` also raised this thread's quit
+                // request, for a detached quit poll to find the signal. The
+                // signal is raised here instead: its request goes with it,
+                // or the next poll would turn it into a `quit`.
+                #[cfg(feature = "shared-heap")]
+                if self.parallel_lock().is_some() {
+                    self.quit_requested.clear();
+                }
+                Err(flow)
+            }
             None => Ok(()),
         }
     }

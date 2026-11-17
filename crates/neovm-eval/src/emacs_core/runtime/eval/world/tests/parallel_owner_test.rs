@@ -519,3 +519,42 @@ fn main_ending_ends_every_thread_and_joins_its_os_thread() {
     );
     drop(ev);
 }
+
+/// GNU test/src/thread-tests.el `threads-condvar-wait`, its observations
+/// collected in one list (`with-mutex` spelled out: the unit runtime
+/// loads no Lisp; the GNU test's second `sleep-for` is a `thread-join`, so
+/// the end is not a matter of timing): a notified waiter waits on the
+/// condition again, then a `thread-signal` ends it with that error.
+#[test]
+fn a_notified_condition_waiter_waits_again_and_a_signal_ends_it() {
+    let form = "(progn
+                  (defvar tpw-cv nil)
+                  (fset 'tpw-wait-once
+                        (lambda ()
+                          (mutex-lock (condition-mutex tpw-cv))
+                          (unwind-protect (condition-wait tpw-cv)
+                            (mutex-unlock (condition-mutex tpw-cv)))))
+                  (fset 'tpw-wait (lambda () (tpw-wait-once) (tpw-wait-once)))
+                  (let ((cv-mutex (make-mutex)) th started notified signalled)
+                    (setq tpw-cv (make-condition-variable cv-mutex))
+                    (setq th (make-thread 'tpw-wait))
+                    (setq started (list (thread-live-p th) (length (all-threads))))
+                    (while (null (eq (thread--blocker th) tpw-cv))
+                      (thread-yield))
+                    (mutex-lock cv-mutex)
+                    (unwind-protect (condition-notify tpw-cv t)
+                      (mutex-unlock cv-mutex))
+                    (sleep-for 0.1)
+                    (setq notified (list (thread-live-p th) (length (all-threads))
+                                        (eq (thread--blocker th) tpw-cv)))
+                    (thread-signal th 'error '(\"Die, die, die!\"))
+                    (setq signalled (list (condition-case e (thread-join th) (error e))
+                                          (length (all-threads)) (thread-last-error)))
+                    (list started notified signalled)))";
+    let green = eval(&mut world(ThreadingMode::Green), form);
+    assert_eq!(
+        green,
+        "((t 2) (t 2 t) ((error \"Die, die, die!\") 1 (error \"Die, die, die!\")))"
+    );
+    assert_eq!(eval(&mut parallel(), form), green);
+}
