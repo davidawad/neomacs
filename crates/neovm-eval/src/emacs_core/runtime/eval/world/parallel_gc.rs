@@ -36,6 +36,10 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::Instant;
 
+#[cfg(test)]
+#[path = "tests/parallel_gc_test.rs"]
+mod tests;
+
 /// Where the World's stop is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
