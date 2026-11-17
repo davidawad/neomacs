@@ -21,8 +21,16 @@ unsafe fn test_note(_lock: *const (), _reason: AttachReason) {
     NOTES.fetch_add(1, Ordering::Relaxed);
 }
 
+unsafe fn test_defer(_lock: *const (), _bytes: u64) {}
+
 fn gate() -> DetachedGate {
-    DetachedGate::new(std::ptr::null(), test_attach, test_detach, test_note)
+    DetachedGate::new(
+        std::ptr::null(),
+        test_attach,
+        test_detach,
+        test_note,
+        test_defer,
+    )
 }
 
 #[test]

@@ -543,22 +543,33 @@ impl OwnerAllocState {
     }
 
     /// The run of `class` is exhausted or closed: close it, carve the next
-    /// one under the cold mutex, and read the parity it stamps.
+    /// one under the cold mutex, and read the parity it stamps. When what
+    /// owners allocated since the last adoption makes a collection due, the
+    /// detached thread's World defers one ([`crate::detached::defer_collection`]).
     #[cold]
     #[inline(never)]
     fn refill(&mut self, class: OwnerClass, heap: *const TaggedHeap) {
-        // SAFETY: `mark_parity` changes only inside a collection, and every
-        // owner has closed its runs and is parked for the whole collection,
-        // so no write to it races this read.
-        self.parity = unsafe { std::ptr::addr_of!((*heap).mark_parity).read() };
+        // SAFETY: `mark_parity` and `gc_threshold` change only inside a
+        // collection, and every owner has closed its runs and is parked for
+        // the whole collection, so no write to them races these reads.
+        let (parity, threshold) = unsafe {
+            (
+                std::ptr::addr_of!((*heap).mark_parity).read(),
+                std::ptr::addr_of!((*heap).gc_threshold).read(),
+            )
+        };
+        self.parity = parity;
         let shared = Arc::clone(&self.shared);
         let mut cold = shared.lock();
         self.flush(&mut cold);
         let old = std::mem::take(self.run_mut(class));
         cold.close(class, old);
         let run = cold.carve(class, shared.sizes);
-        shared.publish_pending(&cold);
+        let pending = shared.publish_pending(&cold);
         drop(cold);
+        if pending >= threshold {
+            crate::detached::defer_collection(pending as u64);
+        }
         if class == OwnerClass::Float {
             let mut slot = run.start;
             while slot < run.lim {

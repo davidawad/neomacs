@@ -402,6 +402,18 @@ unsafe fn gate_note(lock: *const (), reason: AttachReason) {
     unsafe { &*lock.cast::<BatonLock>() }.count_attach(reason);
 }
 
+/// The gate's deferral of a collection the thread's own allocation runs
+/// made due (`neovm_value::detached`): it waits for the detached threads,
+/// as one an attached access makes due does ([`gate_detach`]).
+///
+/// # Safety
+///
+/// As [`gate_attach`].
+unsafe fn gate_defer(lock: *const (), bytes: u64) {
+    // SAFETY: the caller's contract.
+    unsafe { &*lock.cast::<BatonLock>() }.defer_collection(bytes);
+}
+
 /// The gate a detached thread of LOCK's World runs behind. LOCK must
 /// outlive the thread's detached body (the World holds it).
 pub(crate) fn detached_gate(lock: &BatonLock) -> DetachedGate {
@@ -410,6 +422,7 @@ pub(crate) fn detached_gate(lock: &BatonLock) -> DetachedGate {
         gate_attach,
         gate_detach,
         gate_note,
+        gate_defer,
     )
 }
 

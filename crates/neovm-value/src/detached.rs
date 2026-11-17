@@ -45,10 +45,12 @@ pub struct DetachedGate {
     detach: unsafe fn(lock: *const (), token: *mut ()),
     /// Count REASON without attaching.
     note: unsafe fn(lock: *const (), reason: AttachReason),
+    /// Defer a collection due at BYTES, without attaching.
+    defer: unsafe fn(lock: *const (), bytes: u64),
 }
 
 impl DetachedGate {
-    /// The gate of LOCK, an erased lock the three entries take back. LOCK
+    /// The gate of LOCK, an erased lock the four entries take back. LOCK
     /// must outlive every thread that runs detached behind the gate.
     #[doc(hidden)]
     pub fn new(
@@ -56,12 +58,14 @@ impl DetachedGate {
         attach: unsafe fn(lock: *const (), reason: AttachReason) -> *mut (),
         detach: unsafe fn(lock: *const (), token: *mut ()),
         note: unsafe fn(lock: *const (), reason: AttachReason),
+        defer: unsafe fn(lock: *const (), bytes: u64),
     ) -> Self {
         Self {
             lock,
             attach,
             detach,
             note,
+            defer,
         }
     }
 }
@@ -191,6 +195,16 @@ pub fn note(reason: AttachReason) {
         // SAFETY: the evaluator installed GATE with its World's live lock,
         // which outlives the thread's detached body.
         unsafe { (gate.note)(gate.lock, reason) };
+    }
+}
+
+/// Owners' allocations made a collection due at BYTES: when this OS thread
+/// runs detached, its World defers one, as an attached access that made it
+/// due would (counted once per deferred collection).
+pub(crate) fn defer_collection(bytes: u64) {
+    if let Some(gate) = placement().gate {
+        // SAFETY: as in `note`.
+        unsafe { (gate.defer)(gate.lock, bytes) };
     }
 }
 
