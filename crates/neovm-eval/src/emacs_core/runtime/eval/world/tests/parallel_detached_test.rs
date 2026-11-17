@@ -157,6 +157,80 @@ fn two_detached_numeric_loops_match_the_serial_result_without_attaching() {
     );
 }
 
+/// GNU `dotimes` (subr.el), as a macro built without backquote: the
+/// unit Context loads no Lisp files.
+const DOTIMES: &str = "(defalias 'tpd-dotimes
+       (cons 'macro
+             (lambda (spec &rest body)
+               (let ((upper (make-symbol \"upper\"))
+                     (counter (make-symbol \"counter\")))
+                 (list 'let (list (list upper (nth 1 spec)) (list counter 0))
+                       (list 'while (list '< counter upper)
+                             (cons 'let (cons (list (list (car spec) counter)) body))
+                             (list 'setq counter (list '1+ counter))))))))";
+
+/// Attaches of two Parallel threads that each run the never-compiled
+/// `tpd-interp-loop` for ITERATIONS: one `let` of a lexical local per
+/// iteration (the `dotimes` expansion), `setq` of lexical locals and
+/// fixnum arithmetic. Returns the growth of the attach counters.
+fn interpreted_loop_attaches(ev: &mut Context, iterations: i64) -> ParallelStats {
+    // The lock exists once the first thread started the Parallel runtime.
+    let before = ev.parallel_lock().map(BatonLock::stats).unwrap_or_default();
+    let serial = numeric_loop(iterations);
+    assert_eq!(
+        eval(
+            ev,
+            &format!(
+                "(let ((a (make-thread (lambda () (tpd-interp-loop {iterations}))))
+                       (b (make-thread (lambda () (tpd-interp-loop {iterations})))))
+                   (list (thread-join a) (thread-join b)))"
+            )
+        ),
+        format!("({serial} {serial})")
+    );
+    let after = stats(ev);
+    ParallelStats {
+        attach_count: after.attach_count - before.attach_count,
+        attach_by_class: after.attach_by_class - before.attach_by_class,
+        attach_by_alloc: after.attach_by_alloc - before.attach_by_alloc,
+        attach_by_intern: after.attach_by_intern - before.attach_by_intern,
+        attach_by_blv: after.attach_by_blv - before.attach_by_blv,
+        ..after
+    }
+}
+
+/// An interpreted fixnum loop on two threads attaches O(1) times, not
+/// O(iterations): its lexical bindings, `setq`s and arithmetic run
+/// detached as the byte-compiled loop's do.
+#[test]
+fn an_interpreted_dotimes_loop_attaches_a_constant_number_of_times() {
+    let mut ev = parallel();
+    assert_eq!(eval(&mut ev, DOTIMES), "tpd-dotimes");
+    eval(
+        &mut ev,
+        "(fset 'tpd-interp-loop
+               (lambda (n)
+                 (let ((s 0))
+                   (tpd-dotimes (i n)
+                     (setq s (logand (+ s (* i i)) #xffffff)))
+                   s)))",
+    );
+    let small = interpreted_loop_attaches(&mut ev, 1_000);
+    let large = interpreted_loop_attaches(&mut ev, 10_000);
+    println!("attaches for 2 x 1000 iterations: {small:?}");
+    println!("attaches for 2 x 10000 iterations: {large:?}");
+    // Thread start, join and end attach a fixed number of times; one
+    // attach per iteration would be at least 20000 here.
+    assert!(
+        large.attach_count < 64,
+        "the interpreted loop attaches per iteration: {large:?}"
+    );
+    assert!(
+        large.attach_count <= small.attach_count + 16,
+        "attaches grow with the iteration count: {small:?} then {large:?}"
+    );
+}
+
 /// Item 7(b): a canonical write attaches, once per `set`.
 #[test]
 fn a_detached_set_attaches_once_per_call() {
