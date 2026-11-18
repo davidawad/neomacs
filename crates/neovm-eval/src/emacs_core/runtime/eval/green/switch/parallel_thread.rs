@@ -5,6 +5,7 @@
 //! records the outcome as a Green carrier job does, then detaches for good.
 
 use super::super::super::world::{Baton, BatonLock, detached_gate, prepare_detached_table};
+use super::super::carried::CarriedState;
 use super::super::carrier_tls;
 use super::{
     AbortOnPanic, Context, Control, Flow, Lifecycle, ThreadKey, Value, Wake, signal,
@@ -131,6 +132,15 @@ impl Context {
     }
 }
 
+/// Drop, while the Baton is still held, what this ending OS thread's
+/// carried thread-locals hold, and leave them fresh placeholders. Their
+/// destructors run after the Baton went back, and what they held may be
+/// shared with the World: its collection-read owner, whose `Rc` count the
+/// Baton holder changes at every heap installation.
+fn release_carried_thread_locals() {
+    CarriedState::placeholders().swap();
+}
+
 /// KEY's whole life on its OS thread (Green's `run_carrier_job`, with the
 /// lock in place of the carrier's channel and pool).
 fn run(key: ThreadKey, control: &Arc<Control>, receiver: mpsc::Receiver<Wake>, lock: &BatonLock) {
@@ -164,6 +174,7 @@ fn run(key: ThreadKey, control: &Arc<Control>, receiver: mpsc::Receiver<Wake>, l
         owner.retire_green_owner();
         stow_carried_state(&baton);
         carrier_tls::park_carrier_tls();
+        release_carried_thread_locals();
         let retired = baton.retire_thread_completion(completion);
         control.finish_parallel(lock, retired, baton);
         return;
@@ -251,6 +262,7 @@ fn run(key: ThreadKey, control: &Arc<Control>, receiver: mpsc::Receiver<Wake>, l
     // This OS thread ends after detaching: its thread-local destructors must
     // then name no heap or World object.
     carrier_tls::park_carrier_tls();
+    release_carried_thread_locals();
     let retired = baton.retire_thread_completion(completion);
     control.finish_parallel(lock, retired, baton);
 }
