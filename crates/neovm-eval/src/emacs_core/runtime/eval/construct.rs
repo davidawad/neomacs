@@ -2831,6 +2831,15 @@ impl Drop for Context {
     fn drop(&mut self) {
         // A Green World's main thread ends its other threads first.
         self.green_teardown();
+        // A Parallel thread's owner retires while other threads may run
+        // detached, storing through the World heap's store protocol: only
+        // this OS thread's installation of the heap is its own to clear.
+        // Main, which ends last, retires the protocol.
+        #[cfg(feature = "shared-heap")]
+        let parallel_thread = self.parallel_lock().is_some()
+            && self
+                .green_key()
+                .is_some_and(|key| key != super::green::ThreadKey::Main);
         self.green_release_seat();
         super::data::dynamic_module_registry::retire_dynamic_module_registry(
             &self.dynamic_module_registry,
@@ -2838,6 +2847,11 @@ impl Drop for Context {
         // Context is !Send, pinned by thread contracts, so Drop stays on its
         // owner thread. Retain upstream policy retirement as defence in depth.
         self.integer_width_context.retire();
+        #[cfg(feature = "shared-heap")]
+        if parallel_thread {
+            neovm_value::tagged::gc::clear_carrier_heap_tls();
+            return;
+        }
         neovm_value::tagged::gc::clear_tagged_heap_if_installed(&self.tagged_heap);
     }
 }
