@@ -35,7 +35,9 @@
 //! The collector then runs with its own roots, the World's (parked registry,
 //! shared-root transport table, owner slabs), and every parked image, and
 //! finishes the cycle's sweep before the parked threads resume, so they
-//! never run in a cycle between its slices. It lowers the request and wakes
+//! never run in a cycle between its slices. The parked threads sweep with
+//! it: while they wait for the stop to end they take the shares of its
+//! in-stop sweep ([`StopWorld::run_on_parked`]). It lowers the request and wakes
 //! everyone. A resumed thread re-installs its heap thread-locals, briefly
 //! attached, before it touches the heap again, so its mirrors of collector
 //! state are current.
@@ -82,6 +84,43 @@ struct StopState {
     /// `Value` never crosses threads, and the words are read back only while
     /// the thread that published them is parked.
     images: HashMap<ThreadId, Vec<usize>>,
+    /// Work the collecting thread hands its parked threads
+    /// ([`StopWorld::run_on_parked`]), while it does.
+    shares: Option<ParkedShares>,
+}
+
+/// The shares of one [`StopWorld::run_on_parked`] call.
+struct ParkedShares {
+    task: ShareTask,
+    parts: usize,
+    /// The next share no thread has taken.
+    next: usize,
+    /// Shares that have returned.
+    finished: usize,
+    /// The first share's panic, for the caller to resume.
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// A borrowed `&(dyn Fn(usize) + Sync)` of the [`StopWorld::run_on_parked`]
+/// call in progress, as an address: its borrow lives on that caller's stack.
+#[derive(Clone, Copy)]
+struct ShareTask(*const ());
+
+// SAFETY: the task is `Sync`, and `run_on_parked` does not return, so its
+// borrow stays live, until every share that took the address has returned.
+unsafe impl Send for ShareTask {}
+
+impl ShareTask {
+    /// Run share INDEX.
+    ///
+    /// # Safety
+    /// The `run_on_parked` call that made this task has not returned.
+    unsafe fn run(self, index: usize) {
+        // SAFETY: the address is that call's `&&(dyn Fn(usize) + Sync)`,
+        // live per the caller's contract.
+        let task = unsafe { *self.0.cast::<&(dyn Fn(usize) + Sync)>() };
+        task(index);
+    }
 }
 
 /// How long a requester parks between looks at the running count.
@@ -144,6 +183,7 @@ impl StopWorld {
                 requested_at: None,
                 running: 0,
                 images: HashMap::new(),
+                shares: None,
             }),
             changed: Condvar::new(),
             safepoint_stops: AtomicU64::new(0),
@@ -226,6 +266,7 @@ impl StopWorld {
         }
         self.changed.notify_all();
         loop {
+            state = self.help(state);
             match state.phase {
                 Phase::Running => {
                     state.images.remove(&me);
@@ -241,6 +282,73 @@ impl StopWorld {
     /// How many threads are parked with an image.
     fn parked(&self) -> usize {
         self.lock_state().images.len()
+    }
+
+    /// The calling thread collects for the stop: run TASK for each share
+    /// index in `0..parts`, here and on the parked threads, which take the
+    /// shares one at a time while they wait for the stop to end. Returns
+    /// once every share has returned, resuming the first share's panic.
+    fn run_on_parked(&self, parts: usize, task: &(dyn Fn(usize) + Sync)) {
+        let mut state = self.lock_state();
+        debug_assert!(state.shares.is_none(), "one share run at a time");
+        state.shares = Some(ParkedShares {
+            task: ShareTask(std::ptr::from_ref(&task).cast()),
+            parts,
+            next: 0,
+            finished: 0,
+            panic: None,
+        });
+        self.changed.notify_all();
+        state = self.help(state);
+        // The task's borrow must outlive every share a parked thread took.
+        while state
+            .shares
+            .as_ref()
+            .is_some_and(|shares| shares.finished < shares.parts)
+        {
+            state = self.wait(state);
+        }
+        let shares = state
+            .shares
+            .take()
+            .expect("the run's shares stay until here");
+        drop(state);
+        if let Some(panic) = shares.panic {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Run shares of a [`Self::run_on_parked`] in progress until none is
+    /// left to take.
+    fn help<'a>(&'a self, mut state: MutexGuard<'a, StopState>) -> MutexGuard<'a, StopState> {
+        while let Some(shares) = state
+            .shares
+            .as_mut()
+            .filter(|shares| shares.next < shares.parts)
+        {
+            let index = shares.next;
+            shares.next += 1;
+            let task = shares.task;
+            drop(state);
+            // SAFETY: `run_on_parked` waits for this share's `finished`
+            // count below before it returns.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                task.run(index)
+            }));
+            state = self.lock_state();
+            let shares = state
+                .shares
+                .as_mut()
+                .expect("shares stay until all finished");
+            shares.finished += 1;
+            if let Err(panic) = outcome {
+                shares.panic.get_or_insert(panic);
+            }
+            if shares.finished == shares.parts {
+                self.changed.notify_all();
+            }
+        }
+        state
     }
 
     /// The requester of [`Self::request_and_park`] holds the Baton: its
@@ -267,7 +375,11 @@ impl StopWorld {
     pub(crate) fn resume(&self) -> Vec<usize> {
         let me = std::thread::current().id();
         let mut state = self.lock_state();
-        while state.phase != Phase::Running {
+        loop {
+            state = self.help(state);
+            if state.phase == Phase::Running {
+                break;
+            }
             state = self.wait(state);
         }
         state.running += 1;
@@ -497,14 +609,8 @@ impl Context {
                 // The parked threads' CPUs sweep what owner threads
                 // allocate the most of; the slices below finish the rest.
                 let workers = std::num::NonZeroUsize::MIN.saturating_add(stop.parked());
-                self.tagged_heap.sweep_in_stop_on(workers, |parts, share| {
-                    std::thread::scope(|threads| {
-                        for index in 1..parts {
-                            threads.spawn(move || share(index));
-                        }
-                        share(0);
-                    });
-                });
+                self.tagged_heap
+                    .sweep_in_stop_on(workers, |parts, share| stop.run_on_parked(parts, share));
                 while matches!(
                     self.tagged_heap.mark_phase(),
                     MarkPhase::Sweeping | MarkPhase::StoppedMarking

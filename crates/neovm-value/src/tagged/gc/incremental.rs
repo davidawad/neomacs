@@ -494,8 +494,8 @@ impl TaggedHeap {
         } else {
             CollectionScope::Young
         };
-        /// Fewer string and vector pages, or dead boxes, than this per
-        /// thread are swept sooner than a thread starts.
+        /// Fewer pages, or dead boxes, than this per share are swept
+        /// sooner than a parked thread wakes for them.
         const PAGES_PER_THREAD: usize = 32;
         const BOXES_PER_THREAD: usize = 4096;
         let ranges = [
@@ -504,13 +504,12 @@ impl TaggedHeap {
             (self.sweep_vector_page_cursor, self.sweep_vector_page_end),
             (self.sweep_bignum_page_cursor, self.sweep_bignum_page_end),
         ];
-        // Strings' and vectors' dead slots free their payloads, which is
-        // the work worth spreading. Float and bignum pages only scan their
-        // bits for slots with nothing (or a few limbs) to free; split across
-        // threads they cost more than on one (the page has to come from
-        // another core's cache to each), so the first share keeps them.
-        let pages =
-            ranges[1].1.saturating_sub(ranges[1].0) + ranges[2].1.saturating_sub(ranges[2].0);
+        // The stop's parked threads run the shares, so a share costs a
+        // wake-up, not a thread start: every class's pages are spread.
+        let pages: usize = ranges
+            .iter()
+            .map(|&(cursor, end)| end.saturating_sub(cursor))
+            .sum();
         let parts = workers
             .get()
             .min(pages.div_ceil(PAGES_PER_THREAD) + doomed.len().div_ceil(BOXES_PER_THREAD))
@@ -523,7 +522,7 @@ impl TaggedHeap {
             ..
         } = self;
         let mut floats = float_arena
-            .page_runs(ranges[0].0, ranges[0].1, 1)
+            .page_runs(ranges[0].0, ranges[0].1, parts)
             .into_iter();
         let mut strings = string_arena
             .page_runs(ranges[1].0, ranges[1].1, parts)
@@ -532,7 +531,7 @@ impl TaggedHeap {
             .page_runs(ranges[2].0, ranges[2].1, parts)
             .into_iter();
         let mut bignums = bignum_arena
-            .page_runs(ranges[3].0, ranges[3].1, 1)
+            .page_runs(ranges[3].0, ranges[3].1, parts)
             .into_iter();
         let mut boxes = doomed.chunks(doomed.len().div_ceil(parts).max(1));
         // One thread's share: a run of each class, and some of the boxes.

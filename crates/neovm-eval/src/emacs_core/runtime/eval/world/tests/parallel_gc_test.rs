@@ -156,6 +156,112 @@ fn a_stop_waits_for_every_running_thread_and_roots_its_image() {
     );
 }
 
+/// The collector's work spread over a stop's parked threads
+/// (`StopWorld::run_on_parked`, the in-stop sweep's executor): every share
+/// runs exactly once, and the parked threads run shares while they wait,
+/// so none has to be started for them.
+#[test]
+fn a_stop_runs_each_share_once_on_its_parked_threads() {
+    const PARTS: usize = 64;
+    let stop = Arc::new(StopWorld::new());
+    let ready = Arc::new(Barrier::new(4));
+    let release = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..3i64)
+        .map(|k| {
+            let (stop, ready, release) =
+                (Arc::clone(&stop), Arc::clone(&ready), Arc::clone(&release));
+            std::thread::spawn(move || {
+                stop.enter_parked(vec![Value::fixnum(k).bits()]);
+                stop.resume();
+                ready.wait();
+                while !release.load(Ordering::Acquire) {
+                    stop.safepoint(|| vec![Value::fixnum(k).bits()]);
+                }
+                stop.leave();
+            })
+        })
+        .collect();
+    ready.wait();
+    let runs: Vec<AtomicUsize> = (0..PARTS).map(|_| AtomicUsize::new(0)).collect();
+    let by_parked = AtomicUsize::new(0);
+    let collector = std::thread::current().id();
+    stop.collect_stopped(|_| {
+        stop.run_on_parked(PARTS, &|index| {
+            runs[index].fetch_add(1, Ordering::Relaxed);
+            if std::thread::current().id() == collector {
+                // The collector's share waits until a parked thread has
+                // taken one: they were woken for the shares left.
+                while by_parked.load(Ordering::Acquire) == 0 {
+                    std::thread::yield_now();
+                }
+            } else {
+                by_parked.fetch_add(1, Ordering::Release);
+            }
+        });
+    });
+    release.store(true, Ordering::Release);
+    for worker in workers {
+        worker.join().expect("worker left the stop");
+    }
+    let runs: Vec<usize> = runs
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .collect();
+    assert_eq!(runs, vec![1; PARTS], "each share runs once");
+    let by_parked = by_parked.load(Ordering::Relaxed);
+    assert!(
+        (1..PARTS).contains(&by_parked),
+        "parked threads ran {by_parked} of {PARTS} shares"
+    );
+}
+
+/// A share's panic on a parked thread reaches the collector once every
+/// share has returned, and the parked threads still resume.
+#[test]
+fn a_share_panic_on_a_parked_thread_reaches_the_collector() {
+    let stop = Arc::new(StopWorld::new());
+    let ready = Arc::new(Barrier::new(2));
+    let release = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (stop, ready, release) = (Arc::clone(&stop), Arc::clone(&ready), Arc::clone(&release));
+        std::thread::spawn(move || {
+            stop.enter_parked(Vec::new());
+            stop.resume();
+            ready.wait();
+            while !release.load(Ordering::Acquire) {
+                stop.safepoint(Vec::new);
+            }
+            stop.leave();
+        })
+    };
+    ready.wait();
+    let collector = std::thread::current().id();
+    let finished = AtomicUsize::new(0);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stop.collect_stopped(|_| {
+            stop.run_on_parked(2, &|_| {
+                if std::thread::current().id() == collector {
+                    // Hold the collector's share until the other one ran.
+                    while finished.load(Ordering::Acquire) == 0 {
+                        std::thread::yield_now();
+                    }
+                } else {
+                    finished.store(1, Ordering::Release);
+                    panic!("share on a parked thread");
+                }
+            });
+        });
+    }));
+    release.store(true, Ordering::Release);
+    worker.join().expect("the parked thread resumed");
+    let panic = caught.expect_err("the share's panic reached the collector");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"share on a parked thread")
+    );
+    assert!(!ASYNC_ATTENTION.is_raised(AsyncSource::StopRequest));
+}
+
 #[test]
 fn a_collection_stops_a_thread_running_detached() {
     let mut ev = parallel();
