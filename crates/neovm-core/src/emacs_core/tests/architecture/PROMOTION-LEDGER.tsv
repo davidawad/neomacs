@@ -1354,3 +1354,4 @@ AttachedScope	struct	(new)	crates/neovm-value/src/detached.rs:202	detached	share
 AttachedScope::enter	method	(new)	crates/neovm-value/src/detached.rs:208	detached	shared-heap S3 detached-thread gate (feature-gated): signed exact-caller row: VM Bcons and the JIT rest list
 with_attached	fn	(new fn)	crates/neovm-value/src/detached.rs:234	detached	shared-heap S3 detached-thread gate (feature-gated): signed exact-caller row: with_tagged_heap gate
 detached	mod	(new)	crates/neovm-value/src/lib.rs:14	crate root	shared-heap S3 detached-thread gate (feature-gated): the evaluator reaches the gate module
+TaggedHeap::sweep_in_stop_on	method	(new)	crates/neovm-value/src/tagged/gc/incremental.rs:474	tagged::gc::incremental	shared-heap stop sweep (feature-gated): signed exact-caller row: world::parallel_gc collect_with_world_stopped
