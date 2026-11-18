@@ -44,6 +44,11 @@ pub(crate) struct ParallelStats {
     pub(crate) stop_wait_ns: u64,
     /// The longest stop, from request to resume.
     pub(crate) stop_max_ns: u64,
+    /// Parks of a collection's requester while detached threads still ran:
+    /// each puts the Baton back and attaches again, so `attach_count`
+    /// includes them. Their number follows how long the threads took to
+    /// reach a safe point, not the work they did.
+    pub(crate) requester_parks: u64,
 }
 
 /// Where the Baton is, under the lock.
@@ -265,6 +270,7 @@ impl BatonLock {
             attach_by_blv: load(&self.attach_by[3]),
             stop_wait_ns: stop.stop_wait_ns,
             stop_max_ns: stop.stop_max_ns,
+            requester_parks: stop.requester_parks,
         }
     }
 

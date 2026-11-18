@@ -195,6 +195,7 @@ fn interpreted_loop_attaches(ev: &mut Context, iterations: i64) -> ParallelStats
         attach_by_alloc: after.attach_by_alloc - before.attach_by_alloc,
         attach_by_intern: after.attach_by_intern - before.attach_by_intern,
         attach_by_blv: after.attach_by_blv - before.attach_by_blv,
+        requester_parks: after.requester_parks - before.requester_parks,
         ..after
     }
 }
@@ -220,13 +221,17 @@ fn an_interpreted_dotimes_loop_attaches_a_constant_number_of_times() {
     println!("attaches for 2 x 1000 iterations: {small:?}");
     println!("attaches for 2 x 10000 iterations: {large:?}");
     // Thread start, join and end attach a fixed number of times; one
-    // attach per iteration would be at least 20000 here.
+    // attach per iteration would be at least 20000 here. A collection's
+    // requester that waits for the threads to reach a safe point attaches
+    // once per park, as many times as the wait lasts: those attaches count
+    // how slow the build is, not the loop's work, and are left out.
+    let work = |stats: &ParallelStats| stats.attach_count - stats.requester_parks;
     assert!(
-        large.attach_count < 64,
+        work(&large) < 64,
         "the interpreted loop attaches per iteration: {large:?}"
     );
     assert!(
-        large.attach_count <= small.attach_count + 16,
+        work(&large) <= work(&small) + 16,
         "attaches grow with the iteration count: {small:?} then {large:?}"
     );
 }
@@ -655,6 +660,7 @@ fn stats_delta(before: &ParallelStats, after: &ParallelStats) -> ParallelStats {
         attach_by_blv: after.attach_by_blv - before.attach_by_blv,
         stop_wait_ns: after.stop_wait_ns - before.stop_wait_ns,
         stop_max_ns: after.stop_max_ns.max(before.stop_max_ns),
+        requester_parks: after.requester_parks - before.requester_parks,
     }
 }
 

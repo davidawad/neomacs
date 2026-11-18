@@ -108,6 +108,9 @@ pub(crate) struct StopCounters {
     pub(crate) collections: u64,
     pub(crate) stop_wait_ns: u64,
     pub(crate) stop_max_ns: u64,
+    /// Parks of a requester waiting for running threads, each one detach
+    /// and one attach of the Baton.
+    pub(crate) requester_parks: u64,
 }
 
 /// The rendezvous of a Parallel World's collections, kept beside the Baton
@@ -120,6 +123,7 @@ pub(crate) struct StopWorld {
     collections: AtomicU64,
     stop_wait_ns: AtomicU64,
     stop_max_ns: AtomicU64,
+    requester_parks: AtomicU64,
 }
 
 fn elapsed_ns(since: Instant) -> u64 {
@@ -146,6 +150,7 @@ impl StopWorld {
             collections: AtomicU64::new(0),
             stop_wait_ns: AtomicU64::new(0),
             stop_max_ns: AtomicU64::new(0),
+            requester_parks: AtomicU64::new(0),
         }
     }
 
@@ -168,7 +173,14 @@ impl StopWorld {
             collections: load(&self.collections),
             stop_wait_ns: load(&self.stop_wait_ns),
             stop_max_ns: load(&self.stop_max_ns),
+            requester_parks: load(&self.requester_parks),
         }
+    }
+
+    /// A requester parked once while threads still ran
+    /// ([`Context::collect_with_world_stopped`]).
+    fn requester_parked(&self) {
+        self.requester_parks.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The calling thread, holding the Baton, is about to run detached: it
@@ -456,10 +468,11 @@ impl Context {
                     let wait_end = Instant::now() + STOP_POLL;
                     let parked = self.green_park(Wait::Select { wait_end });
                     self.gc_driver_active = driver;
-                    if parked.is_err() {
+                    match parked {
+                        Ok(()) => stop.requester_parked(),
                         // The park refused before the Baton moved: wait for
                         // the stop in place, as a bare requester does.
-                        stop.wait_running_in_place();
+                        Err(_) => stop.wait_running_in_place(),
                     }
                     if stop.counters().collections != seen {
                         return;
