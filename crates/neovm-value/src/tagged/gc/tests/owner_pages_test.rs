@@ -511,3 +511,60 @@ fn measure_owner_allocation_one_owner_versus_eight() {
         );
     }
 }
+
+/// One owner allocates N conses and N floats, all garbage (the list is
+/// dropped every 64 cells), and returns the base of every cons block and
+/// float page it took them from.
+fn garbage_bases(heap: &TestHeap, states: &mut [Box<OwnerAllocState>], n: usize) -> Vec<usize> {
+    let mut bases = detached_section(heap, states, |_| {
+        let mut bases = std::collections::BTreeSet::new();
+        let mut list = Value::NIL;
+        for i in 0..n {
+            list = if i % 64 == 0 {
+                Value::NIL
+            } else {
+                Value::cons(Value::fixnum(i as i64), list)
+            };
+            if let Some(cell) = list.as_cons_ptr() {
+                bases.insert(ConsBlock::block_base_for_ptr(cell));
+            }
+            let float = Value::make_float(i as f64).as_float_ptr().expect("a float");
+            bases.insert(float as usize & !(OBJECT_PAGE_ALIGN - 1));
+        }
+        bases
+    });
+    bases.pop().expect("one owner").into_iter().collect()
+}
+
+/// After a collection that empties the cons blocks and float pages an owner
+/// carved, the owner's next refills carve that swept storage again instead
+/// of asking the allocator for fresh blocks and pages.
+#[test]
+fn an_owners_refills_after_a_collection_reuse_the_swept_blocks_and_pages() {
+    crate::test_utils::init_test_tracing();
+    const BLOCKS: usize = 4;
+    let mut heap = TestHeap::new();
+    heap.install();
+    let n = BLOCKS * CONS_BLOCK_SIZE.max(ObjectPage::<FloatObj>::SLOTS);
+    let mut states = vec![heap.new_owner_alloc_state()];
+    let first = garbage_bases(&heap, &mut states, n);
+    // Everything the owner allocated is garbage: the sweep empties its
+    // blocks and pages.
+    heap.collect_exact(std::iter::empty());
+    reopen_owner_regions(&mut states[0]);
+    let fresh_pages = <FloatObj as PagedObject>::live_page_counter().load(Ordering::Relaxed);
+    let second = garbage_bases(&heap, &mut states, n);
+    let fresh_pages =
+        <FloatObj as PagedObject>::live_page_counter().load(Ordering::Relaxed) - fresh_pages;
+    assert_eq!(
+        fresh_pages, 0,
+        "the second round took {fresh_pages} float pages from the allocator"
+    );
+    let unseen: Vec<_> = second.iter().filter(|base| !first.contains(base)).collect();
+    assert!(
+        unseen.is_empty(),
+        "the second round carved {} of {} blocks and pages the first had not: {unseen:x?}",
+        unseen.len(),
+        second.len()
+    );
+}

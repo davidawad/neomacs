@@ -1275,7 +1275,9 @@ impl TaggedHeap {
                     super::young_registry::StoppedYoungLogs::new(_satb_layout_reserve, proof)
                         .expect("eager sweep returned every young-only loan")
                 });
-                cons_blocks.retain_mut(|block| {
+                // Decide each block in place; an empty one leaves the vector
+                // with its storage, for `recycle_released`.
+                let mut keep = |block: &mut ConsBlock| {
                     let mut head = std::ptr::null_mut();
                     let live = if GENERATIONAL {
                         block.sweep_generational(&mut head)
@@ -1332,16 +1334,19 @@ impl TaggedHeap {
                         new_live += live;
                         true
                     }
-                });
+                };
+                cons_blocks
+                    .extract_if(.., |block| !keep(block))
+                    .collect::<Vec<_>>()
             };
-        if GENERATIONAL {
+        let emptied = if GENERATIONAL {
             // SAFETY: the eager collector retains the existing closed extent.
             unsafe { scan_contract::SingleMutatorWorld::from_heap(self) }
                 .with_stopped_heap(|heap, proof| sweep_blocks(heap, Some(proof)))
-                .expect("eager sweep requires every young-only loan returned");
+                .expect("eager sweep requires every young-only loan returned")
         } else {
-            sweep_blocks(self, None);
-        }
+            sweep_blocks(self, None)
+        };
 
         if released > 0 {
             // Dropping blocks shifts every later index, so the base-address
@@ -1365,6 +1370,7 @@ impl TaggedHeap {
             }
             self.rebuild_card_slot_blocks();
         }
+        self.recycle_released(emptied);
 
         if GENERATIONAL {
             let _ = self.cons_allocator.take_completed_sweep_freed();
@@ -1482,8 +1488,10 @@ impl TaggedHeap {
             })
             .expect("candidate release requires every young-only loan returned");
         let old_len = self.cons_blocks.len();
-        self.cons_blocks
-            .retain(|block| !empty.contains(&ConsBlockBase::of(block)));
+        let released: Vec<ConsBlock> = self
+            .cons_blocks
+            .extract_if(.., |block| empty.contains(&ConsBlockBase::of(block)))
+            .collect();
         self.cons_block_index_by_base.clear();
         for (index, block) in self.cons_blocks.iter().enumerate() {
             let previous = self
@@ -1495,9 +1503,11 @@ impl TaggedHeap {
             }
         }
         self.rebuild_card_slot_blocks();
-        let released = old_len - self.cons_blocks.len();
-        debug_assert_eq!(released, empty.len());
-        released
+        debug_assert_eq!(released.len(), empty.len());
+        debug_assert_eq!(old_len - self.cons_blocks.len(), released.len());
+        let count = released.len();
+        self.recycle_released(released);
+        count
     }
 
     /// Drop ordinary cons blocks with no survivors and rebuild their
@@ -1562,13 +1572,16 @@ impl TaggedHeap {
             }
         }
         let gen_enabled = self.generational.enabled;
-        self.cons_blocks.retain(|block| {
-            if gen_enabled {
-                block.count_live_generational() != 0
-            } else {
-                block.count_marked() != 0
-            }
-        });
+        let released: Vec<ConsBlock> = self
+            .cons_blocks
+            .extract_if(.., |block| {
+                if gen_enabled {
+                    block.count_live_generational() == 0
+                } else {
+                    block.count_marked() == 0
+                }
+            })
+            .collect();
         self.cons_blocks.shrink_to_fit();
 
         self.cons_block_index_by_base =
@@ -1587,14 +1600,26 @@ impl TaggedHeap {
         }
         self.rebuild_card_slot_blocks();
 
-        old_len - self.cons_blocks.len()
+        debug_assert_eq!(old_len - self.cons_blocks.len(), released.len());
+        let count = released.len();
+        self.recycle_released(released);
+        count
+    }
+
+    /// Blocks a release removed: owner threads may carve their storage
+    /// again (`owner_pages.rs`); otherwise they are freed here.
+    fn recycle_released(&mut self, released: Vec<ConsBlock>) {
+        #[cfg(feature = "shared-heap")]
+        self.recycle_released_cons_blocks(released);
+        #[cfg(not(feature = "shared-heap"))]
+        drop(released);
     }
 
     /// Release every completely empty young arena page after a full sweep.
     /// Per-class indices and partial chains are rebuilt inside each arena.
     pub(super) fn release_empty_object_pages(&mut self) -> usize {
         debug_assert!(!self.alloc_regions_open(), "releasing pages under a region");
-        self.float_arena.release_empty_pages()
+        let released = self.float_arena.release_empty_pages()
             + self.string_arena.release_empty_pages()
             + self.vector_arena.release_empty_pages()
             + self.bytecode_arena.release_empty_pages()
@@ -1603,7 +1628,11 @@ impl TaggedHeap {
             + self.record_arena.release_empty_pages()
             + self.symbol_with_pos_arena.release_empty_pages()
             + self.marker_arena.release_empty_pages()
-            + self.bignum_arena.release_empty_pages()
+            + self.bignum_arena.release_empty_pages();
+        // Owner threads carve released pages' storage again.
+        #[cfg(feature = "shared-heap")]
+        self.recycle_spare_pages();
+        released
     }
 
     /// Sweep non-cons objects: walk intrusive list, free unmarked, rebuild list.
