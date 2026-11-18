@@ -497,17 +497,38 @@ impl LeafWitness {
             bc_buf: ctx.bc_buf.len(),
             depth: ctx.depth,
             function_epoch: ctx.obarray.function_epoch(),
-            buffer: ctx.edit.buffers.current_buffer().map(|buf| {
-                (
-                    buf.id(),
-                    buf.point_char_pos(),
-                    buf.point_min_char_pos(),
-                    buf.point_max_char_pos(),
-                    buf.modified_tick(),
-                )
-            }),
+            buffer: Self::buffer(ctx),
             allocated: Self::allocated(ctx),
         }
+    }
+
+    /// The current buffer's identity, point, narrowing and modification
+    /// tick; none on a Parallel World's detached thread, as for
+    /// [`Self::allocated`]: its current buffer is shared with its peers, and
+    /// reading the tick borrows the text's storage, which they borrow at
+    /// the same time.
+    fn buffer(
+        ctx: &Context,
+    ) -> Option<(
+        neovm_edit::buffer::BufferId,
+        neovm_edit::buffer::CharPos0,
+        neovm_edit::buffer::CharPos0,
+        neovm_edit::buffer::CharPos0,
+        i64,
+    )> {
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::detached::is_detached() {
+            return None;
+        }
+        ctx.edit.buffers.current_buffer().map(|buf| {
+            (
+                buf.id(),
+                buf.point_char_pos(),
+                buf.point_min_char_pos(),
+                buf.point_max_char_pos(),
+                buf.modified_tick(),
+            )
+        })
     }
 
     /// The heap's allocation count; 0 on a Parallel World's detached
