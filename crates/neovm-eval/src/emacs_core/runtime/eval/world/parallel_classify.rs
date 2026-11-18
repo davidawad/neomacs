@@ -21,6 +21,7 @@ use crate::emacs_core::subr::effect_schema::{
 use neovm_value::detached::{AttachReason, DetachedGate};
 use neovm_value::error::Flow;
 use neovm_value::intern::SymId;
+use neovm_value::quit::{ASYNC_ATTENTION, AsyncSource};
 use neovm_value::value::Value;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -477,31 +478,38 @@ impl Context {
         neovm_value::detached::resume_detached(attach.gate);
     }
 
-    /// Whether a GC safe point must not collect now: a detached thread
-    /// never does, and while any thread runs detached a due collection is
-    /// deferred (slice S3's stage-2 limitation: their stacks hold roots no
-    /// collector can see until slice S4).
+    /// A GC safe point's answer in a Parallel World when it is not the
+    /// ordinary one. A detached thread reads no heap state here: it goes to
+    /// the collection entry ([`Self::parallel_defers_collection`]) to park
+    /// when a stop is requested. An attached thread joins a requested stop;
+    /// while any thread runs detached it defers a due collection (slice
+    /// S3's limitation).
     #[inline]
-    pub(crate) fn parallel_defers_safe_point(&self) -> bool {
+    pub(crate) fn parallel_safe_point(&self) -> Option<bool> {
+        let stop_requested = ASYNC_ATTENTION.is_raised(AsyncSource::StopRequest);
         if neovm_value::detached::is_detached() {
-            return true;
+            return Some(stop_requested);
         }
-        let Some(lock) = self.parallel_lock() else {
-            return false;
-        };
+        let lock = self.parallel_lock()?;
+        if stop_requested && self.gc_inhibit_depth == 0 {
+            return Some(true);
+        }
         if Self::detached_peers(lock) == 0 {
-            return false;
+            return None;
         }
         if self.tagged_heap.should_collect() {
             lock.defer_collection(self.tagged_heap.bytes_since_gc() as u64);
         }
-        true
+        Some(false)
     }
 
-    /// [`Self::parallel_defers_safe_point`] at a collection's entry; a
-    /// collection that runs after a deferral is counted.
-    pub(crate) fn parallel_defers_collection(&self) -> bool {
+    /// At a collection's entry: a detached thread parks for a requested
+    /// stop instead ([`Self::parallel_detached_collect`]); an attached one
+    /// defers while any thread runs detached. A collection that runs after
+    /// a deferral is counted.
+    pub(crate) fn parallel_defers_collection(&mut self, force_complete: bool) -> bool {
         if neovm_value::detached::is_detached() {
+            self.parallel_detached_collect(force_complete);
             return true;
         }
         let Some(lock) = self.parallel_lock() else {

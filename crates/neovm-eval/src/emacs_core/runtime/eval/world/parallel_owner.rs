@@ -279,14 +279,18 @@ impl BatonLock {
         self.attach_by[index].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A Lisp thread's body starts running detached, or detaches again.
+    /// A Lisp thread's body starts running detached, or detaches again: it
+    /// runs until it parks for a stop or attaches ([`StopWorld`]). The
+    /// caller holds the Baton.
     pub(crate) fn body_detached(&self) {
         self.detached_threads.fetch_add(1, Ordering::AcqRel);
+        self.stop.enter_running();
     }
 
     /// A Lisp thread's detached body attached, for World work or its end.
     pub(crate) fn body_attached(&self) {
         self.detached_threads.fetch_sub(1, Ordering::AcqRel);
+        self.stop.leave();
     }
 
     /// How many Lisp threads run their detached body without the Baton.

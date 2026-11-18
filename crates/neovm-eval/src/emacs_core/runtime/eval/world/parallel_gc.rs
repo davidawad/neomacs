@@ -11,33 +11,41 @@
 //!   World's parked registry before it blocked. It is stopped already and the
 //!   collector traces that registry.
 //! - a thread running detached (S3's detached execution, and this slice's
-//!   test-only detached section) is counted in [`StopWorld`] as running. The
-//!   requester raises [`AsyncSource::StopRequest`] in `ASYNC_ATTENTION`, the
-//!   word every safe point tests, and waits until no thread is running. A
-//!   thread reaching its next safe point copies its roots into a root image
-//!   owned by the World's [`StopWorld`] and parks on its condition variable.
+//!   test-only detached section) is counted in [`StopWorld`] as running,
+//!   from the moment it puts the Baton back to run detached until it holds
+//!   the Baton again for World work; a heap access it attaches for keeps it
+//!   counted, since its Rust frames hold values no image names. The
+//!   requester raises [`AsyncSource::StopRequest`] in `ASYNC_ATTENTION` and
+//!   waits until no thread is running. A thread reaching its next exact
+//!   safe point (a collection point of the evaluator, the VM or compiled
+//!   code, where every value it holds is rooted in its Context) copies its
+//!   roots into a root image owned by the World's [`StopWorld`], closes its
+//!   allocation runs and parks on its condition variable.
 //!
 //! The requester waits WITHOUT the Baton: it parks as `sleep-for` does, for
 //! [`STOP_POLL`] at a time (Green's park publishes its roots and puts the
-//! Baton back), until no thread runs. A thread blocked attaching gets the
-//! Baton meanwhile; were the requester to wait holding the Baton, a running
-//! thread that needs it would wait for it forever. Any Baton holder that
-//! finds no thread running may collect for the stop, and a requester that
-//! finds a collection ran meanwhile does not collect again.
+//! Baton back), until no thread runs. A running thread blocked attaching
+//! (for a `World`-class primitive or a heap access) gets the Baton
+//! meanwhile, finishes that work and parks at its next safe point; were the
+//! requester to wait holding the Baton, that thread would wait for it
+//! forever. Any Baton holder that finds no thread running may collect for
+//! the stop, and a requester that finds a collection ran meanwhile does not
+//! collect again.
 //!
-//! The collector then runs with its own roots, the World's (parked
-//! registry, shared-root transport table, owner slabs), and every parked
-//! image, and finishes the cycle's sweep before the parked threads resume,
-//! so they never run in a cycle between its slices. It lowers the request
-//! and wakes everyone. A resumed thread re-installs its heap thread-locals
-//! before it touches the heap again, so its mirrors of collector state are
-//! current.
+//! The collector then runs with its own roots, the World's (parked registry,
+//! shared-root transport table, owner slabs), and every parked image, and
+//! finishes the cycle's sweep before the parked threads resume, so they
+//! never run in a cycle between its slices. It lowers the request and wakes
+//! everyone. A resumed thread re-installs its heap thread-locals, briefly
+//! attached, before it touches the heap again, so its mirrors of collector
+//! state are current.
 //!
 //! The stop's mutex and condition variable are the only synchronization
 //! this adds; every stop is counted (`safepoint_stops`, `collections`,
 //! `stop_wait_ns`, `stop_max_ns` in [`super::ParallelStats`]).
 
 use super::super::Context;
+use super::BatonLock;
 use crate::emacs_core::eval::green::Wait;
 use neovm_value::quit::{ASYNC_ATTENTION, AsyncSource};
 use neovm_value::tagged::gc::MarkPhase;
@@ -174,6 +182,19 @@ impl StopWorld {
         let me = std::thread::current().id();
         let previous = self.lock_state().images.insert(me, image);
         debug_assert!(previous.is_none(), "a thread runs one detached extent");
+    }
+
+    /// The calling thread, holding the Baton, puts it back to run detached.
+    /// It runs even while a stop is requested: it holds the Baton, so the
+    /// stop has not begun, and it parks at its next safe point.
+    pub(crate) fn enter_running(&self) {
+        self.lock_state().running += 1;
+    }
+
+    /// Whether a stop is requested or in progress (exact, unlike the
+    /// `ASYNC_ATTENTION` hint).
+    pub(crate) fn stop_pending(&self) -> bool {
+        self.lock_state().phase != Phase::Running
     }
 
     /// The calling thread, running detached, stops running: it publishes
@@ -429,6 +450,39 @@ impl Context {
             super::super::restore_scratch_gc_roots(saved);
         });
     }
+
+    /// `gc_collect_from_current_roots` on a thread running detached, at an
+    /// exact safe point (its caller rooted what it holds): park for the
+    /// stop in progress.
+    pub(crate) fn parallel_detached_collect(&mut self, _force_complete: bool) {
+        let Some(lock) = self.parallel_lock_shared() else {
+            return;
+        };
+        if lock.stop().stop_pending() {
+            self.parallel_park_for_stop(&lock);
+        }
+    }
+
+    /// Park this detached thread for the stop in progress: publish its roots,
+    /// close its allocation runs, and resume once the stop ends.
+    fn parallel_park_for_stop(&mut self, lock: &BatonLock) {
+        let stop = lock.stop();
+        let seen = stop.counters().collections;
+        let image = owner_image(self);
+        let Some(gate) = neovm_value::detached::suspend_detached() else {
+            return;
+        };
+        stop.park(image);
+        stop.resume();
+        if stop.counters().collections != seen {
+            // The collection changed heap state this thread mirrors; the
+            // mirrors are refreshed under the Baton, as at any install.
+            let baton = lock.attach().into_baton();
+            self.tagged_heap.install_tagged_heap();
+            lock.detach(baton);
+        }
+        neovm_value::detached::resume_detached(gate);
+    }
 }
 
 /// The integration point for a thread whose allocation tripped the
@@ -439,25 +493,10 @@ pub(crate) fn on_threshold_tripped(ctx: &mut Context) {
     request_collection(ctx);
 }
 
-/// Collect now, as the requester: the caller holds the Baton.
+/// Collect now, as the requester: the caller holds the Baton, or runs
+/// detached and requests the collection attached.
 pub(crate) fn request_collection(ctx: &mut Context) {
     ctx.gc_collect_from_current_roots();
-}
-
-/// `maybe_quit_slow`'s part: a stop is requested. A thread running detached
-/// Lisp parks here with its roots; the Baton holder (the requester itself,
-/// or a holder that saw a stale hint) has nothing to do.
-pub(crate) fn stop_safepoint(ctx: &mut Context) {
-    let Some(lock) = ctx.parallel_lock_shared() else {
-        return;
-    };
-    if lock.is_attached_here() {
-        return;
-    }
-    lock.stop().park(owner_image(ctx));
-    lock.stop().resume();
-    // The collector changed heap state this thread mirrors.
-    ctx.tagged_heap.install_tagged_heap();
 }
 
 #[cfg(test)]

@@ -1315,9 +1315,9 @@ impl Context {
     pub fn gc_collect_from_current_roots_impl(&mut self, force_complete: bool) {
         #[cfg(debug_assertions)]
         neovm_value::tagged::mutate::debug_assert_no_heap_mut_closure();
-        // A Parallel World collects only while no thread runs detached.
+        // A Parallel World's detached thread parks or requests instead.
         #[cfg(feature = "shared-heap")]
-        if self.parallel_defers_collection() {
+        if self.parallel_defers_collection(force_complete) {
             return;
         }
         // Collection also compacts undo state, materializes thread buffer
@@ -2298,10 +2298,10 @@ impl Context {
         #[cfg(debug_assertions)]
         neovm_value::tagged::mutate::debug_assert_no_heap_mut_closure();
         // A Parallel World's detached thread reads no heap state here, and
-        // no collection runs while one exists.
+        // any thread joins a requested stop.
         #[cfg(feature = "shared-heap")]
-        if self.parallel_defers_safe_point() {
-            return false;
+        if let Some(collect) = self.parallel_safe_point() {
+            return collect;
         }
         // The common answer, decided from plain fields without a call: no
         // collection is in flight, none is pending or forced, and the
@@ -2452,12 +2452,6 @@ impl Context {
     #[doc(hidden)]
     pub fn maybe_quit_slow(&mut self) -> Result<(), Flow> {
         crate::emacs_core::subr::leaf::debug_assert_no_leaf_active!("a quit poll");
-        // A Parallel World's collection asks detached threads to park here.
-        #[cfg(feature = "shared-heap")]
-        if neovm_value::quit::ASYNC_ATTENTION.is_raised(neovm_value::quit::AsyncSource::StopRequest)
-        {
-            super::world::parallel_gc::stop_safepoint(self);
-        }
         // GNU fatal_error_signal calls Fkill_emacs(signal-number, nil), even
         // with inhibit-quit bound. Hooks run on the Lisp owner, and Shutdown
         // unwinds to the ordinary host terminal/process cleanup boundary.
