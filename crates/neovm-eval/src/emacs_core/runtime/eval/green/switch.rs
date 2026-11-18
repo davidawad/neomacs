@@ -1387,6 +1387,14 @@ impl Context {
             | MarkPhase::StoppedMarking
             | MarkPhase::PublishingSweep => false,
         };
+        // A Parallel World collects only with every other thread stopped
+        // (`collect_with_world_stopped`), so an idle heap has nothing to
+        // drain, and threads running detached use it meanwhile: the drain's
+        // exclusive loan of it would race them.
+        #[cfg(feature = "shared-heap")]
+        let sweep_only = sweep_only
+            || (self.parallel_lock().is_some()
+                && matches!(self.tagged_heap.mark_phase(), MarkPhase::Idle));
         if sweep_only && !self.tagged_heap.gc_locks_poisoned() {
             // The Baton still excludes concurrent launch; no callback,
             // safepoint or handoff runs before the transport table closes the
