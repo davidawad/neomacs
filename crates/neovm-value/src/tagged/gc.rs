@@ -2896,7 +2896,6 @@ mod census_tests;
 #[cfg(test)]
 #[path = "gc/tests/chunk_map_test.rs"]
 mod chunk_map_tests;
-
 #[cfg(test)]
 #[path = "gc/tests/cons_alloc_test.rs"]
 mod cons_alloc_tests;
