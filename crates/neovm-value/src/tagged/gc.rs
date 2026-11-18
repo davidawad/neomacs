@@ -2896,6 +2896,7 @@ mod census_tests;
 #[cfg(test)]
 #[path = "gc/tests/chunk_map_test.rs"]
 mod chunk_map_tests;
+
 #[cfg(test)]
 #[path = "gc/tests/cons_alloc_test.rs"]
 mod cons_alloc_tests;
@@ -2916,6 +2917,10 @@ mod generational_verifier_tests;
 #[cfg(test)]
 #[path = "gc/tests/marker_arena_test.rs"]
 mod marker_arena_tests;
+/// A Parallel World's in-stop sweep leaves what the serial slices leave.
+#[cfg(all(test, feature = "shared-heap"))]
+#[path = "gc/tests/sweep_in_stop_test.rs"]
+mod sweep_in_stop_tests;
 /// Record and closure slot stores are atomic: race-free against an atomic
 /// reader, same semantics, same barrier through a concurrent mark.
 #[cfg(test)]
