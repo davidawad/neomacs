@@ -1627,3 +1627,7 @@ mod parallel_owner_tests;
 #[cfg(all(test, feature = "shared-heap"))]
 #[path = "world/tests/parallel_detached_test.rs"]
 mod parallel_detached_tests;
+
+#[cfg(all(test, feature = "shared-heap"))]
+#[path = "world/tests/parallel_concurrent_gc_test.rs"]
+mod parallel_concurrent_gc_tests;
