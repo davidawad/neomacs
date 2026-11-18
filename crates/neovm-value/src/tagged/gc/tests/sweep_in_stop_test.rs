@@ -62,7 +62,14 @@ fn the_in_stop_sweep_on_four_threads_leaves_what_the_slices_leave() {
     serial.finish_incremental_sweep_now();
 
     let (mut spread, live, dead) = heap_in_its_sweep();
-    spread.sweep_in_stop_on(NonZeroUsize::new(4).unwrap());
+    spread.sweep_in_stop_on(NonZeroUsize::new(4).unwrap(), |parts, share| {
+        std::thread::scope(|threads| {
+            for index in 1..parts {
+                threads.spawn(move || share(index));
+            }
+            share(0);
+        });
+    });
     assert!(
         spread.sweep_noncons_pending.is_null()
             && spread.sweep_float_page_cursor == spread.sweep_float_page_end

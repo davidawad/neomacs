@@ -497,7 +497,14 @@ impl Context {
                 // The parked threads' CPUs sweep what owner threads
                 // allocate the most of; the slices below finish the rest.
                 let workers = std::num::NonZeroUsize::MIN.saturating_add(stop.parked());
-                self.tagged_heap.sweep_in_stop_on(workers);
+                self.tagged_heap.sweep_in_stop_on(workers, |parts, share| {
+                    std::thread::scope(|threads| {
+                        for index in 1..parts {
+                            threads.spawn(move || share(index));
+                        }
+                        share(0);
+                    });
+                });
                 while matches!(
                     self.tagged_heap.mark_phase(),
                     MarkPhase::Sweeping | MarkPhase::StoppedMarking

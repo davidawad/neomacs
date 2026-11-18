@@ -456,7 +456,7 @@ impl TaggedHeap {
         done
     }
 
-    /// Sweep, on up to WORKERS threads at once (the threads a Parallel
+    /// Sweep, in up to WORKERS shares at once (one per thread a Parallel
     /// World's stop leaves idle), what owner threads allocate the most of:
     /// every float, string, vector and bignum page the deferred sweep has
     /// left, and the young list's dead boxed strings, floats, vectors and
@@ -465,9 +465,17 @@ impl TaggedHeap {
     /// it; the slices that finish the sweep find the pages and the list
     /// done. The caller holds the world stopped, as for a slice; with a
     /// collection observation active everything stays for the slices.
+    ///
+    /// RUN_SHARES `(parts, share)` calls `share(i)` once for each `i` in
+    /// `0..parts`, on whichever threads it has (the stop's parked threads),
+    /// and returns once every call has returned.
     #[cfg(feature = "shared-heap")]
     #[doc(hidden)]
-    pub fn sweep_in_stop_on(&mut self, workers: std::num::NonZeroUsize) {
+    pub fn sweep_in_stop_on(
+        &mut self,
+        workers: std::num::NonZeroUsize,
+        run_shares: impl FnOnce(usize, &(dyn Fn(usize) + Sync)),
+    ) {
         assert!(
             !self.concurrent_mark_running,
             "sweeping requires an explicit successful marker finish"
@@ -500,7 +508,7 @@ impl TaggedHeap {
         // the work worth spreading. Float and bignum pages only scan their
         // bits for slots with nothing (or a few limbs) to free; split across
         // threads they cost more than on one (the page has to come from
-        // another core's cache to each), so the calling thread keeps them.
+        // another core's cache to each), so the first share keeps them.
         let pages =
             ranges[1].1.saturating_sub(ranges[1].0) + ranges[2].1.saturating_sub(ranges[2].0);
         let parts = workers
@@ -569,20 +577,9 @@ impl TaggedHeap {
                 sweep!(bignums, false),
             )
         };
-        let swept: Vec<_> = std::thread::scope(|threads| {
-            let mut shares = shares.into_iter();
-            let mine = shares.next().expect("at least one share");
-            let spawned: Vec<_> = shares
-                .map(|share| threads.spawn(move || sweep_share(share)))
-                .collect();
-            let mut swept = vec![sweep_share(mine)];
-            swept.extend(spawned.into_iter().map(|thread| {
-                thread
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            }));
-            swept
-        });
+        let slots = ShareSlots::new(shares);
+        run_shares(parts, &|index| slots.run(index, &sweep_share));
+        let swept = slots.into_results();
         let mut float_runs = Vec::new();
         let mut string_runs = Vec::new();
         let mut vector_runs = Vec::new();
@@ -3009,6 +3006,76 @@ impl TaggedHeap {
                 );
             }
         }
+    }
+}
+
+/// The shares of [`TaggedHeap::sweep_in_stop_on`]: each one's input and,
+/// once it ran, its result, for whichever thread runs it.
+#[cfg(feature = "shared-heap")]
+struct ShareSlots<In, Out> {
+    slots: Vec<ShareSlot<In, Out>>,
+}
+
+#[cfg(feature = "shared-heap")]
+struct ShareSlot<In, Out> {
+    /// Set by the one call that runs this share.
+    claimed: std::sync::atomic::AtomicBool,
+    /// Set, with release, once `out` holds the result.
+    done: std::sync::atomic::AtomicBool,
+    input: std::cell::UnsafeCell<Option<In>>,
+    out: std::cell::UnsafeCell<Option<Out>>,
+}
+
+// SAFETY: a slot's cells are touched only by the call that won its `claimed`
+// flag, and `out` after that call published it with `done` (release) and the
+// reader saw it (acquire), so no two threads touch a cell at once.
+#[cfg(feature = "shared-heap")]
+unsafe impl<In: Send, Out: Send> Sync for ShareSlots<In, Out> {}
+
+#[cfg(feature = "shared-heap")]
+impl<In, Out> ShareSlots<In, Out> {
+    fn new(inputs: Vec<In>) -> Self {
+        let slots = inputs
+            .into_iter()
+            .map(|input| ShareSlot {
+                claimed: std::sync::atomic::AtomicBool::new(false),
+                done: std::sync::atomic::AtomicBool::new(false),
+                input: std::cell::UnsafeCell::new(Some(input)),
+                out: std::cell::UnsafeCell::new(None),
+            })
+            .collect();
+        Self { slots }
+    }
+
+    /// Run share INDEX with WORK. Panics when it ran already.
+    fn run(&self, index: usize, work: impl FnOnce(In) -> Out) {
+        use std::sync::atomic::Ordering;
+        let slot = &self.slots[index];
+        assert!(
+            !slot.claimed.swap(true, Ordering::AcqRel),
+            "share {index} runs once"
+        );
+        // SAFETY: this call won `claimed`, so no other thread touches the
+        // cells until `done` publishes the result.
+        let input =
+            unsafe { (*slot.input.get()).take() }.expect("an unclaimed share has its input");
+        let out = work(input);
+        // SAFETY: as above.
+        unsafe { *slot.out.get() = Some(out) };
+        slot.done.store(true, Ordering::Release);
+    }
+
+    /// Every share's result, in share order. Panics when one did not run.
+    fn into_results(self) -> Vec<Out> {
+        use std::sync::atomic::Ordering;
+        self.slots
+            .into_iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                assert!(slot.done.load(Ordering::Acquire), "share {index} ran");
+                slot.out.into_inner().expect("a done share has its result")
+            })
+            .collect()
     }
 }
 
