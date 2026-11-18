@@ -342,9 +342,16 @@ pub(super) fn store_projected_runtime_binding(
         buffer_id: super::SavedBufferId::from_option(buffers.current_buffer_id()),
     }];
     let specpdl = if shadowed { &evidence[..] } else { specpdl };
-    let locus = obarray.with_revealed_projection(sym_id, |obarray| {
-        super::store_runtime_binding(obarray, buffers, None, specpdl, sym_id, checked)
-    });
+    let locus = if obarray
+        .thread_projection_of(sym_id)
+        .is_some_and(|projection| projection.arm() == CanonicalArm::Plain)
+    {
+        store_projected_plain(obarray, buffers, sym_id, checked.value())
+    } else {
+        obarray.with_revealed_projection(sym_id, |obarray| {
+            super::store_runtime_binding(obarray, buffers, None, specpdl, sym_id, checked)
+        })
+    };
     // A `set` that made the local again gives a binding of this owner whose
     // local was killed its storage back, as `make-local-variable` does
     // (`Context::owner_local_made`).
@@ -364,4 +371,30 @@ pub(super) fn store_projected_runtime_binding(
         cell.set_cdr(hidden.get());
     }
     locus
+}
+
+/// The canonical store of a projected variable whose logical arm is plain:
+/// what [`super::store_runtime_binding`] does to the revealed `Plainval`
+/// cell, without revealing it. In a Parallel World threads running detached
+/// read the cell meanwhile, so it must stay as they read it; the value lands
+/// in the projection's atomic plain word.
+fn store_projected_plain(
+    obarray: &mut neovm_value::symbol::Obarray,
+    buffers: &mut neovm_edit::buffer::BufferManager,
+    sym_id: SymId,
+    value: Value,
+) -> Option<neovm_edit::buffer::BufferId> {
+    if obarray
+        .get_by_id(sym_id)
+        .is_some_and(|symbol| symbol.is_interned_global())
+        && let Some(current_id) = buffers.current_buffer_id()
+        && buffers
+            .get(current_id)
+            .is_some_and(|buf| buf.has_buffer_local_by_sym_id_gated(sym_id, false))
+    {
+        let _ = buffers.set_buffer_local_property_by_sym_id(current_id, sym_id, value);
+        return Some(current_id);
+    }
+    obarray.set_canonical_value(neovm_value::symbol::CanonicalAccess::STORAGE, sym_id, value);
+    None
 }
