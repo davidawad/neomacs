@@ -3230,6 +3230,15 @@ pub(crate) fn run_armed_leaf(
 /// exists: the leaf just ran); Deferred/NotCompilable/inlining leaves leave
 /// the slot empty.
 pub(crate) fn arm_leaf_slot(ctx: *mut Context, func: &ByteCodeFunction) {
+    // The slot is in the function object every OS thread of a Parallel World
+    // shares, and the epoch is the process's: armed with this thread's leaf,
+    // it would hand that leaf to every other thread, though the leaf lives
+    // in this thread's cache and this thread's exit frees it. Each thread
+    // enters its leaf through its own cache instead.
+    #[cfg(feature = "shared-heap")]
+    if crate::emacs_core::eval::parallel_world_made() {
+        return;
+    }
     let rt = func.jit_runtime();
     let epoch = leaf_slot_epoch();
     if rt.armed_leaf_word(epoch).is_some() {

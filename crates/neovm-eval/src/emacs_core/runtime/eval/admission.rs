@@ -72,7 +72,8 @@ pub(crate) enum ThreadingMode {
 /// World's threads run JIT-compiled code without the Baton, so from then on
 /// no compile allocates inline (`jit_inline_alloc_on`): an inline
 /// allocation bumps the heap's one keeper cursor, which those threads would
-/// all share.
+/// all share. Nor is a function's leaf slot armed (`jit::cache::arm_leaf_slot`):
+/// the slot is shared, the leaf one thread's.
 #[cfg(feature = "shared-heap")]
 static PARALLEL_WORLD_MADE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -90,6 +91,10 @@ impl ThreadingMode {
         #[cfg(feature = "shared-heap")]
         if self == Self::Parallel {
             PARALLEL_WORLD_MADE.store(true, std::sync::atomic::Ordering::Relaxed);
+            // No leaf slot is armed from now on (`jit::cache::arm_leaf_slot`),
+            // and one armed before reads as empty.
+            #[cfg(feature = "jit")]
+            crate::emacs_core::jit::cache::invalidate_green_leaf_slots();
         }
         self
     }

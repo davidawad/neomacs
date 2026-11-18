@@ -279,3 +279,36 @@ fn rest_callees_take_the_direct_entry_with_a_consed_list() {
         );
     }
 }
+
+/// The slot is in the function object every OS thread of a Parallel World
+/// shares, while the leaf it would hold is in this thread's own cache: a
+/// thread probing it could run another thread's leaf, which that thread's
+/// exit frees. Once the process made a Parallel World nothing is armed, and
+/// each thread enters its leaf through its own cache.
+#[cfg(feature = "shared-heap")]
+#[test]
+fn a_parallel_world_arms_no_leaf_slot() {
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
+    crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
+    let mut ev = crate::test_utils::with_legacy_gc(|| {
+        Context::new_with_threading(
+            crate::emacs_core::eval::ThreadingMode::Parallel,
+            crate::test_utils::unit_runtime(),
+        )
+    });
+    let (sym, callee) = bind_fn(&mut ev, "c1-leaf-slot-parallel", adder());
+    let caller = caller_of(sym, 20, 22);
+    assert_eq!(call0(&mut ev, caller), Value::make_int(42));
+    assert_eq!(
+        cache::cache_entry_kind_for_test(compiled_id(callee)),
+        "compiled",
+        "premise: the leaf compiled"
+    );
+    assert!(!slot_armed(callee), "the tier-up entry arms nothing");
+    cache::arm_leaf_slot(&mut ev as *mut Context, callee.get_bytecode_data().unwrap());
+    assert!(!slot_armed(callee), "nor does an explicit arm");
+    for _ in 0..8 {
+        assert_eq!(call0(&mut ev, caller), Value::make_int(42), "cache entry");
+    }
+}
