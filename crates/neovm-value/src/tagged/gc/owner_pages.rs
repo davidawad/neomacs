@@ -581,6 +581,16 @@ pub(crate) struct OwnerPages {
     /// keeper's pacing reads them ([`TaggedHeap::bytes_since_gc`]) between
     /// adoptions. Written under the cold mutex.
     pending_bytes: AtomicUsize,
+    /// The bytes owners' closed runs charged that the owners still hold
+    /// (not handed to the cold state): each owner adds its own at its
+    /// refills and takes them back when it closes. With
+    /// [`Self::pending_bytes`], what owners allocated since the last
+    /// adoption.
+    held_bytes: AtomicUsize,
+    /// Owners that hold some of [`Self::held_bytes`]: those that allocated
+    /// since they last closed, which every owner does when it parks for a
+    /// collection.
+    holders: AtomicUsize,
     /// How many spare storages of each [`OwnerClass`] the cold state
     /// holds: an owner takes the cold mutex for them only when there are
     /// some. Written under the cold mutex.
@@ -597,6 +607,8 @@ impl OwnerPages {
             lock_wait_ns: AtomicU64::new(0),
             adoptions: AtomicU64::new(0),
             pending_bytes: AtomicUsize::new(0),
+            held_bytes: AtomicUsize::new(0),
+            holders: AtomicUsize::new(0),
             spare: Default::default(),
         }
     }
@@ -670,6 +682,9 @@ pub(crate) struct OwnerAllocState {
     local: AllocatorCold,
     /// Refills since the last close.
     refills: u64,
+    /// The bytes of `local`'s charges this owner added to the shared
+    /// [`OwnerPages::held_bytes`].
+    held: usize,
     cons: OwnerRun,
     float: OwnerRun,
     string: OwnerRun,
@@ -683,6 +698,12 @@ pub(crate) struct OwnerAllocState {
     /// the state was made: permanent runtime roots, copied, never traced from
     /// here. Zero when the heap had none.
     canonical_empty_bits: [usize; 2],
+}
+
+impl Drop for OwnerAllocState {
+    fn drop(&mut self) {
+        self.release_held();
+    }
 }
 
 // SAFETY: the state is built by the keeper and then used by exactly one owner
@@ -728,6 +749,15 @@ impl OwnerAllocState {
         }
     }
 
+    /// Our closed runs' bytes leave the shared count of what owners hold.
+    fn release_held(&mut self) {
+        let held = std::mem::take(&mut self.held);
+        if held > 0 {
+            self.shared.held_bytes.fetch_sub(held, Ordering::Relaxed);
+            self.shared.holders.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     /// Hand our charges and boxed objects to our pending state.
     fn flush(&mut self) {
         self.local.charges.add(&std::mem::take(&mut self.charges));
@@ -739,6 +769,12 @@ impl OwnerAllocState {
     /// stamps. When what owners allocated since the last adoption makes a
     /// collection due, the detached thread's World defers one
     /// ([`crate::detached::defer_collection`]).
+    ///
+    /// Due means a threshold for every owner that allocated since it last
+    /// closed: each allocating owner allocates as much between two
+    /// collections as a thread alone would. Owners resume from a collection
+    /// one after another, so the first to reach a threshold of its own
+    /// would leave the others a fraction of theirs.
     #[cold]
     #[inline(never)]
     fn refill(&mut self, class: OwnerClass, heap: *const TaggedHeap) {
@@ -763,9 +799,16 @@ impl OwnerAllocState {
         }
         let run = self.local.carve(class, self.sizes);
         self.refills += 1;
-        // What other owners handed over, and what we hold.
-        let pending = self.shared.pending_bytes() + self.local.charges.bytes;
-        if pending >= threshold {
+        // What owners handed over, and what each of them holds.
+        let added = self.local.charges.bytes - self.held;
+        if self.held == 0 && added > 0 {
+            self.shared.holders.fetch_add(1, Ordering::Relaxed);
+        }
+        self.held += added;
+        let held = self.shared.held_bytes.fetch_add(added, Ordering::Relaxed) + added;
+        let pending = self.shared.pending_bytes() + held;
+        let holders = self.shared.holders.load(Ordering::Relaxed).max(1);
+        if pending >= threshold.saturating_mul(holders) {
             crate::detached::defer_collection(pending as u64);
         }
         if class == OwnerClass::Float {
@@ -978,6 +1021,8 @@ pub(crate) fn close_owner_regions(state: &mut OwnerAllocState) {
     cold.absorb(&mut state.local);
     shared.publish_pending(&cold);
     shared.publish_spare(&cold);
+    // Counted in the cold state's charges now.
+    state.release_held();
 }
 
 /// Resume allocating after a collection. Runs reopen lazily: the next
@@ -1029,6 +1074,7 @@ impl TaggedHeap {
             sizes,
             local: AllocatorCold::new(),
             refills: 0,
+            held: 0,
             cons: OwnerRun::default(),
             float: OwnerRun::default(),
             string: OwnerRun::default(),

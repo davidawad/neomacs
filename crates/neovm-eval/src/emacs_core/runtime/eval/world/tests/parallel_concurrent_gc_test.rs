@@ -147,3 +147,70 @@ fn collections_during_detached_execution_keep_every_threads_data() {
     let after = stats_so_far(&ev);
     assert!(after.collections > before.collections, "{after:?}");
 }
+
+/// `(tpc-garbage N)`: cons N cells, each garbage once the next is made, and
+/// return the last one's car.
+const TPC_GARBAGE: &str = "(defalias 'tpc-garbage
+  (lambda (n)
+    (let ((i 0) (c nil))
+      (while (< i n)
+        (setq c (cons i nil))
+        (setq i (1+ i)))
+      (car c))))";
+
+/// `(tpc-slow-garbage N K)`: `tpc-garbage` with K loop steps after each
+/// cons, which slow its consing down.
+const TPC_SLOW_GARBAGE: &str = "(defalias 'tpc-slow-garbage
+  (lambda (n k)
+    (let ((i 0) (j 0) (c nil))
+      (while (< i n)
+        (setq c (cons i nil))
+        (setq j 0)
+        (while (< j k) (setq j (1+ j)))
+        (setq i (1+ i)))
+      (car c))))";
+
+/// Two detached threads cons garbage at once, one about four times as fast
+/// as the other and four times as much. Between two collections every
+/// owner that allocates allocates a threshold, as a thread alone does, so
+/// the pair runs about half the collections main runs consing the same
+/// alone. Paced on its own bytes, the fast owner would collect at each
+/// threshold of its own while the slow one had allocated a quarter of its
+/// own (owners resuming from a collection one after another start
+/// unevenly the same way), about four fifths of main's collections.
+#[test]
+fn owners_allocating_together_collect_once_per_threshold_each() {
+    let mut ev = parallel();
+    eval(&mut ev, TPC_GARBAGE);
+    eval(&mut ev, TPC_SLOW_GARBAGE);
+    assert_eq!(
+        eval(&mut ev, "(thread-join (make-thread (lambda () t)))"),
+        "t"
+    );
+    let alone: u64 = eval(
+        &mut ev,
+        "(let ((g gcs-done))
+           (tpc-garbage 1600000)
+           (tpc-slow-garbage 400000 4)
+           (- gcs-done g))",
+    )
+    .parse()
+    .expect("a count");
+    let before = stats_so_far(&ev);
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(let ((slow (make-thread (lambda () (tpc-slow-garbage 400000 4))))
+                   (fast (make-thread (lambda () (tpc-garbage 1600000)))))
+               (list (thread-join fast) (thread-join slow)))"
+        ),
+        "(1599999 399999)"
+    );
+    let together = stats_so_far(&ev).collections - before.collections;
+    println!("main alone: {alone} collections; the two threads: {together}");
+    assert!(alone >= 20, "main's run collects: {alone}");
+    assert!(
+        together * 3 <= alone * 2,
+        "{together} collections for two owners, {alone} for main alone"
+    );
+}
