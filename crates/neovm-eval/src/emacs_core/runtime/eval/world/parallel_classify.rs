@@ -10,7 +10,8 @@
 //! ([`ParallelClass`]); every other primitive runs attached: the subr seam
 //! takes the Baton for the call and puts it back after. Heap accesses the
 //! thread makes while detached attach in `neovm_value::detached`, and
-//! collections wait until no thread runs detached.
+//! collections stop detached threads at their exact safe points
+//! (`world::parallel_gc`).
 
 use super::{Baton, BatonLock, Context};
 use crate::emacs_core::eval::subr_abi::SubrFn;
@@ -388,8 +389,8 @@ unsafe fn gate_attach(lock: *const (), reason: AttachReason) -> *mut () {
     Box::into_raw(Box::new(lock.attach().into_baton())).cast()
 }
 
-/// The gate's detach: a collection the access made due waits for the
-/// detached threads; then the Baton goes back.
+/// The gate's detach: a collection the access made due is requested at
+/// the thread's next exact safe point; then the Baton goes back.
 ///
 /// # Safety
 ///
@@ -417,9 +418,9 @@ unsafe fn gate_note(lock: *const (), reason: AttachReason) {
     unsafe { &*lock.cast::<BatonLock>() }.count_attach(reason);
 }
 
-/// The gate's deferral of a collection the thread's own allocation runs
-/// made due (`neovm_value::detached`): it waits for the detached threads,
-/// as one an attached access makes due does ([`gate_detach`]).
+/// The gate's note of a collection the thread's own allocation runs made
+/// due (`neovm_value::detached`), requested as one an attached access makes
+/// due is ([`gate_detach`]).
 ///
 /// # Safety
 ///
@@ -480,54 +481,30 @@ impl Context {
 
     /// A GC safe point's answer in a Parallel World when it is not the
     /// ordinary one. A detached thread reads no heap state here: it goes to
-    /// the collection entry ([`Self::parallel_defers_collection`]) to park
-    /// when a stop is requested. An attached thread joins a requested stop;
-    /// while any thread runs detached it defers a due collection (slice
-    /// S3's limitation).
+    /// the collection entry ([`Self::parallel_defers_collection`]) when a
+    /// stop is requested, to park, or when its World has a collection due,
+    /// to request it. An attached thread joins a requested stop.
     #[inline]
     pub(crate) fn parallel_safe_point(&self) -> Option<bool> {
         let stop_requested = ASYNC_ATTENTION.is_raised(AsyncSource::StopRequest);
         if neovm_value::detached::is_detached() {
-            return Some(stop_requested);
+            let due = self.gc_inhibit_depth == 0
+                && self.parallel_lock().is_some_and(BatonLock::collection_due);
+            return Some(stop_requested || due);
         }
-        let lock = self.parallel_lock()?;
-        if stop_requested && self.gc_inhibit_depth == 0 {
-            return Some(true);
-        }
-        if Self::detached_peers(lock) == 0 {
-            return None;
-        }
-        if self.tagged_heap.should_collect() {
-            lock.defer_collection(self.tagged_heap.bytes_since_gc() as u64);
-        }
-        Some(false)
+        (stop_requested && self.gc_inhibit_depth == 0 && self.parallel_lock().is_some())
+            .then_some(true)
     }
 
-    /// At a collection's entry: a detached thread parks for a requested
-    /// stop instead ([`Self::parallel_detached_collect`]); an attached one
-    /// defers while any thread runs detached. A collection that runs after
-    /// a deferral is counted.
+    /// At a collection's entry: a detached thread does not collect itself,
+    /// it parks for a stop, or requests the due collection
+    /// ([`Self::parallel_detached_collect`]).
     pub(crate) fn parallel_defers_collection(&mut self, force_complete: bool) -> bool {
         if neovm_value::detached::is_detached() {
             self.parallel_detached_collect(force_complete);
             return true;
         }
-        let Some(lock) = self.parallel_lock() else {
-            return false;
-        };
-        if Self::detached_peers(lock) > 0 {
-            lock.defer_collection(self.tagged_heap.bytes_since_gc() as u64);
-            return true;
-        }
-        lock.collection_runs();
         false
-    }
-
-    /// Bodies running detached now. This OS thread, attached, is not one:
-    /// a body that seats the Baton leaves the count, and a peer that then
-    /// parks in a wait has published its roots in the parked registry.
-    fn detached_peers(lock: &BatonLock) -> u64 {
-        lock.detached_threads()
     }
 
     /// A detached thread binds SYM dynamically. A projected variable binds

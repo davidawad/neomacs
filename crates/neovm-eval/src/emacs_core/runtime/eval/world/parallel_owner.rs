@@ -77,12 +77,12 @@ pub(crate) struct BatonLock {
     detached_ns: AtomicU64,
     threads: AtomicU64,
     deferred_bytes: AtomicU64,
-    /// Lisp threads running their detached body without the Baton: their
-    /// stacks hold roots no collection can see, so none may run (slice S3's
-    /// limitation). A body attached for World work is not counted.
-    detached_threads: AtomicU64,
-    /// A collection was deferred and has not run yet.
+    /// A detached thread's allocation made a collection due; the next of
+    /// them to reach an exact safe point requests it.
     collection_deferred: AtomicBool,
+    /// A detached thread claimed the due collection: no other requests it
+    /// until a collection runs.
+    collection_claimed: AtomicBool,
     /// Per [`AttachReason`], in declaration order.
     attach_by: [AtomicU64; 4],
     /// The collections' rendezvous, with their counters.
@@ -114,8 +114,8 @@ impl BatonLock {
             detached_ns: AtomicU64::new(0),
             threads: AtomicU64::new(1),
             deferred_bytes: AtomicU64::new(0),
-            detached_threads: AtomicU64::new(0),
             collection_deferred: AtomicBool::new(false),
+            collection_claimed: AtomicBool::new(false),
             attach_by: Default::default(),
             stop: StopWorld::new(),
         }
@@ -283,33 +283,42 @@ impl BatonLock {
     /// runs until it parks for a stop or attaches ([`StopWorld`]). The
     /// caller holds the Baton.
     pub(crate) fn body_detached(&self) {
-        self.detached_threads.fetch_add(1, Ordering::AcqRel);
         self.stop.enter_running();
     }
 
     /// A Lisp thread's detached body attached, for World work or its end.
     pub(crate) fn body_attached(&self) {
-        self.detached_threads.fetch_sub(1, Ordering::AcqRel);
         self.stop.leave();
     }
 
-    /// How many Lisp threads run their detached body without the Baton.
-    pub(crate) fn detached_threads(&self) -> u64 {
-        self.detached_threads.load(Ordering::Acquire)
-    }
-
-    /// A collection due now waits for every detached body to end; BYTES is
-    /// what it would have looked at. Counted once per deferred collection.
+    /// A detached thread's allocation made a collection due, which the
+    /// first detached thread to reach an exact safe point requests; BYTES is
+    /// what it would look at. Counted once per due collection.
     pub(crate) fn defer_collection(&self, bytes: u64) {
         if !self.collection_deferred.swap(true, Ordering::AcqRel) {
             self.deferred_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
-    /// A collection runs: a deferred one is no longer pending. The stop
-    /// counts every collection ([`StopWorld`]).
+    /// Whether a detached thread's allocation made a collection due that no
+    /// thread has claimed.
+    #[inline]
+    pub(crate) fn collection_due(&self) -> bool {
+        self.collection_deferred.load(Ordering::Relaxed)
+            && !self.collection_claimed.load(Ordering::Relaxed)
+    }
+
+    /// Claim the due collection: true for exactly one caller per due one.
+    pub(crate) fn take_collection_due(&self) -> bool {
+        self.collection_deferred.load(Ordering::Acquire)
+            && !self.collection_claimed.swap(true, Ordering::AcqRel)
+    }
+
+    /// A collection ran: a due one is no longer pending, nor claimed. The
+    /// stop counts every collection ([`StopWorld`]).
     pub(crate) fn collection_runs(&self) {
         self.collection_deferred.store(false, Ordering::Release);
+        self.collection_claimed.store(false, Ordering::Release);
     }
 
     /// The rendezvous every collection in this World stops at.

@@ -335,48 +335,6 @@ fn thread_signal_stops_a_detached_spinner() {
     );
 }
 
-/// Item 5 and 7(f): a consing detached thread defers the collections it
-/// makes due; the deferred one runs once no thread is detached.
-#[test]
-fn collections_wait_for_detached_threads_and_run_after_the_join() {
-    let mut ev = parallel();
-    assert_eq!(
-        eval(
-            &mut ev,
-            "(let ((th (make-thread
-                        (lambda ()
-                          (let ((n 0) (l nil) (g gcs-done))
-                            (while (< n 300000)
-                              (setq l (cons n l))
-                              (setq n (1+ n)))
-                            ;; No World-class primitive here: one would let
-                            ;; this thread, attached and the only one
-                            ;; detached, run the collection itself.
-                            (list (car l) (- gcs-done g) gcs-done))))))
-               (setq tpd-result (thread-join th))
-               (list (car tpd-result) (car (cdr tpd-result))))"
-        ),
-        // No collection ran while the thread consed.
-        "(299999 0)"
-    );
-    let deferred = stats(&mut ev);
-    assert!(deferred.deferred_bytes > 0, "{deferred:?}");
-    assert!(deferred.attach_by_alloc > 0, "{deferred:?}");
-    // Main is the only thread now: its next safe points collect.
-    assert_eq!(
-        eval(
-            &mut ev,
-            "(let ((n 0) (seen (car (cdr (cdr tpd-result)))))
-               (while (and (= gcs-done seen) (< n 100000)) (setq n (1+ n)))
-               (> gcs-done seen))"
-        ),
-        "t"
-    );
-    let collected = stats(&mut ev);
-    println!("parallel stats after a deferred collection: {collected:?}");
-    assert!(collected.collections >= 1, "{collected:?}");
-}
-
 /// [`stats`], all zero before the first thread starts the World's lock.
 fn stats_so_far(ev: &mut Context) -> ParallelStats {
     ev.parallel_lock().map(BatonLock::stats).unwrap_or_default()
@@ -731,7 +689,7 @@ fn bench_row(
              (setq ts (cons (make-thread (lambda () {call})) ts))
              (setq k (1+ k)))
            (let ((results (mapcar 'thread-join ts)) (n 0))
-             ;; Main's safe points after the joins run a deferred collection.
+             ;; Main's safe points after the joins finish any sweep left.
              (while (< n 2000) (setq n (1+ n)))
              results))",
         call = workload.call
@@ -780,7 +738,7 @@ fn bench_workloads_on_2_4_8_threads_report_their_attaches_and_collections() {
 /// as wall-clock times: serial (main, one call per thread, its collections
 /// inline) against the threads' phase (spawn to the last join, as
 /// `bench.el` times it), and apart from both the collection main runs
-/// after the joins (deferred while the threads ran). Each call repeats
+/// after the joins (what the threads left to sweep). Each call repeats
 /// `NEOVM_MEASURE_REPEAT` times. A measurement in a test build: printed
 /// only.
 #[test]

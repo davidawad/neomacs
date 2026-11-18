@@ -197,6 +197,42 @@ impl StopWorld {
         self.lock_state().phase != Phase::Running
     }
 
+    /// The calling thread, running detached, claimed a due collection: it
+    /// requests a stop and parks with IMAGE like any running thread, until
+    /// the stop ends (false: it runs again) or no thread runs (true: it
+    /// attaches and collects for the stop, then [`Self::withdraw_image`]).
+    pub(crate) fn request_and_park(&self, image: Vec<usize>) -> bool {
+        let me = std::thread::current().id();
+        let mut state = self.lock_state();
+        debug_assert!(state.running > 0, "only a running thread parks");
+        state.running -= 1;
+        state.images.insert(me, image);
+        if state.phase == Phase::Running {
+            state.requested_at = Some(Instant::now());
+            state.phase = Phase::Stopping;
+            ASYNC_ATTENTION.raise(AsyncSource::StopRequest);
+        }
+        self.changed.notify_all();
+        loop {
+            match state.phase {
+                Phase::Running => {
+                    state.images.remove(&me);
+                    state.running += 1;
+                    return false;
+                }
+                Phase::Stopping if state.running == 0 => return true,
+                Phase::Stopping | Phase::Stopped => state = self.wait(state),
+            }
+        }
+    }
+
+    /// The requester of [`Self::request_and_park`] holds the Baton: its
+    /// roots are its Context's again.
+    pub(crate) fn withdraw_image(&self) {
+        let me = std::thread::current().id();
+        self.lock_state().images.remove(&me);
+    }
+
     /// The calling thread, running detached, stops running: it publishes
     /// IMAGE and the requester (if any) may stop waiting for it.
     pub(crate) fn park(&self, image: Vec<usize>) {
@@ -453,14 +489,47 @@ impl Context {
 
     /// `gc_collect_from_current_roots` on a thread running detached, at an
     /// exact safe point (its caller rooted what it holds): park for the
-    /// stop in progress.
-    pub(crate) fn parallel_detached_collect(&mut self, _force_complete: bool) {
+    /// stop in progress, or request the collection the World has due, park
+    /// like the others, and collect once no thread runs.
+    pub(crate) fn parallel_detached_collect(&mut self, force_complete: bool) {
         let Some(lock) = self.parallel_lock_shared() else {
             return;
         };
         if lock.stop().stop_pending() {
             self.parallel_park_for_stop(&lock);
+        } else if lock.take_collection_due() {
+            self.parallel_request_collection(&lock, force_complete);
         }
+    }
+
+    /// The due collection this detached thread claimed: request the stop and
+    /// park; when every other detached thread has parked, attach (no longer
+    /// running), collect, and run detached again. A stop another holder ends
+    /// first is the collection.
+    fn parallel_request_collection(&mut self, lock: &BatonLock, force_complete: bool) {
+        let stop = lock.stop();
+        let seen = stop.counters().collections;
+        let image = owner_image(self);
+        let Some(gate) = neovm_value::detached::suspend_detached() else {
+            return;
+        };
+        if stop.request_and_park(image) {
+            self.parallel_seat_baton(lock.attach().into_baton());
+            stop.withdraw_image();
+            if stop.counters().collections == seen {
+                self.gc_collect_from_current_roots_impl(force_complete);
+            } else {
+                self.tagged_heap.install_tagged_heap();
+            }
+            let baton = self.parallel_unseat_baton();
+            lock.body_detached();
+            lock.detach(baton);
+        } else if stop.counters().collections != seen {
+            let baton = lock.attach().into_baton();
+            self.tagged_heap.install_tagged_heap();
+            lock.detach(baton);
+        }
+        neovm_value::detached::resume_detached(gate);
     }
 
     /// Park this detached thread for the stop in progress: publish its roots,
