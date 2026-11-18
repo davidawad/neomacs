@@ -914,3 +914,54 @@ fn detached_threads_bind_buffer_locals_of_a_shared_buffer_without_attaching() {
     // per binding would be at least 4 x 20000 here.
     assert!(row.attach_count < 64, "the bindings attach: {row:?}");
 }
+
+/// A compiled call of a compiled `&rest` callee on a detached thread conses
+/// the rest list from the thread's own allocation runs. The callee takes
+/// 16 arguments and a rest list, more than the spec shim's fast path
+/// frames, so every call marshals through `Vm::run_leaf_native_to_native`:
+/// two threads whose byte-compiled loop makes 2000 such calls each attach
+/// for their allocation state once each, not once per call.
+#[cfg(feature = "jit")]
+#[test]
+fn a_compiled_rest_call_on_detached_threads_attaches_a_bounded_number_of_times() {
+    use crate::emacs_core::bytecode::ByteCodeFunctionExt;
+    use crate::emacs_core::bytecode::value_api::TaggedValueBytecodeExt;
+    use crate::emacs_core::jit::RuntimeStateTieringExt;
+    const CALLS: i64 = 2_000;
+    let mut ev = parallel();
+    // `(lambda (a1 ... a16 &rest r) r)` and `(lambda (n) (let ((i 0) (s 0))
+    // (while (< i n) (setq s (+ s (car (cdr (tpd-rest-callee i 1 ... 17)))))
+    // (setq i (1+ i))) s))`, as GNU's byte compiler emits them.
+    eval(
+        &mut ev,
+        r#"(progn
+             (fset 'tpd-rest-callee (make-byte-code 4240 "\207" [] 18))
+             (fset 'tpd-rest-loop
+                   (make-byte-code 257 "\300\211\001\003\127\203\052\000\211\301\003\302\303\304\305\306\307\310\311\312\313\314\315\316\317\320\321\322\046\022\101\100\134\262\001\001\124\262\002\202\002\000\207"
+                                   [0 tpd-rest-callee 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17] 23)))"#,
+    );
+    assert_eq!(eval(&mut ev, "(tpd-rest-loop 10)"), "170");
+    // Each thread compiles both at its first call of them.
+    for name in ["tpd-rest-callee", "tpd-rest-loop"] {
+        let function = ev
+            .eval_str(&format!("(symbol-function '{name})"))
+            .expect("defined");
+        function
+            .get_bytecode_data()
+            .expect("byte-code")
+            .jit_runtime()
+            .set_hot_for_test();
+    }
+    let before = stats_so_far(&mut ev);
+    let thread = format!("(make-thread (lambda () (tpd-rest-loop {CALLS})))");
+    assert_eq!(
+        eval(
+            &mut ev,
+            &format!("(let ((a {thread}) (b {thread})) (list (thread-join a) (thread-join b)))")
+        ),
+        format!("({0} {0})", 17 * CALLS)
+    );
+    let row = stats_delta(&before, &stats(&mut ev));
+    println!("2 threads x {CALLS} compiled &rest calls: {row:?}");
+    assert!(row.attach_by_alloc <= 2, "{row:?}");
+}

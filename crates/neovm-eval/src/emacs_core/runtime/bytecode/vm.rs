@@ -8812,23 +8812,33 @@ impl<'a> Vm<'a> {
                 // backtrace frame, pushed before this runs, roots the
                 // arguments (the scope and a `LispArgVec` copy of the tail
                 // were most of this function's ~240 instructions).
-                // SAFETY: the seam-provided dormant Context.
-                // SAFETY (owner chain): (c) fails: this WorldView<TaggedHeap> field loan is last used
-                // by alloc_cons in the rest-building loop. Only copied rest bits reach slots
-                // afterward; neither the raw native call nor fallback below reuses this field owner.
-                #[cfg(feature = "shared-heap")]
-                let _attached = neovm_value::detached::AttachedScope::enter(
-                    neovm_value::detached::AttachReason::Alloc,
-                );
-                let heap = unsafe { &mut (*ctx_ptr).tagged_heap };
-                let mut rest = Value::NIL;
-                for i in (nonrest..nargs).rev() {
-                    // SAFETY: args_ptr addresses `nargs` valid words.
-                    let arg = unsafe {
+                let arg = |i: usize| {
+                    // SAFETY: args_ptr addresses `nargs` valid words, i < nargs.
+                    unsafe {
                         /* SAFETY: bytecode word */
                         Value::from_bits(unsafe { *args_ptr.add(i) } as usize)
-                    };
-                    rest = heap.alloc_cons(arg, rest);
+                    }
+                };
+                let mut rest = Value::NIL;
+                // A Parallel World's detached thread conses from its own
+                // allocation runs (`Value::cons`), without the Baton.
+                #[cfg(feature = "shared-heap")]
+                let detached = neovm_value::detached::is_detached();
+                #[cfg(not(feature = "shared-heap"))]
+                let detached = false;
+                if detached {
+                    for i in (nonrest..nargs).rev() {
+                        rest = Value::cons(arg(i), rest);
+                    }
+                } else {
+                    // SAFETY: the seam-provided dormant Context.
+                    // SAFETY (owner chain): (c) fails: this WorldView<TaggedHeap> field loan is last used
+                    // by alloc_cons in the rest-building loop. Only copied rest bits reach slots
+                    // afterward; neither the raw native call nor fallback below reuses this field owner.
+                    let heap = unsafe { &mut (*ctx_ptr).tagged_heap };
+                    for i in (nonrest..nargs).rev() {
+                        rest = heap.alloc_cons(arg(i), rest);
+                    }
                 }
                 slots[nonrest] = rest.bits() as i64;
             }
