@@ -224,6 +224,11 @@ pub struct GreenSeat {
 }
 
 impl GreenSeat {
+    /// Whether this thread carries the World's Baton in its seat.
+    pub(crate) fn holds_baton(&self) -> bool {
+        self.baton.is_some()
+    }
+
     pub(crate) fn take_owner_step_baton(&mut self) -> Result<Baton, host_service::HostRootError> {
         self.baton
             .take()
