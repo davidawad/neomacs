@@ -764,6 +764,7 @@ fn measure_bench_workloads_serial_versus_parallel() {
     crate::emacs_core::jit::force_jit_off_for_test(false);
     println!("| workload | threads | serial | threads' phase | speedup | after the joins |");
     println!("|---|---:|---:|---:|---:|---:|");
+    let mut phases = Vec::new();
     for workload in &BENCH_WORKLOADS {
         let call = format!(
             "(let ((j 0) (r nil)) (while (< j {repeat}) (setq r {}) (setq j (1+ j))) r)",
@@ -786,9 +787,11 @@ fn measure_bench_workloads_serial_versus_parallel() {
         eval(&mut ev, &serial_form);
         let serial = started.elapsed();
         eval(&mut ev, settle);
+        let before = stats_so_far(&mut ev);
         let started = std::time::Instant::now();
         let joined = eval(&mut ev, &parallel_form);
         let parallel = started.elapsed();
+        phases.push((workload.name, stats_delta(&before, &stats(&mut ev))));
         let started = std::time::Instant::now();
         eval(&mut ev, settle);
         let after = started.elapsed();
@@ -802,6 +805,27 @@ fn measure_bench_workloads_serial_versus_parallel() {
             "| {} | {threads} | {serial:.2?} | {parallel:.2?} | {:.2}x | {after:.2?} |",
             workload.name,
             serial.as_secs_f64() / parallel.as_secs_f64()
+        );
+    }
+    // The counters of each threads' phase: what serialized it, counted.
+    println!(
+        "| workload | attach-count | by-alloc | by-class | by-intern | requester-parks \
+         | collections | safepoint-stops | deferred-bytes | attach-wait-ns | stop-wait-ns |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (name, row) in phases {
+        println!(
+            "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            row.attach_count,
+            row.attach_by_alloc,
+            row.attach_by_class,
+            row.attach_by_intern,
+            row.requester_parks,
+            row.collections,
+            row.safepoint_stops,
+            row.deferred_bytes,
+            row.attach_wait_ns,
+            row.stop_wait_ns,
         );
     }
 }
