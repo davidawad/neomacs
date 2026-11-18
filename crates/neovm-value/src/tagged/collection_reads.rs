@@ -493,7 +493,7 @@ fn unchanged_since(
     store: &StoreState,
 ) -> bool {
     let count = store.sequence().wrapping_sub(revision.sequence());
-    if count > JOURNAL_SIZE as u64 {
+    if count > JOURNAL_SIZE as u64 || store.has_unjournaled_stores() {
         return false;
     }
     (1..=count).all(|offset| {
@@ -574,7 +574,10 @@ impl CollectionReadScope {
         // first read (including initialization of fresh objects) are harmless.
         let now = LispCollectionRevision::from_sequence(self.owner.store().sequence());
         let count = now.sequence().wrapping_sub(capture.started.sequence());
-        if capture.overflow || count > JOURNAL_SIZE as u64 {
+        if capture.overflow
+            || count > JOURNAL_SIZE as u64
+            || self.owner.store().has_unjournaled_stores()
+        {
             tracing::trace!(target: "neovm_core::collection_reads", reads = capture.reads.len(), writes = count, overflow = capture.overflow, "capture rejected");
             return None;
         }

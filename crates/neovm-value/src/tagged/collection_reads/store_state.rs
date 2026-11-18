@@ -102,9 +102,13 @@ pub(crate) struct MutatorStoreState {
     pub(super) writes: Cell<std::ptr::NonNull<[JournalSlot; JOURNAL_SIZE]>>,
     pub(super) policy: PolicyCell,
     pub(super) observe: AtomicBool,
+    /// A thread running detached stored without journaling (feature
+    /// `shared-heap`): no certificate is coherent until
+    /// [`StoreState::journal_detached_extent`] ends the extent.
+    pub(super) unjournaled: AtomicBool,
     // Fill the ABI padding with Cells as well: a shared store-protocol
     // reference may remain live across the barrier's whole-heap loan.
-    _padding: [Cell<u8>; size_of::<usize>() - 2],
+    _padding: [Cell<u8>; size_of::<usize>() - 3],
 }
 
 /// Heap-owned publication, separate from the executing mutator's journal.
@@ -138,7 +142,8 @@ impl StoreState {
                     JournalPolicy::BeforeFirstCapture
                 }),
                 observe: AtomicBool::new(false),
-                _padding: [const { Cell::new(0) }; size_of::<usize>() - 2],
+                unjournaled: AtomicBool::new(false),
+                _padding: [const { Cell::new(0) }; size_of::<usize>() - 3],
             },
             windows: StoreWindows {
                 cons_window: WindowCell::new(BarrierWindow::NONE),
@@ -153,23 +158,53 @@ impl StoreState {
         self.mutator.revision.load(Ordering::Relaxed)
     }
 
-    /// The next revision, this store's own: detached threads advance it at
-    /// once, so each takes its revision and ring slot in one step.
+    /// The next revision, the Baton holder's alone. A thread running
+    /// detached takes none: were every detached store to advance the one
+    /// revision word and write the ring slot beside it, the threads would
+    /// pass that cache line between them on every `setcar` (`lexenv_set`
+    /// was 40% of an interpreted loop on eight threads). It marks the store
+    /// unjournaled instead, which rejects every certificate until a
+    /// stopped World ends the extent; [`Self::record`] skips its slot.
     #[inline(always)]
     pub(crate) fn advance(&self) -> u64 {
         #[cfg(feature = "shared-heap")]
-        let next = self
-            .mutator
-            .revision
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        #[cfg(not(feature = "shared-heap"))]
-        let next = {
-            let next = self.sequence().wrapping_add(1);
-            self.mutator.revision.store(next, Ordering::Relaxed);
-            next
-        };
+        if crate::detached::is_detached() {
+            self.note_unjournaled();
+            return self.sequence();
+        }
+        let next = self.sequence().wrapping_add(1);
+        self.mutator.revision.store(next, Ordering::Relaxed);
         next
+    }
+
+    /// A detached store's mark: after the first it is a load of a line
+    /// the threads share unmodified.
+    #[cfg(feature = "shared-heap")]
+    #[inline(always)]
+    fn note_unjournaled(&self) {
+        if !self.mutator.unjournaled.load(Ordering::Relaxed) {
+            self.mutator.unjournaled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a detached thread stored since the last
+    /// [`Self::journal_detached_extent`]: the journal misses those stores,
+    /// so no certificate may be reused.
+    #[inline(always)]
+    pub(crate) fn has_unjournaled_stores(&self) -> bool {
+        self.mutator.unjournaled.load(Ordering::Relaxed)
+    }
+
+    /// End an unjournaled extent, with no thread running detached (a
+    /// collection's stopped World): advance the revision past the journal,
+    /// so every certificate begun before now reads as having lost its
+    /// history, and journal again.
+    pub(crate) fn journal_detached_extent(&self) {
+        if self.has_unjournaled_stores() {
+            let next = self.sequence().wrapping_add(JOURNAL_SIZE as u64 + 1);
+            self.mutator.revision.store(next, Ordering::Relaxed);
+            self.mutator.unjournaled.store(false, Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]
@@ -181,6 +216,10 @@ impl StoreState {
 
     #[inline(always)]
     pub(super) fn record(&self, owner: usize, revision: u64) {
+        #[cfg(feature = "shared-heap")]
+        if crate::detached::is_detached() {
+            return;
+        }
         self.journal()[revision as usize & (JOURNAL_SIZE - 1)].set(owner);
     }
 

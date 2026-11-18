@@ -164,3 +164,59 @@ fn observation_budget_and_unwind_restore_the_outer_scope() {
 #[cfg(test)]
 #[path = "fast_paths_test.rs"]
 mod fast_paths;
+
+/// A thread running detached stores without a revision or a ring slot
+/// (feature `shared-heap`): the threads would otherwise share that line on
+/// every store. Its first store refuses every certificate until a stopped
+/// World ends the extent, and one begun before the end stays refused.
+#[cfg(feature = "shared-heap")]
+#[test]
+fn detached_stores_take_no_revision_and_refuse_every_certificate() {
+    use crate::detached::{AttachReason, DetachedGate, begin_detached, end_detached};
+    unsafe fn attach(_lock: *const (), _reason: AttachReason) -> *mut () {
+        panic!("a store does not attach");
+    }
+    unsafe fn detach(_lock: *const (), _token: *mut ()) {}
+    unsafe fn note(_lock: *const (), _reason: AttachReason) {}
+    unsafe fn defer(_lock: *const (), _bytes: u64) {}
+    let source = Value::cons(Value::NIL, Value::NIL);
+    let unrelated = Value::cons(Value::NIL, Value::NIL);
+    let (_, reads) = capture(|| source.cons_car());
+    let reads = reads.unwrap();
+    assert!(reads.unchanged());
+
+    let before = LispCollectionRevision::current();
+    begin_detached(DetachedGate::new(
+        std::ptr::null(),
+        attach,
+        detach,
+        note,
+        defer,
+    ));
+    for _ in 0..1000 {
+        unrelated.set_car(Value::T);
+    }
+    let after = LispCollectionRevision::current();
+    end_detached();
+    assert_eq!(
+        after.steps_since_for_test(before),
+        0,
+        "1000 detached stores"
+    );
+    assert!(
+        !reads.unchanged(),
+        "the journal missed the detached stores, so nothing is reused"
+    );
+
+    with_store(|store| store.journal_detached_extent());
+    assert!(
+        !reads.unchanged(),
+        "a certificate begun inside the extent stays refused after it"
+    );
+    let (_, fresh) = capture(|| source.cons_car());
+    let fresh = fresh.unwrap();
+    unrelated.set_car(Value::NIL);
+    assert!(fresh.unchanged(), "the Baton holder journals again");
+    source.set_car(Value::T);
+    assert!(!fresh.unchanged());
+}

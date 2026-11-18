@@ -69,6 +69,10 @@ impl TaggedHeap {
         );
         #[cfg(any(test, debug_assertions, feature = "test-support"))]
         crate::tagged::mutate::debug_assert_no_heap_mut_closure();
+        // No thread runs detached while a collection begins (a Parallel
+        // World collects stopped): the stores they made unjournaled end here.
+        #[cfg(feature = "shared-heap")]
+        super::with_store_state(|store| store.journal_detached_extent());
         // SAFETY: collection entry has the sole stopped owner, no worker,
         // callbacks, or allocation safepoint. Residual words must survive a
         // failed entry for diagnosis; begin never clears a SATB buffer.
