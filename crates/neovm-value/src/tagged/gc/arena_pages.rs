@@ -745,6 +745,71 @@ pub(super) struct ObjectArena<T: PagedObject> {
     pub(super) partial_head: usize,
 }
 
+/// Consecutive pages of one arena that one thread sweeps while the world
+/// is stopped ([`ObjectArena::page_runs`]).
+#[cfg(feature = "shared-heap")]
+pub(super) struct PageRun<'a, T: PagedObject> {
+    /// The arena index of `pages[0]`.
+    first: usize,
+    pages: &'a mut [ObjectPage<T>],
+}
+
+// SAFETY: a run is swept with the world stopped, and runs are disjoint, so
+// no other thread touches its pages. Only classes whose dead payloads free
+// allocator memory and touch nothing else are sent (`Float`, `String`,
+// `Vector`, `Bignum`), and any thread may free allocator memory.
+#[cfg(feature = "shared-heap")]
+unsafe impl<T: PagedObject> Send for PageRun<'_, T> {}
+
+/// What sweeping one [`PageRun`] gave back.
+#[cfg(feature = "shared-heap")]
+pub(super) struct SweptRun {
+    live: usize,
+    freed: usize,
+    /// Arena indices of the run's pages that freed a slot.
+    partial: Vec<usize>,
+    /// The freed slots' addresses, when asked for.
+    slots: Vec<usize>,
+}
+
+#[cfg(feature = "shared-heap")]
+impl<T: PagedObject> PageRun<'_, T> {
+    /// Sweep the run, as `sweep_range` would without an `on_free` or a
+    /// collection observation, collecting the freed slots' addresses when
+    /// COLLECT.
+    pub(super) fn sweep<const GENERATIONAL: bool>(
+        self,
+        parity: MarkParity,
+        scope: CollectionScope,
+        collect: bool,
+    ) -> SweptRun {
+        let mut run = SweptRun {
+            live: 0,
+            freed: 0,
+            partial: Vec::new(),
+            slots: Vec::new(),
+        };
+        for (offset, page) in self.pages.iter_mut().enumerate() {
+            let (live, freed) = ObjectArena::<T>::sweep_page::<GENERATIONAL, false>(
+                page,
+                parity,
+                scope,
+                &mut |slot| {
+                    if collect {
+                        run.slots.push(slot);
+                    }
+                },
+            );
+            run.live = run.live.saturating_add(live);
+            run.freed += freed;
+            if freed > 0 {
+                run.partial.push(self.first + offset);
+            }
+        }
+        run
+    }
+}
+
 impl<T: PagedObject> ObjectArena<T> {
     #[cfg_attr(feature = "test-support", visibility::make(pub))]
     pub(super) fn new(chunk_map: Option<std::sync::Arc<ChunkMap>>) -> Self {
@@ -1078,69 +1143,143 @@ impl<T: PagedObject> ObjectArena<T> {
         let mut live_bytes = 0usize;
         let mut freed = 0usize;
         for page_index in start..end.min(self.pages.len()) {
-            let page = &mut self.pages[page_index];
-            if page.retired {
-                continue; // never swept; slots permanently tenured-live
+            let (live, page_freed) = Self::sweep_page::<GENERATIONAL, OBSERVED>(
+                &mut self.pages[page_index],
+                parity,
+                scope,
+                &mut on_free,
+            );
+            live_bytes = live_bytes.saturating_add(live);
+            freed += page_freed;
+            if page_freed > 0 {
+                self.link_partial(page_index);
             }
-            let mut freed_any = false;
-            for word_index in 0..ObjectPage::<T>::ALLOC_WORDS {
-                // RE-READ the current bitmap word (see the doc above).
-                let mut bits = page.alloc_bits[word_index];
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let index = word_index * usize::BITS as usize + bit;
-                    let slot = page.slot_ptr(index);
-                    // Alloc bit set ⇒ the slot holds a fully written live
-                    // object — reading its header is sound.
-                    let header = unsafe { &*(slot as *const GcHeader) };
-                    debug_assert!(
-                        header.kind == T::KIND,
-                        "wrong-kind header in a {} arena slot",
-                        T::CLASS,
-                    );
-                    // (1) GENERATION-SKIP before any parity interpretation.
-                    if header.black_by_generation(scope) {
-                        // Session-old objects were promoted eagerly at mark
-                        // termination. Reset their marks before completing
-                        // this sweep, without touching permanent marks.
-                        // The concurrent marker has exited and no mutator
-                        // changes this slot during the sweep slice.
-                        if GENERATIONAL && !header.generation.permanent() && header.is_marked() {
-                            header.marked.store(UNMARKED_AT_REST, Ordering::Relaxed);
-                        }
-                        continue;
+        }
+        (live_bytes, freed)
+    }
+
+    /// Sweep one page: `(live bytes, slots freed)`.
+    fn sweep_page<const GENERATIONAL: bool, const OBSERVED: bool>(
+        page: &mut ObjectPage<T>,
+        parity: MarkParity,
+        scope: CollectionScope,
+        on_free: &mut impl FnMut(usize),
+    ) -> (usize, usize) {
+        let mut live_bytes = 0usize;
+        let mut freed = 0usize;
+        if page.retired {
+            return (0, 0); // never swept; slots permanently tenured-live
+        }
+        for word_index in 0..ObjectPage::<T>::ALLOC_WORDS {
+            // RE-READ the current bitmap word (see the doc above).
+            let mut bits = page.alloc_bits[word_index];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let index = word_index * usize::BITS as usize + bit;
+                let slot = page.slot_ptr(index);
+                // Alloc bit set ⇒ the slot holds a fully written live
+                // object — reading its header is sound.
+                let header = unsafe { &*(slot as *const GcHeader) };
+                debug_assert!(
+                    header.kind == T::KIND,
+                    "wrong-kind header in a {} arena slot",
+                    T::CLASS,
+                );
+                // (1) GENERATION-SKIP before any parity interpretation.
+                if header.black_by_generation(scope) {
+                    // Session-old objects were promoted eagerly at mark
+                    // termination. Reset their marks before completing
+                    // this sweep, without touching permanent marks.
+                    // The concurrent marker has exited and no mutator
+                    // changes this slot during the sweep slice.
+                    if GENERATIONAL && !header.generation.permanent() && header.is_marked() {
+                        header.marked.store(UNMARKED_AT_REST, Ordering::Relaxed);
                     }
-                    if header.is_marked_at(parity) {
-                        // (2) Survivor: variable-size byte accounting.
-                        if GENERATIONAL && header.tenured && !header.generation.permanent() {
-                            // Joined marker, stopped mutators: restore GEN-3
-                            // only after every mark reader has finished.
-                            header.marked.store(UNMARKED_AT_REST, Ordering::Relaxed);
-                        } else {
-                            live_bytes = live_bytes.saturating_add(
-                                TaggedHeap::object_bytes_from_header(slot as *const GcHeader),
-                            );
-                        }
+                    continue;
+                }
+                if header.is_marked_at(parity) {
+                    // (2) Survivor: variable-size byte accounting.
+                    if GENERATIONAL && header.tenured && !header.generation.permanent() {
+                        // Joined marker, stopped mutators: restore GEN-3
+                        // only after every mark reader has finished.
+                        header.marked.store(UNMARKED_AT_REST, Ordering::Relaxed);
                     } else {
-                        // (3) Dead: evict from any class registry, drop the
-                        // payload IN PLACE, then clear the bit (the oracle
-                        // answers NOT-owned from here on).
-                        on_free(slot as usize);
-                        if OBSERVED {
-                            header.clear_collection_observed();
-                        }
-                        unsafe { std::ptr::drop_in_place(slot) };
-                        page.free_slot(index);
-                        freed += 1;
-                        freed_any = true;
+                        live_bytes = live_bytes.saturating_add(
+                            TaggedHeap::object_bytes_from_header(slot as *const GcHeader),
+                        );
                     }
+                } else {
+                    // (3) Dead: evict from any class registry, drop the
+                    // payload IN PLACE, then clear the bit (the oracle
+                    // answers NOT-owned from here on).
+                    on_free(slot as usize);
+                    if OBSERVED {
+                        header.clear_collection_observed();
+                    }
+                    unsafe { std::ptr::drop_in_place(slot) };
+                    page.free_slot(index);
+                    freed += 1;
                 }
             }
-            if freed_any && !page.on_partial {
-                page.on_partial = true;
-                page.next_partial = self.partial_head;
-                self.partial_head = page_index;
+        }
+        (live_bytes, freed)
+    }
+
+    /// Put page PAGE_INDEX, which a sweep freed slots of, on the partial
+    /// chain.
+    fn link_partial(&mut self, page_index: usize) {
+        let page = &mut self.pages[page_index];
+        if !page.on_partial {
+            page.on_partial = true;
+            page.next_partial = self.partial_head;
+            self.partial_head = page_index;
+        }
+    }
+
+    /// Split pages `start..end` into at most PARTS runs of consecutive
+    /// pages, for [`PageRun::sweep`] on as many threads.
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn page_runs(
+        &mut self,
+        start: usize,
+        end: usize,
+        parts: usize,
+    ) -> Vec<PageRun<'_, T>> {
+        let end = end.min(self.pages.len());
+        if start >= end {
+            return Vec::new();
+        }
+        let len = (end - start).div_ceil(parts.max(1));
+        self.pages[start..end]
+            .chunks_mut(len)
+            .enumerate()
+            .map(|(index, pages)| PageRun {
+                first: start + index * len,
+                pages,
+            })
+            .collect()
+    }
+
+    /// Account the runs [`PageRun::sweep`] swept, in page order: put each
+    /// page that freed a slot on the partial chain, as the serial sweep
+    /// does, and hand FREED the freed slots' addresses. `(live, freed)`.
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn link_swept_runs(
+        &mut self,
+        runs: impl IntoIterator<Item = SweptRun>,
+        mut freed_slots: Option<&mut Vec<usize>>,
+    ) -> (usize, usize) {
+        let mut live_bytes = 0usize;
+        let mut freed = 0usize;
+        for run in runs {
+            live_bytes = live_bytes.saturating_add(run.live);
+            freed += run.freed;
+            for page_index in run.partial {
+                self.link_partial(page_index);
+            }
+            if let Some(slots) = freed_slots.as_deref_mut() {
+                slots.extend(run.slots);
             }
         }
         (live_bytes, freed)
