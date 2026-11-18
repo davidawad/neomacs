@@ -1,4 +1,8 @@
-//! World-owned store protocol. Only the Baton holder mutates these Cells.
+//! World-owned store protocol. The Baton holder mutates it; in a Parallel
+//! World (feature `shared-heap`) so do threads running detached, whose stores
+//! journal here without the Baton. Every word a store reads or writes is
+//! therefore atomic, accessed Relaxed: alone, each access compiles to the
+//! plain load or store the former `Cell` made.
 //!
 //! A collector may publish another owner's windows only while the registered
 //! World is parked in the stopped handshake, before releasing that owner.
@@ -9,16 +13,95 @@ use std::cell::OnceCell;
 use std::mem::{MaybeUninit, align_of, offset_of, size_of};
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU8, AtomicU64};
+
+/// One journal entry: the identity word of a written owner.
+#[repr(transparent)]
+pub(crate) struct JournalSlot(AtomicUsize);
+
+impl JournalSlot {
+    const fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    fn set(&self, owner: usize) {
+        self.0.store(owner, Ordering::Relaxed);
+    }
+}
+
+/// The journal policy byte every store tests.
+#[repr(transparent)]
+pub(crate) struct PolicyCell(AtomicU8);
+
+impl PolicyCell {
+    const fn new(policy: JournalPolicy) -> Self {
+        Self(AtomicU8::new(policy as u8))
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self) -> JournalPolicy {
+        match self.0.load(Ordering::Relaxed) {
+            policy if policy == JournalPolicy::JournalOnly as u8 => JournalPolicy::JournalOnly,
+            policy if policy == JournalPolicy::BeforeFirstCapture as u8 => {
+                JournalPolicy::BeforeFirstCapture
+            }
+            _ => JournalPolicy::JournalAndObserve,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set(&self, policy: JournalPolicy) {
+        self.0.store(policy as u8, Ordering::Relaxed);
+    }
+}
+
+/// A published barrier window. A reader may pair the bounds of two
+/// publications only while a publication changes them, which the collector
+/// does with every other mutator stopped.
+#[repr(C)]
+pub(crate) struct WindowCell {
+    lo: AtomicUsize,
+    len: AtomicUsize,
+}
+
+impl WindowCell {
+    fn new(window: BarrierWindow) -> Self {
+        Self {
+            lo: AtomicUsize::new(window.lo()),
+            len: AtomicUsize::new(window.len()),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self) -> BarrierWindow {
+        BarrierWindow::from_lo_len(
+            self.lo.load(Ordering::Relaxed),
+            self.len.load(Ordering::Relaxed),
+        )
+    }
+
+    #[inline(always)]
+    fn set(&self, window: BarrierWindow) {
+        self.lo.store(window.lo(), Ordering::Relaxed);
+        self.len.store(window.len(), Ordering::Relaxed);
+    }
+}
 
 /// Mutator-owned fields stay together so registration can own this block
-/// when several mutators eventually share one heap. Only the Baton holder
-/// writes them today. The retained World owns the out-of-line ring allocation.
+/// when several mutators eventually share one heap. The retained World owns
+/// the out-of-line ring allocation.
 #[repr(C)]
 pub(crate) struct MutatorStoreState {
-    pub(super) revision: Cell<u64>,
-    pub(super) writes: Cell<std::ptr::NonNull<[Cell<usize>; JOURNAL_SIZE]>>,
-    pub(super) policy: Cell<JournalPolicy>,
-    pub(super) observe: Cell<bool>,
+    pub(super) revision: AtomicU64,
+    pub(super) writes: Cell<std::ptr::NonNull<[JournalSlot; JOURNAL_SIZE]>>,
+    pub(super) policy: PolicyCell,
+    pub(super) observe: AtomicBool,
     // Fill the ABI padding with Cells as well: a shared store-protocol
     // reference may remain live across the barrier's whole-heap loan.
     _padding: [Cell<u8>; size_of::<usize>() - 2],
@@ -27,8 +110,8 @@ pub(crate) struct MutatorStoreState {
 /// Heap-owned publication, separate from the executing mutator's journal.
 #[repr(C)]
 pub(crate) struct StoreWindows {
-    pub(crate) cons_window: Cell<BarrierWindow>,
-    pub(crate) window: Cell<BarrierWindow>,
+    pub(crate) cons_window: WindowCell,
+    pub(crate) window: WindowCell,
 }
 
 /// The authoritative store protocol lives inline at the heap tail while
@@ -43,23 +126,23 @@ pub struct StoreState {
 }
 
 impl StoreState {
-    fn new(writes: NonNull<[Cell<usize>; JOURNAL_SIZE]>) -> Self {
+    fn new(writes: NonNull<[JournalSlot; JOURNAL_SIZE]>) -> Self {
         initialize();
         Self {
             mutator: MutatorStoreState {
-                revision: Cell::new(0),
+                revision: AtomicU64::new(0),
                 writes: Cell::new(writes),
-                policy: Cell::new(if history_required() {
+                policy: PolicyCell::new(if history_required() {
                     JournalPolicy::JournalOnly
                 } else {
                     JournalPolicy::BeforeFirstCapture
                 }),
-                observe: Cell::new(false),
+                observe: AtomicBool::new(false),
                 _padding: [const { Cell::new(0) }; size_of::<usize>() - 2],
             },
             windows: StoreWindows {
-                cons_window: Cell::new(BarrierWindow::NONE),
-                window: Cell::new(BarrierWindow::NONE),
+                cons_window: WindowCell::new(BarrierWindow::NONE),
+                window: WindowCell::new(BarrierWindow::NONE),
             },
             heap: Cell::new(std::ptr::null_mut()),
         }
@@ -67,18 +150,30 @@ impl StoreState {
 
     #[inline(always)]
     pub(crate) fn sequence(&self) -> u64 {
-        self.mutator.revision.get()
+        self.mutator.revision.load(Ordering::Relaxed)
     }
 
+    /// The next revision, this store's own: detached threads advance it at
+    /// once, so each takes its revision and ring slot in one step.
     #[inline(always)]
     pub(crate) fn advance(&self) -> u64 {
-        let next = self.mutator.revision.get().wrapping_add(1);
-        self.mutator.revision.set(next);
+        #[cfg(feature = "shared-heap")]
+        let next = self
+            .mutator
+            .revision
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        #[cfg(not(feature = "shared-heap"))]
+        let next = {
+            let next = self.sequence().wrapping_add(1);
+            self.mutator.revision.store(next, Ordering::Relaxed);
+            next
+        };
         next
     }
 
     #[inline(always)]
-    pub(super) fn journal(&self) -> &[Cell<usize>; JOURNAL_SIZE] {
+    pub(super) fn journal(&self) -> &[JournalSlot; JOURNAL_SIZE] {
         // SAFETY: ObservationWorld retains this one ring allocation across
         // inline/detached protocol moves. Every element is interior mutable.
         unsafe { self.mutator.writes.get().as_ref() }
@@ -97,7 +192,7 @@ impl StoreState {
 
 struct WorldObservations {
     // The ring outlives either scalar location, including retained certificates.
-    _writes: crate::tagged::gc::AliasableBox<[Cell<usize>; JOURNAL_SIZE]>,
+    _writes: crate::tagged::gc::AliasableBox<[JournalSlot; JOURNAL_SIZE]>,
     detached: std::cell::UnsafeCell<MaybeUninit<StoreState>>,
     inline: Cell<Option<NonNull<StoreState>>>,
     dump: Cell<BarrierWindow>,
@@ -114,7 +209,8 @@ static_assertions::assert_not_impl_any!(ObservationWorld: Send, Sync);
 
 impl Default for ObservationWorld {
     fn default() -> Self {
-        let writes = crate::tagged::gc::AliasableBox::new([const { Cell::new(0) }; JOURNAL_SIZE]);
+        let writes =
+            crate::tagged::gc::AliasableBox::new([const { JournalSlot::new() }; JOURNAL_SIZE]);
         let store = StoreState::new(writes.root());
         Self(Rc::new(WorldObservations {
             _writes: writes,
@@ -162,7 +258,10 @@ impl ObservationWorld {
     }
 
     fn observe_scopes(&self, active: bool) {
-        self.store().mutator.observe.set(active);
+        self.store()
+            .mutator
+            .observe
+            .store(active, Ordering::Relaxed);
         if active {
             self.store()
                 .mutator

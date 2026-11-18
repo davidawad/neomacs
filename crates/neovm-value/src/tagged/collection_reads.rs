@@ -523,7 +523,7 @@ impl CollectionReadScope {
             let mut state = state.borrow_mut();
             with_store(|store| {
                 store.mutator.policy.set(JournalPolicy::JournalAndObserve);
-                store.mutator.observe.set(true);
+                store.mutator.observe.store(true, Ordering::Relaxed);
             });
             let overflow = state.captures.len() >= MAX_DEPTH;
             if overflow {
@@ -625,7 +625,7 @@ impl CollectionReadScope {
             } else {
                 JournalPolicy::JournalOnly
             });
-            store.mutator.observe.set(active);
+            store.mutator.observe.store(active, Ordering::Relaxed);
             if self.owner.is_current() {
                 clear_recent_reads();
                 ACTIVE.with(|membership| membership.set(active));
@@ -882,7 +882,7 @@ fn record_unprojected_write_before_first_capture(store: &StoreState, value: Tagg
 /// Preserve ordinary projection policy without an idle ACTIVE TLS read.
 #[inline(always)]
 pub(crate) fn observe_store_projection_in_store(store: &StoreState, value: TaggedValue) {
-    if store.mutator.observe.get() {
+    if store.mutator.observe.load(Ordering::Relaxed) {
         observe_store_projection_active(value);
     }
 }
