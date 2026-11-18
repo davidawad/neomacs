@@ -26,12 +26,23 @@
 //! owner block and page, so mark and sweep see one heap. The mark parity an
 //! owner stamps is read at each refill; it changes only inside a collection.
 //!
+//! Reuse: a sweep's empty blocks and pages are storage owners carve again.
+//! As many as owners started between the last two sweeps go to the cold
+//! state's spare lists ([`TaggedHeap::recycle_released_cons_blocks`],
+//! [`TaggedHeap::recycle_spare_pages`]); an owner about to open a block or
+//! page takes a batch of them under the cold mutex, so it pays the
+//! allocator's fresh memory only when no swept storage is left.
+//!
 //! Everything here is `#[cfg(feature = "shared-heap")]`; without an installed
 //! [`OwnerAllocState`] the allocation entry points take the keeper path.
 
 use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+/// How many spare blocks or pages of one class an owner takes from the cold
+/// state at once.
+const SPARE_BATCH: usize = 8;
 
 /// How many cells or slots an owner takes per refill, at most: a run never
 /// crosses its block or page.
@@ -64,12 +75,23 @@ pub(crate) struct OwnerAllocStats {
 
 /// The size classes an owner carves runs of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
 enum OwnerClass {
     Cons,
     Float,
     String,
     Vector,
     Bignum,
+}
+
+impl OwnerClass {
+    const ALL: [Self; 5] = [
+        Self::Cons,
+        Self::Float,
+        Self::String,
+        Self::Vector,
+        Self::Bignum,
+    ];
 }
 
 /// One open run: `[start, lim)` reserved, `[start, cur)` handed out.
@@ -140,6 +162,21 @@ struct PendingPage<T: PagedObject> {
 struct PagePool<T: PagedObject> {
     pages: Vec<PendingPage<T>>,
     carving: Option<usize>,
+    /// Storage of swept, empty pages a new page is made over first.
+    spare: Vec<*mut u8>,
+    /// Pages started (over spare storage or fresh) since the last recycle.
+    carved: usize,
+    /// How many spare storages recycling keeps: the pages owners started
+    /// between the last two recycles that saw any.
+    limit: usize,
+}
+
+impl<T: PagedObject> Drop for PagePool<T> {
+    fn drop(&mut self) {
+        for storage in self.spare.drain(..) {
+            ObjectPage::<T>::free_storage(storage);
+        }
+    }
 }
 
 impl<T: PagedObject> PagePool<T> {
@@ -147,7 +184,16 @@ impl<T: PagedObject> PagePool<T> {
         Self {
             pages: Vec::new(),
             carving: None,
+            spare: Vec::new(),
+            carved: 0,
+            limit: 0,
         }
+    }
+
+    /// Whether the next carve starts a page.
+    fn opens_page(&mut self) -> bool {
+        self.carving
+            .is_none_or(|base| self.page_mut(base).page.next_index >= ObjectPage::<T>::SLOTS)
     }
 
     fn page_mut(&mut self, base: usize) -> &mut PendingPage<T> {
@@ -167,7 +213,11 @@ impl<T: PagedObject> PagePool<T> {
         let base = match open {
             Some(base) => base,
             None => {
-                let page = ObjectPage::new();
+                let page = self
+                    .spare
+                    .pop()
+                    .map_or_else(ObjectPage::new, ObjectPage::over_storage);
+                self.carved += 1;
                 let base = page.base_addr();
                 self.pages.push(PendingPage { page, open_runs: 0 });
                 self.carving = Some(base);
@@ -202,11 +252,35 @@ impl<T: PagedObject> PagePool<T> {
         used
     }
 
-    /// Take over every page of OTHER, whose runs are all closed.
+    /// Take over every page and spare storage of OTHER, whose runs are all
+    /// closed.
     fn absorb(&mut self, other: &mut Self) {
         debug_assert!(other.pages.iter().all(|pending| pending.open_runs == 0));
         self.pages.append(&mut other.pages);
         other.carving = None;
+        self.spare.append(&mut other.spare);
+        self.carved += std::mem::take(&mut other.carved);
+    }
+
+    /// Move up to SPARE_BATCH spare storages to TO.
+    fn lend_spare(&mut self, to: &mut Self) {
+        let at = self.spare.len().saturating_sub(SPARE_BATCH);
+        to.spare.extend(self.spare.drain(at..));
+    }
+
+    /// A sweep released pages to ARENA's spare storage: keep as many as
+    /// owners started since the last recycle that saw them start any,
+    /// taking ARENA's or giving the excess back to it.
+    fn recycle(&mut self, arena: &mut ObjectArena<T>) {
+        if self.carved > 0 {
+            self.limit = std::mem::take(&mut self.carved);
+        }
+        if self.spare.len() > self.limit {
+            arena.spare_storage.extend(self.spare.drain(self.limit..));
+        }
+        let take = (self.limit - self.spare.len()).min(arena.spare_storage.len());
+        let at = arena.spare_storage.len() - take;
+        self.spare.extend(arena.spare_storage.drain(at..));
     }
 
     /// Take every page no run is open in; the carving page too when `all`
@@ -242,6 +316,21 @@ struct AllocatorCold {
     boxed: Vec<*mut VecLikeHeader>,
     charges: Charges,
     open_runs: usize,
+    /// Storage of swept, empty cons blocks a new block is made over first.
+    spare_blocks: Vec<*mut u8>,
+    /// Cons blocks started (over spare storage or fresh) since the last
+    /// recycle.
+    carved_blocks: usize,
+    /// How many spare blocks recycling keeps (as [`PagePool::limit`]).
+    spare_block_limit: usize,
+}
+
+impl Drop for AllocatorCold {
+    fn drop(&mut self) {
+        for storage in self.spare_blocks.drain(..) {
+            ConsBlock::free_storage(storage);
+        }
+    }
 }
 
 // SAFETY: the raw pointers name block and page storage and boxed objects this
@@ -283,6 +372,9 @@ impl AllocatorCold {
             boxed: Vec::new(),
             charges: Charges::default(),
             open_runs: 0,
+            spare_blocks: Vec::new(),
+            carved_blocks: 0,
+            spare_block_limit: 0,
         }
     }
 
@@ -299,6 +391,46 @@ impl AllocatorCold {
         self.bignums.absorb(&mut local.bignums);
         self.boxed.append(&mut local.boxed);
         self.charges.add(&std::mem::take(&mut local.charges));
+        self.spare_blocks.append(&mut local.spare_blocks);
+        self.carved_blocks += std::mem::take(&mut local.carved_blocks);
+    }
+
+    /// Whether the next carve of CLASS starts a block or page.
+    fn opens(&mut self, class: OwnerClass) -> bool {
+        match class {
+            OwnerClass::Cons => self.carving_block.is_none_or(|base| {
+                self.block_mut(base).block.next_index as usize >= CONS_BLOCK_SIZE
+            }),
+            OwnerClass::Float => self.floats.opens_page(),
+            OwnerClass::String => self.strings.opens_page(),
+            OwnerClass::Vector => self.vectors.opens_page(),
+            OwnerClass::Bignum => self.bignums.opens_page(),
+        }
+    }
+
+    /// How many spare storages of CLASS this state holds.
+    fn spare_len(&self, class: OwnerClass) -> usize {
+        match class {
+            OwnerClass::Cons => self.spare_blocks.len(),
+            OwnerClass::Float => self.floats.spare.len(),
+            OwnerClass::String => self.strings.spare.len(),
+            OwnerClass::Vector => self.vectors.spare.len(),
+            OwnerClass::Bignum => self.bignums.spare.len(),
+        }
+    }
+
+    /// Move up to SPARE_BATCH spare storages of CLASS to TO.
+    fn lend_spare(&mut self, class: OwnerClass, to: &mut AllocatorCold) {
+        match class {
+            OwnerClass::Cons => {
+                let at = self.spare_blocks.len().saturating_sub(SPARE_BATCH);
+                to.spare_blocks.extend(self.spare_blocks.drain(at..));
+            }
+            OwnerClass::Float => self.floats.lend_spare(&mut to.floats),
+            OwnerClass::String => self.strings.lend_spare(&mut to.strings),
+            OwnerClass::Vector => self.vectors.lend_spare(&mut to.vectors),
+            OwnerClass::Bignum => self.bignums.lend_spare(&mut to.bignums),
+        }
     }
 
     fn carve(&mut self, class: OwnerClass, sizes: OwnerRunSizes) -> OwnerRun {
@@ -328,7 +460,11 @@ impl AllocatorCold {
         let (base, first, n) = match reserved {
             Some((base, (first, n))) => (base, first, n),
             None => {
-                let mut block = ConsBlock::new();
+                let mut block = self
+                    .spare_blocks
+                    .pop()
+                    .map_or_else(ConsBlock::new, ConsBlock::over_storage);
+                self.carved_blocks += 1;
                 let (first, n) = block.reserve_tail(want);
                 let base = block.base_addr();
                 self.blocks.push(PendingBlock {
@@ -445,6 +581,10 @@ pub(crate) struct OwnerPages {
     /// keeper's pacing reads them ([`TaggedHeap::bytes_since_gc`]) between
     /// adoptions. Written under the cold mutex.
     pending_bytes: AtomicUsize,
+    /// How many spare storages of each [`OwnerClass`] the cold state
+    /// holds: an owner takes the cold mutex for them only when there are
+    /// some. Written under the cold mutex.
+    spare: [AtomicUsize; 5],
 }
 
 impl OwnerPages {
@@ -457,6 +597,15 @@ impl OwnerPages {
             lock_wait_ns: AtomicU64::new(0),
             adoptions: AtomicU64::new(0),
             pending_bytes: AtomicUsize::new(0),
+            spare: Default::default(),
+        }
+    }
+
+    /// Publish COLD's spare storage counts to [`Self::spare`]; the caller
+    /// holds the cold mutex COLD came from.
+    fn publish_spare(&self, cold: &AllocatorCold) {
+        for class in OwnerClass::ALL {
+            self.spare[class as usize].store(cold.spare_len(class), Ordering::Relaxed);
         }
     }
 
@@ -606,6 +755,12 @@ impl OwnerAllocState {
         self.flush();
         let old = std::mem::take(self.run_mut(class));
         self.local.close(class, old);
+        if self.local.opens(class)
+            && self.local.spare_len(class) == 0
+            && self.shared.spare[class as usize].load(Ordering::Relaxed) > 0
+        {
+            self.take_spare(class);
+        }
         let run = self.local.carve(class, self.sizes);
         self.refills += 1;
         // What other owners handed over, and what we hold.
@@ -631,6 +786,16 @@ impl OwnerAllocState {
             }
         }
         *self.run_mut(class) = run;
+    }
+
+    /// Take a batch of the cold state's spare storage of CLASS: the next
+    /// block or page is carved over swept memory.
+    #[cold]
+    fn take_spare(&mut self, class: OwnerClass) {
+        let shared = Arc::clone(&self.shared);
+        let mut cold = shared.lock();
+        cold.lend_spare(class, &mut self.local);
+        shared.publish_spare(&cold);
     }
 
     #[inline(always)]
@@ -812,6 +977,7 @@ pub(crate) fn close_owner_regions(state: &mut OwnerAllocState) {
     let mut cold = shared.lock();
     cold.absorb(&mut state.local);
     shared.publish_pending(&cold);
+    shared.publish_spare(&cold);
 }
 
 /// Resume allocating after a collection. Runs reopen lazily: the next
@@ -884,6 +1050,45 @@ impl TaggedHeap {
             .as_deref()
             .map(OwnerPages::stats)
             .unwrap_or_default()
+    }
+
+    /// Blocks a sweep emptied and unregistered: owners carve as many as they
+    /// started since the last recycle that saw them start any over their
+    /// storage; the rest go back to the allocator. Keeper only, every
+    /// owner's runs closed.
+    pub(super) fn recycle_released_cons_blocks(&mut self, released: Vec<ConsBlock>) {
+        let Some(shared) = self.owner_pages.as_deref() else {
+            return;
+        };
+        let mut cold = shared.cold.lock();
+        if cold.carved_blocks > 0 {
+            cold.spare_block_limit = std::mem::take(&mut cold.carved_blocks);
+        }
+        let limit = cold.spare_block_limit;
+        for block in released {
+            if cold.spare_blocks.len() < limit {
+                cold.spare_blocks.push(block.into_storage());
+            }
+        }
+        while cold.spare_blocks.len() > limit {
+            ConsBlock::free_storage(cold.spare_blocks.pop().expect("above the limit"));
+        }
+        shared.publish_spare(&cold);
+    }
+
+    /// A sweep released empty pages to each arena's spare storage: owners
+    /// carve some of it ([`PagePool::recycle`]). Keeper only, every owner's
+    /// runs closed.
+    pub(super) fn recycle_spare_pages(&mut self) {
+        let Some(shared) = self.owner_pages.clone() else {
+            return;
+        };
+        let mut cold = shared.cold.lock();
+        cold.floats.recycle(&mut self.float_arena);
+        cold.strings.recycle(&mut self.string_arena);
+        cold.vectors.recycle(&mut self.vector_arena);
+        cold.bignums.recycle(&mut self.bignum_arena);
+        shared.publish_spare(&cold);
     }
 
     /// Move every owner block, page and boxed object no open run still

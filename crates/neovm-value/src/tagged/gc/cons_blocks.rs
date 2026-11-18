@@ -54,6 +54,36 @@ impl ConsBlock {
         }
     }
 
+    /// A fresh block over STORAGE, the storage of a released block
+    /// ([`Self::into_storage`]): zeroed as `new`'s allocation is.
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn over_storage(storage: *mut u8) -> Self {
+        // SAFETY: STORAGE is a whole block's allocation that no block owns.
+        unsafe { storage.write_bytes(0, CONS_BLOCK_BYTES) };
+        clear_cons_observed_block(storage as usize);
+        Self {
+            storage,
+            next_index: 0,
+        }
+    }
+
+    /// Dissolve a block that is no longer registered, keeping its storage
+    /// for a later block ([`Self::over_storage`]) or [`Self::free_storage`].
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn into_storage(self) -> *mut u8 {
+        clear_cons_observed_block(self.base_addr());
+        let storage = self.storage;
+        std::mem::forget(self);
+        storage
+    }
+
+    /// Give a released block's storage back to the allocator.
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn free_storage(storage: *mut u8) {
+        // SAFETY: STORAGE came from `new`'s allocation with this layout.
+        unsafe { alloc::dealloc(storage, Self::layout()) };
+    }
+
     #[inline]
     pub(super) fn base_addr(&self) -> usize {
         self.storage as usize
