@@ -858,3 +858,59 @@ fn a_bytecode_cons_loop_attaches_a_bounded_number_of_times() {
     assert_eq!(row.attach_by_class, 0, "{row:?}");
     assert!(row.attach_by_alloc <= 2, "{row:?}");
 }
+
+/// Detached threads let-bind buffer-local variables of the buffer they all
+/// share, one with a local binding there and one without, and read them
+/// inside the binding. Each bind and unbind looks the variable up in the
+/// buffer's local bindings; no thread may write that shared buffer's lazy
+/// index (`LocalVariableBindings`), and no binding attaches. Run with
+/// `--stress-count`: the race it guards was a `RefCell already borrowed`
+/// panic on whichever thread lost it.
+#[test]
+fn detached_threads_bind_buffer_locals_of_a_shared_buffer_without_attaching() {
+    const THREADS: usize = 4;
+    const ITERATIONS: i64 = 20_000;
+    let mut ev = parallel();
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(progn
+               (defvar tpd-blv-local 0)
+               (make-variable-buffer-local 'tpd-blv-local)
+               (setq tpd-blv-local 5)
+               (defvar tpd-blv-default 7)
+               (make-variable-buffer-local 'tpd-blv-default)
+               (list (local-variable-p 'tpd-blv-local)
+                     (local-variable-p 'tpd-blv-default)))"
+        ),
+        "(t nil)"
+    );
+    let before = stats_so_far(&mut ev);
+    let form = format!(
+        "(let ((k 0) (ts nil))
+           (while (< k {THREADS})
+             (setq ts
+                   (cons (make-thread
+                          (lambda ()
+                            (let ((i 0) (s 0))
+                              (while (< i {ITERATIONS})
+                                (let ((tpd-blv-local i) (tpd-blv-default 1))
+                                  (setq s (+ s tpd-blv-local tpd-blv-default)))
+                                (setq i (1+ i)))
+                              (list s tpd-blv-local tpd-blv-default))))
+                         ts))
+             (setq k (1+ k)))
+           (list (mapcar 'thread-join ts) tpd-blv-local tpd-blv-default))"
+    );
+    let sum = ITERATIONS * (ITERATIONS - 1) / 2 + ITERATIONS;
+    let each = format!("({sum} 5 7)");
+    assert_eq!(
+        eval(&mut ev, &form),
+        format!("(({}) 5 7)", vec![each.as_str(); THREADS].join(" "))
+    );
+    let row = stats_delta(&before, &stats(&mut ev));
+    println!("{THREADS} threads x {ITERATIONS} buffer-local bindings: {row:?}");
+    // Thread start, join and end attach a fixed number of times; one attach
+    // per binding would be at least 4 x 20000 here.
+    assert!(row.attach_count < 64, "the bindings attach: {row:?}");
+}

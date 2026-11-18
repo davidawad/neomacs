@@ -1662,6 +1662,15 @@ impl LocalVariableBindings {
     }
 
     fn binding_cons(&self, sym_id: SymId) -> Option<Value> {
+        // A Parallel World's detached thread (feature `shared-heap`) reads
+        // this buffer beside every other thread, without the Baton, so it
+        // must not build or borrow the index: a `RefCell` is one owner's.
+        // It walks the alist as `assq` does instead; only a Baton holder
+        // keeps the index.
+        #[cfg(feature = "shared-heap")]
+        if neovm_value::detached::is_detached() {
+            return self.binding_cons_by_walk(sym_id);
+        }
         let mut index = self.index.borrow_mut();
         if index.is_none() {
             let mut rebuilt = FxHashMap::default();
@@ -1683,6 +1692,21 @@ impl LocalVariableBindings {
             *index = Some(rebuilt);
         }
         index.as_ref()?.get(&sym_id).copied()
+    }
+
+    /// [`Self::binding_cons`] without the index: the first entry whose car
+    /// is SYM_ID, as `assq` finds it.
+    #[cfg(feature = "shared-heap")]
+    fn binding_cons_by_walk(&self, sym_id: SymId) -> Option<Value> {
+        let mut cursor = self.alist;
+        while cursor.is_cons() {
+            let entry = cursor.cons_car();
+            cursor = cursor.cons_cdr();
+            if entry.is_cons() && entry.cons_car().as_bare_symbol_id() == Some(sym_id) {
+                return Some(entry);
+            }
+        }
+        None
     }
 
     #[doc(hidden)]

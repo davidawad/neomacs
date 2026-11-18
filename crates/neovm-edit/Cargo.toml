@@ -15,6 +15,9 @@ default = ["jit", "neovm-value/sqlite"]
 test-support = ["neovm-value/test-support", "dep:visibility"]
 display-stop-validate = []
 jit = ["neovm-value/jit"]
+# The shared-heap experiment (off by default): a Parallel World's detached
+# thread looks buffer-local bindings up without the buffer's index.
+shared-heap = ["neovm-value/shared-heap"]
 # Numeric redisplay policy injection for dependent fixtures (stage-4 W5/E13:
 # the evaluator re-exports the guard, so the feature must reach this crate).
 redisplay-test-policy = []
