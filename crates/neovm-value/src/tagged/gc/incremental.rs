@@ -456,6 +456,226 @@ impl TaggedHeap {
         done
     }
 
+    /// Sweep, on up to WORKERS threads at once (the threads a Parallel
+    /// World's stop leaves idle), what owner threads allocate the most of:
+    /// every float, string, vector and bignum page the deferred sweep has
+    /// left, and the young list's dead boxed strings, floats, vectors and
+    /// hash tables. Their dead payloads only free allocator memory. The
+    /// young list itself is walked here, on this thread, as a slice walks
+    /// it; the slices that finish the sweep find the pages and the list
+    /// done. The caller holds the world stopped, as for a slice; with a
+    /// collection observation active everything stays for the slices.
+    #[cfg(feature = "shared-heap")]
+    #[doc(hidden)]
+    pub fn sweep_in_stop_on(&mut self, workers: std::num::NonZeroUsize) {
+        assert!(
+            !self.concurrent_mark_running,
+            "sweeping requires an explicit successful marker finish"
+        );
+        if !self.sweep_in_progress || has_noncons_collection_observations() {
+            return;
+        }
+        // Collector code never sees an open allocation region
+        // (`alloc_region.rs`, invariant I2).
+        self.close_alloc_regions();
+        let doomed = self.sweep_young_list_deferring_drops();
+        let parity = self.mark_parity;
+        let generational = self.generational.enabled;
+        let scope = if generational {
+            self.collection_scope()
+        } else {
+            CollectionScope::Young
+        };
+        /// Fewer string and vector pages, or dead boxes, than this per
+        /// thread are swept sooner than a thread starts.
+        const PAGES_PER_THREAD: usize = 32;
+        const BOXES_PER_THREAD: usize = 4096;
+        let ranges = [
+            (self.sweep_float_page_cursor, self.sweep_float_page_end),
+            (self.sweep_string_page_cursor, self.sweep_string_page_end),
+            (self.sweep_vector_page_cursor, self.sweep_vector_page_end),
+            (self.sweep_bignum_page_cursor, self.sweep_bignum_page_end),
+        ];
+        // Strings' and vectors' dead slots free their payloads, which is
+        // the work worth spreading. Float and bignum pages only scan their
+        // bits for slots with nothing (or a few limbs) to free; split across
+        // threads they cost more than on one (the page has to come from
+        // another core's cache to each), so the calling thread keeps them.
+        let pages =
+            ranges[1].1.saturating_sub(ranges[1].0) + ranges[2].1.saturating_sub(ranges[2].0);
+        let parts = workers
+            .get()
+            .min(pages.div_ceil(PAGES_PER_THREAD) + doomed.len().div_ceil(BOXES_PER_THREAD))
+            .max(1);
+        let TaggedHeap {
+            float_arena,
+            string_arena,
+            vector_arena,
+            bignum_arena,
+            ..
+        } = self;
+        let mut floats = float_arena
+            .page_runs(ranges[0].0, ranges[0].1, 1)
+            .into_iter();
+        let mut strings = string_arena
+            .page_runs(ranges[1].0, ranges[1].1, parts)
+            .into_iter();
+        let mut vectors = vector_arena
+            .page_runs(ranges[2].0, ranges[2].1, parts)
+            .into_iter();
+        let mut bignums = bignum_arena
+            .page_runs(ranges[3].0, ranges[3].1, 1)
+            .into_iter();
+        let mut boxes = doomed.chunks(doomed.len().div_ceil(parts).max(1));
+        // One thread's share: a run of each class, and some of the boxes.
+        let shares: Vec<_> = (0..parts)
+            .map(|_| {
+                (
+                    floats.next(),
+                    strings.next(),
+                    vectors.next(),
+                    bignums.next(),
+                    boxes.next().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let sweep_share = |(floats, strings, vectors, bignums, boxes): (
+            Option<PageRun<'_, FloatObj>>,
+            Option<PageRun<'_, StringObj>>,
+            Option<PageRun<'_, VectorObj>>,
+            Option<PageRun<'_, BignumObj>>,
+            &[DoomedBox],
+        )| {
+            macro_rules! sweep {
+                ($run:expr, $collect:expr) => {
+                    $run.map(|run| {
+                        if generational {
+                            run.sweep::<true>(parity, scope, $collect)
+                        } else {
+                            run.sweep::<false>(parity, scope, $collect)
+                        }
+                    })
+                };
+            }
+            for doomed in boxes {
+                // SAFETY: each dead box is in exactly one share, already
+                // unlinked from every list and registry.
+                unsafe { doomed.drop_box() };
+            }
+            (
+                sweep!(floats, false),
+                sweep!(strings, false),
+                sweep!(vectors, true),
+                sweep!(bignums, false),
+            )
+        };
+        let swept: Vec<_> = std::thread::scope(|threads| {
+            let mut shares = shares.into_iter();
+            let mine = shares.next().expect("at least one share");
+            let spawned: Vec<_> = shares
+                .map(|share| threads.spawn(move || sweep_share(share)))
+                .collect();
+            let mut swept = vec![sweep_share(mine)];
+            swept.extend(spawned.into_iter().map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            }));
+            swept
+        });
+        let mut float_runs = Vec::new();
+        let mut string_runs = Vec::new();
+        let mut vector_runs = Vec::new();
+        let mut bignum_runs = Vec::new();
+        for (floats, strings, vectors, bignums) in swept {
+            float_runs.extend(floats);
+            string_runs.extend(strings);
+            vector_runs.extend(vectors);
+            bignum_runs.extend(bignums);
+        }
+        let mut vectors = Vec::new();
+        let mut live = 0usize;
+        let mut freed = 0usize;
+        for (class_live, class_freed) in [
+            self.float_arena.link_swept_runs(float_runs, None),
+            self.string_arena.link_swept_runs(string_runs, None),
+            self.vector_arena
+                .link_swept_runs(vector_runs, Some(&mut vectors)),
+            self.bignum_arena.link_swept_runs(bignum_runs, None),
+        ] {
+            live = live.saturating_add(class_live);
+            freed += class_freed;
+        }
+        self.sweep_float_page_cursor = ranges[0].1.max(ranges[0].0);
+        self.sweep_string_page_cursor = ranges[1].1.max(ranges[1].0);
+        self.sweep_vector_page_cursor = ranges[2].1.max(ranges[2].0);
+        self.sweep_bignum_page_cursor = ranges[3].1.max(ranges[3].0);
+        for addr in vectors {
+            let removed = self.vector_object_addrs.remove(&addr);
+            debug_assert!(removed, "freed page vector was not in the registry");
+        }
+        self.current_mutator_gc_mut().allocated_count = self
+            .current_mutator_gc()
+            .allocated_count
+            .saturating_sub(freed);
+        self.sweep_noncons_live_bytes = self.sweep_noncons_live_bytes.saturating_add(live);
+        self.sweep_noncons_freed += freed;
+    }
+
+    /// The young list's part of a slice, for the whole list: survivors
+    /// relink, tenured objects move to the old list, and each dead object
+    /// leaves its registries. A dead boxed string, float, vector or hash
+    /// table is returned for [`Self::sweep_in_stop_on`] to drop; any other
+    /// dead object is freed here.
+    #[cfg(feature = "shared-heap")]
+    fn sweep_young_list_deferring_drops(&mut self) -> Vec<DoomedBox> {
+        // As in `incremental_sweep_slice`: the list is young-only and no
+        // flip happens while this sweep drains.
+        let parity = self.mark_parity;
+        let mut doomed = Vec::new();
+        let mut freed = 0usize;
+        while !self.sweep_noncons_pending.is_null() {
+            let current = self.sweep_noncons_pending;
+            // SAFETY: as in `incremental_sweep_slice`; a deferred box is
+            // detached from every list and registry before it is returned.
+            unsafe {
+                self.sweep_noncons_pending = (*current).next;
+                if (*current).tenured && !(*current).generation.permanent() {
+                    self.link_old_object_world_stopped(current);
+                    continue;
+                }
+                if (*current).is_marked_at(parity) {
+                    (*current).next = self.all_objects;
+                    self.all_objects = current;
+                    self.sweep_noncons_live_bytes = self
+                        .sweep_noncons_live_bytes
+                        .saturating_add(self.collector_object_bytes(current));
+                    continue;
+                }
+                self.non_cons_object_addrs.remove(&(current as usize));
+                self.unregister_vector_object(current);
+                match DoomedBox::of(current) {
+                    Some(boxed) => {
+                        if let Some(table) = boxed.hash_table() {
+                            // As `free_gc_object` leaves the registry.
+                            if self.always_swept_weak_tables_set.remove(&table) {
+                                self.always_swept_weak_tables
+                                    .retain(|&registered| registered != table);
+                            }
+                        }
+                        doomed.push(boxed);
+                    }
+                    None => self.free_gc_object(current, ReclamationMode::Explicit),
+                }
+                self.current_mutator_gc_mut().allocated_count =
+                    self.current_mutator_gc().allocated_count.saturating_sub(1);
+                freed += 1;
+            }
+        }
+        self.sweep_noncons_freed += freed;
+        doomed
+    }
+
     /// Drive the deferred sweep to completion in one shot (forced GC, or before
     /// the next mark / a stop-the-world collection can begin).
     #[doc(hidden)]
@@ -2787,6 +3007,67 @@ impl TaggedHeap {
                     page.on_partial,
                     "page {page_index} has free slots but is off the partial chain",
                 );
+            }
+        }
+    }
+}
+
+/// A dead young boxed object whose drop only frees allocator memory, for
+/// [`TaggedHeap::sweep_in_stop_on`] to drop on another thread.
+#[cfg(feature = "shared-heap")]
+struct DoomedBox(*mut GcHeader);
+
+// SAFETY: a doomed box is unlinked from every list and registry, so the
+// thread dropping it is the only one to touch it, and the kinds `of` admits
+// own nothing but allocator memory.
+#[cfg(feature = "shared-heap")]
+unsafe impl Send for DoomedBox {}
+#[cfg(feature = "shared-heap")]
+unsafe impl Sync for DoomedBox {}
+
+#[cfg(feature = "shared-heap")]
+impl DoomedBox {
+    /// HEADER, a dead young object, when it is a boxed string, float, vector
+    /// or hash table.
+    ///
+    /// # Safety
+    /// HEADER is an initialized object header.
+    unsafe fn of(header: *mut GcHeader) -> Option<Self> {
+        let admitted = match unsafe { (*header).kind } {
+            HeapObjectKind::String | HeapObjectKind::Float => true,
+            HeapObjectKind::VecLike => matches!(
+                unsafe { (*(header as *mut VecLikeHeader)).type_tag },
+                VecLikeType::Vector | VecLikeType::HashTable
+            ),
+            _ => false,
+        };
+        admitted.then_some(Self(header))
+    }
+
+    /// The table, when this is a hash table.
+    fn hash_table(&self) -> Option<*mut HashTableObj> {
+        // SAFETY: `of` admitted an initialized header; the box is not freed.
+        unsafe {
+            ((*self.0).kind == HeapObjectKind::VecLike
+                && (*(self.0 as *mut VecLikeHeader)).type_tag == VecLikeType::HashTable)
+                .then_some(self.0 as *mut HashTableObj)
+        }
+    }
+
+    /// Drop the box, as `free_gc_object` would.
+    ///
+    /// # Safety
+    /// Called once, by the only thread holding this box.
+    unsafe fn drop_box(&self) {
+        let header = self.0;
+        unsafe {
+            match (*header).kind {
+                HeapObjectKind::String => drop(Box::from_raw(header as *mut StringObj)),
+                HeapObjectKind::Float => drop(Box::from_raw(header as *mut FloatObj)),
+                _ => match (*(header as *mut VecLikeHeader)).type_tag {
+                    VecLikeType::Vector => drop(Box::from_raw(header as *mut VectorObj)),
+                    _ => drop(Box::from_raw(header as *mut HashTableObj)),
+                },
             }
         }
     }

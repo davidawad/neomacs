@@ -238,6 +238,11 @@ impl StopWorld {
         }
     }
 
+    /// How many threads are parked with an image.
+    fn parked(&self) -> usize {
+        self.lock_state().images.len()
+    }
+
     /// The requester of [`Self::request_and_park`] holds the Baton: its
     /// roots are its Context's again.
     pub(crate) fn withdraw_image(&self) {
@@ -489,6 +494,10 @@ impl Context {
             collect(self);
             lock.collection_runs();
             if finish_cycle && !roots.is_empty() {
+                // The parked threads' CPUs sweep what owner threads
+                // allocate the most of; the slices below finish the rest.
+                let workers = std::num::NonZeroUsize::MIN.saturating_add(stop.parked());
+                self.tagged_heap.sweep_in_stop_on(workers);
                 while matches!(
                     self.tagged_heap.mark_phase(),
                     MarkPhase::Sweeping | MarkPhase::StoppedMarking
