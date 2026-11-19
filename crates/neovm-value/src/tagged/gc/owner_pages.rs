@@ -30,8 +30,8 @@
 //! As many as owners started between the last two sweeps go to the cold
 //! state's spare lists ([`TaggedHeap::recycle_released_cons_blocks`],
 //! [`TaggedHeap::recycle_spare_pages`]); an owner about to open a block or
-//! page takes a batch of them under the cold mutex, so it pays the
-//! allocator's fresh memory only when no swept storage is left.
+//! page takes one of them under the cold mutex, so it pays the allocator's
+//! fresh memory only when no swept storage is left.
 //!
 //! Everything here is `#[cfg(feature = "shared-heap")]`; without an installed
 //! [`OwnerAllocState`] the allocation entry points take the keeper path.
@@ -41,8 +41,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 /// How many spare blocks or pages of one class an owner takes from the cold
-/// state at once.
-const SPARE_BATCH: usize = 8;
+/// state at once: one, the block or page it is about to start. Recycling
+/// keeps as many spares as owners started in the last cycle; a batch's
+/// uncarved rest, handed back at the owner's next close, counted toward no
+/// cycle, so each cycle fell short by every owner's rest and took fresh
+/// memory for it, while the next recycle returned as much to the arena to
+/// be freed. A block or page is 64 KB of allocation per cold-mutex take.
+const SPARE_BATCH: usize = 1;
 
 /// How many cells or slots an owner takes per refill, at most: a run never
 /// crosses its block or page.
@@ -71,6 +76,9 @@ pub(crate) struct OwnerAllocStats {
     pub(crate) lock_wait_ns: u64,
     /// Keeper adoptions that moved at least one block, page or object.
     pub(crate) adoptions: u64,
+    /// Blocks and pages owners started over fresh allocator memory, not
+    /// over swept storage.
+    pub(crate) fresh: u64,
 }
 
 /// The size classes an owner carves runs of.
@@ -596,6 +604,7 @@ pub(crate) struct OwnerPages {
     locks: AtomicU64,
     lock_wait_ns: AtomicU64,
     adoptions: AtomicU64,
+    fresh: AtomicU64,
     /// The bytes the cold state's charges hold, not yet adopted: the
     /// keeper's pacing reads them ([`TaggedHeap::bytes_since_gc`]) between
     /// adoptions. Written under the cold mutex.
@@ -625,6 +634,7 @@ impl OwnerPages {
             locks: AtomicU64::new(0),
             lock_wait_ns: AtomicU64::new(0),
             adoptions: AtomicU64::new(0),
+            fresh: AtomicU64::new(0),
             pending_bytes: AtomicUsize::new(0),
             held_bytes: AtomicUsize::new(0),
             holders: AtomicUsize::new(0),
@@ -672,6 +682,7 @@ impl OwnerPages {
             locks: self.locks.load(Ordering::Relaxed),
             lock_wait_ns: self.lock_wait_ns.load(Ordering::Relaxed),
             adoptions: self.adoptions.load(Ordering::Relaxed),
+            fresh: self.fresh.load(Ordering::Relaxed),
         }
     }
 }
@@ -826,11 +837,13 @@ impl OwnerAllocState {
         self.flush();
         let old = std::mem::take(self.run_mut(class));
         self.local.close(class, old);
-        if self.local.opens(class)
-            && self.local.spare_len(class) == 0
-            && self.shared.spare[class as usize].load(Ordering::Relaxed) > 0
-        {
-            self.take_spare(class);
+        if self.local.opens(class) && self.local.spare_len(class) == 0 {
+            if self.shared.spare[class as usize].load(Ordering::Relaxed) > 0 {
+                self.take_spare(class);
+            }
+            if self.local.spare_len(class) == 0 {
+                self.shared.fresh.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let run = self.local.carve(class, self.sizes);
         self.refills += 1;

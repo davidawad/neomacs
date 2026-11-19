@@ -711,3 +711,45 @@ fn adoption_threads_exactly_the_never_handed_slots() {
     assert_eq!(threaded, expected);
     assert!(page.on_partial);
 }
+
+/// Four owners each fill five float pages with garbage per round, then a
+/// collection empties them all, and recycling keeps as many swept pages as
+/// the owners started. From the second round on the owners start every
+/// page over that swept storage, none over fresh allocator memory. (Taken
+/// eight at a time, each owner's uncarved rest went back to the cold state
+/// at its close, uncounted: every round fell short by as much and took it
+/// fresh, and the next recycle left as much to be freed.)
+#[test]
+fn owners_carve_only_swept_storage_once_their_rounds_repeat() {
+    crate::test_utils::init_test_tracing();
+    const OWNERS: usize = 4;
+    const PAGES: usize = 5;
+    const ROUNDS: usize = 6;
+    let mut heap = TestHeap::new();
+    heap.install();
+    let mut states: Vec<_> = (0..OWNERS).map(|_| heap.new_owner_alloc_state()).collect();
+    let mut fresh = Vec::new();
+    for _ in 0..ROUNDS {
+        let before = heap.owner_alloc_stats().fresh;
+        detached_section(&heap, &mut states, |_| {
+            for i in 0..PAGES * ObjectPage::<FloatObj>::SLOTS {
+                Value::make_float(i as f64);
+            }
+        });
+        fresh.push(heap.owner_alloc_stats().fresh - before);
+        heap.collect_exact(std::iter::empty());
+        for state in &mut states {
+            reopen_owner_regions(state);
+        }
+    }
+    assert_eq!(
+        fresh[0],
+        (OWNERS * PAGES) as u64,
+        "the first round starts every page fresh"
+    );
+    assert_eq!(
+        fresh[1..],
+        [0; ROUNDS - 1],
+        "fresh pages per round: {fresh:?}"
+    );
+}
