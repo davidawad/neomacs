@@ -11,7 +11,7 @@ use crate::output::window_request::{OutputWindowLifecycleRequest, OutputWindowRo
 use neomacs_display_protocol::frame_glyphs::GlyphRowRole;
 use neomacs_display_protocol::frame_glyphs::PhysCursor;
 use neomacs_display_protocol::glyph_matrix::MatrixRow;
-use neomacs_display_protocol::glyph_matrix::{GlyphMatrix, GlyphRow, WindowMatrixEntry};
+use neomacs_display_protocol::glyph_matrix::{GlyphArea, GlyphMatrix, GlyphRow, WindowMatrixEntry};
 use neomacs_display_protocol::types::{DisplayWindowId, Rect};
 
 /// Owned by one exclusive frame-build attempt, never shared across mutators.
@@ -699,9 +699,18 @@ impl OutputWindowRowGrid {
             self.finalized_rows.resize(rows, false);
         }
         self.clear_finalized(begin.row);
+        let ncols = self.matrix.ncols;
         let Some(row) = self.row_mut(begin.row) else {
             return;
         };
+        if begin.start_charpos.is_some() {
+            // A buffer-text row fills up to the matrix width, as GNU's glyph
+            // rows are allocated at the window's width: size the text area
+            // once instead of growing it glyph by glyph through every
+            // power of two on every row of every frame.
+            let text = &mut row.glyphs[GlyphArea::Text.index()];
+            text.reserve(ncols.saturating_sub(text.len()));
+        }
         begin.apply_to_row(row);
     }
 

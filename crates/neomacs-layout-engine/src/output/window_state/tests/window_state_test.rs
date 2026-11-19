@@ -75,3 +75,20 @@ fn cursor_row_lookup_assigns_a_shared_non_zv_endpoint_to_the_following_row() {
 
     assert_eq!(grid.find_cursor_row_for_charpos(5), Some(1));
 }
+
+#[test]
+fn begun_buffer_text_row_reserves_the_matrix_width_and_chrome_rows_do_not() {
+    let mut grid = OutputWindowRowGrid::new(3, 80);
+    grid.begin_row(OutputRowBeginRequest::text_at(
+        0,
+        crate::types::LayoutCharPos0::new(5),
+    ));
+    grid.begin_row(OutputRowBeginRequest::new(2, GlyphRowRole::ModeLine, true));
+    let text = &grid.row(0).expect("text row").glyphs[GlyphArea::Text.index()];
+    assert!(text.is_empty());
+    assert!(text.capacity() >= 80, "capacity {}", text.capacity());
+    let mode_line = &grid.row(2).expect("mode line").glyphs[GlyphArea::Text.index()];
+    assert_eq!(mode_line.capacity(), 0);
+    // The rows the walk did not begin stay the shared inert row.
+    assert!(!grid.row(1).expect("unbegun row").enabled);
+}
