@@ -753,3 +753,141 @@ fn owners_carve_only_swept_storage_once_their_rounds_repeat() {
         "fresh pages per round: {fresh:?}"
     );
 }
+
+/// A minor collection that seeds exactly ROOTS, its sweep finished.
+fn minor(heap: &mut TestHeap, roots: &[TaggedValue]) {
+    heap.begin_minor_collection().unwrap();
+    for &root in roots {
+        heap.seed_root(root);
+    }
+    heap.complete_minor_collection();
+    heap.finish_incremental_sweep_now();
+}
+
+/// A generational heap that owner threads allocate from, and one owner.
+fn generational_heap_with_an_owner() -> (TestHeap, Box<OwnerAllocState>) {
+    let mut heap = TestHeap::new();
+    // SAFETY: a fresh heap, no marker and no compiled leaf yet.
+    unsafe { heap.set_generational_enabled(true) };
+    heap.install();
+    let owner = heap.new_owner_alloc_state();
+    (heap, owner)
+}
+
+/// While owners allocate, a minor keeps a non-cons object it finds live for
+/// the first time young, and the next minor that finds it live promotes
+/// it; one that does not frees it. A first-time survivor that an object
+/// old after the promotion references is promoted at once: reached from a
+/// remembered old vector, from the dirty card of an old cons, from a
+/// surviving young cons, or from an aged survivor, transitively.
+#[test]
+fn a_parallel_minor_promotes_a_first_time_survivor_only_under_an_old_referrer() {
+    crate::test_utils::init_test_tracing();
+    let (mut heap, _owner) = generational_heap_with_an_owner();
+    let string = |heap: &mut TestHeap, s: &str| heap.alloc_string(LispString::from_utf8(s));
+    let alone = heap.alloc_bignum(owner_bignum(0, 1));
+    let inner = string(&mut heap, "inner");
+    let middle = heap.alloc_vector(vec![inner]);
+    let outer = heap.alloc_vector(vec![middle]);
+    let under_cons = string(&mut heap, "under a cons");
+    let cons = heap.alloc_cons(under_cons, TaggedValue::NIL);
+    let doomed = heap.alloc_bignum(owner_bignum(0, 2));
+    minor(&mut heap, &[alone, outer, cons, doomed]);
+    for young in [alone, inner, middle, outer, doomed] {
+        assert!(
+            !heap.value_is_old_for_test(young),
+            "{young:?} survived once"
+        );
+    }
+    assert!(heap.value_is_old_for_test(cons));
+    assert!(heap.value_is_old_for_test(under_cons), "a cons promotes it");
+
+    // An aged vector's new child is promoted with it.
+    let late = string(&mut heap, "late");
+    assert!(crate::tagged::mutate::set_vector_slot(outer, 0, late));
+    let doomed_ptr = doomed.as_veclike_ptr().expect("a bignum");
+    minor(&mut heap, &[alone, outer, middle]);
+    for old in [alone, outer, middle, inner, late] {
+        assert!(heap.value_is_old_for_test(old), "{old:?} survived twice");
+    }
+    assert!(
+        !heap.bignum_arena.owns(doomed_ptr.cast()),
+        "an unrooted first-time survivor dies young"
+    );
+
+    // Old owners' new children: the remembered vector's and the dirty card's.
+    let logged = string(&mut heap, "logged");
+    let carded = string(&mut heap, "carded");
+    assert!(crate::tagged::mutate::set_vector_slot(outer, 0, logged));
+    assert!(crate::tagged::mutate::set_cons_car(cons, carded));
+    let rooted = string(&mut heap, "rooted");
+    minor(&mut heap, &[outer, cons, rooted]);
+    assert!(heap.value_is_old_for_test(logged), "R_seed promotes it");
+    assert!(heap.value_is_old_for_test(carded), "the card promotes it");
+    assert!(!heap.value_is_old_for_test(rooted));
+    assert_eq!(heap.remembered_log_len_for_test(), 0);
+}
+
+/// Without owners a minor promotes every survivor, as before.
+#[test]
+fn a_minor_without_owners_promotes_a_first_time_survivor() {
+    crate::test_utils::init_test_tracing();
+    let mut heap = TestHeap::new();
+    // SAFETY: a fresh heap, no marker and no compiled leaf yet.
+    unsafe { heap.set_generational_enabled(true) };
+    heap.install();
+    let alone = heap.alloc_bignum(owner_bignum(0, 1));
+    minor(&mut heap, &[alone]);
+    assert!(heap.value_is_old_for_test(alone));
+}
+
+/// Four owners each fill three bignum pages per round and keep the last
+/// bignum, an accumulator, live across the round's minor. The accumulator
+/// dies in the next round. Promoted at its first minor, each pinned its
+/// page until a major, so every round started one fresh page per owner;
+/// kept young, it dies in the next minor and its page is swept storage the
+/// owners carve again.
+#[test]
+fn owners_carve_an_accumulators_page_again_once_it_dies_young() {
+    crate::test_utils::init_test_tracing();
+    const OWNERS: usize = 4;
+    const PAGES: usize = 3;
+    const ROUNDS: usize = 6;
+    let (mut heap, first) = generational_heap_with_an_owner();
+    let mut states = vec![first];
+    states.extend((1..OWNERS).map(|_| heap.new_owner_alloc_state()));
+    let n = PAGES * ObjectPage::<BignumObj>::SLOTS;
+    let mut fresh = Vec::new();
+    for round in 0..ROUNDS {
+        let before = heap.owner_alloc_stats().fresh;
+        let accumulators = detached_section(&heap, &mut states, |tag| {
+            let mut last = 0;
+            for i in 0..n {
+                last = Value::make_integer(owner_bignum(tag, round * n + i)).bits();
+            }
+            last
+        });
+        fresh.push(heap.owner_alloc_stats().fresh - before);
+        let roots: Vec<_> = accumulators.iter().copied().map(value).collect();
+        minor(&mut heap, &roots);
+        for (tag, &root) in roots.iter().enumerate() {
+            assert_eq!(
+                root.as_bignum(),
+                Some(&owner_bignum(tag, round * n + n - 1))
+            );
+        }
+        for state in &mut states {
+            reopen_owner_regions(state);
+        }
+    }
+    assert_eq!(
+        fresh[0],
+        (OWNERS * PAGES) as u64,
+        "the first round starts every page fresh"
+    );
+    assert_eq!(
+        fresh[2..],
+        [0; ROUNDS - 2],
+        "fresh pages per round: {fresh:?}"
+    );
+}

@@ -397,6 +397,10 @@ impl TaggedHeap {
         }
         let partition_first = self.partition_dump && !self.dump_blackened;
         let mut headers = std::mem::take(&mut self.generational.promo);
+        #[cfg(feature = "shared-heap")]
+        if !partition_first && self.keeps_first_survivors_young() {
+            self.keep_first_survivors_young_world_stopped(&mut headers);
+        }
         for mutator in self.mutators() {
             headers.extend(mutator.black_born.iter().copied());
             for region in &mutator.black_born_regions {
@@ -488,6 +492,165 @@ impl TaggedHeap {
         );
         if !partition_first {
             self.clear_black_births_world_stopped();
+        }
+    }
+
+    /// Whether this minor keeps its first-time survivors young: only while
+    /// owner threads allocate (a Parallel World). There a minor stops every
+    /// thread, and what one of them holds at the stop (a bignum accumulator,
+    /// a document being parsed) mostly dies soon after; promoted, it would
+    /// stay until a major and pin its page.
+    #[cfg(feature = "shared-heap")]
+    #[inline]
+    fn keeps_first_survivors_young(&self) -> bool {
+        self.is_minor_collection()
+            && !self.generational.major_in_progress
+            && self.owner_pages.is_some()
+    }
+
+    /// Age-2 promotion of a minor's non-cons survivors (P3.1 C3.3): take the
+    /// first-time survivors out of HEADERS and mark them aged, except those
+    /// an object that is old after this promotion references. Those are
+    /// reached from this cycle's remembered owners (R_seed and the old cells
+    /// of dirty cards), from an aged survivor, from a marked young cons
+    /// (conses promote at their first survival), or from another such
+    /// survivor, transitively. So no old object references a young one
+    /// after the promotion, the invariant the remembered-set reset relies
+    /// on. Every mutator is stopped and the marker has joined.
+    #[cfg(feature = "shared-heap")]
+    #[cold]
+    #[inline(never)]
+    fn keep_first_survivors_young_world_stopped(&mut self, headers: &mut Vec<*mut GcHeader>) {
+        // SAFETY (all header reads below): every pointer in HEADERS is a
+        // live, marked young header of this heap, and nothing is freed
+        // before the sweep this promotion arms.
+        let mut young: FxHashSet<usize> = headers
+            .iter()
+            .filter(|&&ptr| unsafe { !(*ptr).tenured && !(*ptr).generation.aged() })
+            .map(|&ptr| ptr as usize)
+            .collect();
+        if young.is_empty() {
+            return;
+        }
+        let mut promote: Vec<*mut GcHeader> = headers
+            .iter()
+            .copied()
+            .filter(|&ptr| !young.contains(&(ptr as usize)))
+            .collect();
+        // A first-time survivor CHILD reached from an object that will be
+        // old is promoted, and what it references is reached next.
+        fn reach(
+            young: &mut FxHashSet<usize>,
+            promote: &mut Vec<*mut GcHeader>,
+            child: TaggedValue,
+        ) {
+            if !child.is_cons()
+                && let Some(addr) = TaggedHeap::value_heap_addr(child)
+                && young.remove(&addr)
+            {
+                promote.push(addr as *mut GcHeader);
+            }
+        }
+        let mut seed = Vec::new();
+        let mut visit = |child| reach(&mut young, &mut seed, child);
+        for &owner in &self.generational.r_seed {
+            self.for_each_strong_child(owner, &mut visit);
+        }
+        self.for_each_dirty_card_child(&mut visit);
+        for block in &self.cons_blocks {
+            let trailer = block.trailer();
+            for word in 0..cons_mark_words(block.next_index as usize) {
+                let marked = trailer.mark_word(word).load(Ordering::Relaxed) as u64;
+                let mut cells = marked & !trailer.old_word(word);
+                while cells != 0 {
+                    let index = word * CONS_MARK_BITS_PER_WORD + cells.trailing_zeros() as usize;
+                    cells &= cells - 1;
+                    // SAFETY: a marked cell of an owned block is a live cons.
+                    let children = unsafe {
+                        let cell = block.cells_ptr().add(index);
+                        [(*cell).load_car(), (*cell).load_cdr()]
+                    };
+                    children.into_iter().for_each(&mut visit);
+                }
+            }
+        }
+        promote.append(&mut seed);
+        while let Some(ptr) = promote.pop() {
+            self.for_each_header_child(ptr, &mut |child| reach(&mut young, &mut promote, child));
+        }
+        headers.retain(|&ptr| {
+            if !young.contains(&(ptr as usize)) {
+                return true;
+            }
+            // SAFETY: as above; the generation byte is written only here
+            // and at promotion, with every mutator stopped.
+            let header = unsafe { &mut *ptr };
+            header.generation = header.generation.with_aged();
+            false
+        });
+    }
+
+    /// Every heap child of OWNER, weak ones included.
+    #[cfg(feature = "shared-heap")]
+    fn for_each_strong_child(&self, owner: TaggedValue, visit: &mut impl FnMut(TaggedValue)) {
+        if owner.is_cons() {
+            let ptr = owner.gc_cons_ptr();
+            // SAFETY: a remembered cons owner is live until the sweep.
+            let children = unsafe { [(*ptr).load_car(), (*ptr).load_cdr()] };
+            children.into_iter().for_each(visit);
+        } else if let Some(addr) = Self::value_heap_addr(owner) {
+            self.for_each_header_child(addr as *mut GcHeader, visit);
+        }
+    }
+
+    /// Every heap child of the non-cons object at HEADER, weak ones
+    /// included. Floats have none.
+    #[cfg(feature = "shared-heap")]
+    fn for_each_header_child(&self, header: *mut GcHeader, visit: &mut impl FnMut(TaggedValue)) {
+        // SAFETY: HEADER is a live object's header (callers' contract); its
+        // kind names the object it prefixes.
+        match unsafe { (*header).kind } {
+            HeapObjectKind::VecLike => Self::for_each_veclike_child(
+                self.collector_tables(),
+                header.cast::<VecLikeHeader>(),
+                &mut super::mark_sweep::VisitChild(|child| visit(child)),
+            ),
+            HeapObjectKind::String => {
+                // SAFETY: as above, a string object.
+                let intervals = unsafe { (*header.cast::<StringObj>()).data.intervals() };
+                if !intervals.is_empty() {
+                    intervals.for_each_root(|root| visit(root));
+                }
+            }
+            HeapObjectKind::Float => {}
+        }
+    }
+
+    /// Both children of every old cell in a dirty card, as
+    /// [`Self::trace_dirty_card_owners_world_stopped`] reaches them.
+    #[cfg(feature = "shared-heap")]
+    fn for_each_dirty_card_child(&self, visit: &mut impl FnMut(TaggedValue)) {
+        let slots = self.card_slots().map_or(0, |slots| slots.dirty().len());
+        for slot_index in 0..slots {
+            let Some((chunk, blocks)) = self.dirty_slot_blocks(slot_index) else {
+                continue;
+            };
+            for block in blocks {
+                let block = &self.cons_blocks[block];
+                for offset in chunk.dirty_offsets() {
+                    let (first, mut old) = block.old_cells_in_card(offset);
+                    while old != 0 {
+                        let index = first + old.trailing_zeros() as usize;
+                        old &= old - 1;
+                        // SAFETY: an old cell of an owned block is a live cons.
+                        let children = unsafe {
+                            let cell = block.cells_ptr().add(index);
+                            [(*cell).load_car(), (*cell).load_cdr()]
+                        };
+                        children.into_iter().for_each(&mut *visit);
+                    }
+                }
+            }
         }
     }
 

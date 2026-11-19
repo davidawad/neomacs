@@ -535,7 +535,9 @@ pub const UNMARKED_AT_REST: u8 = 0;
 ///   exactly those permanent, and a [`ImageResident`] proof is required:
 ///   never traced, never swept, not even by a major. Implies `tenured`.
 ///   Runtime survivors of that same cycle are only tenured, never permanent.
-/// - bit 1: reserved for the age bit of P3.1 C3.3 (age-2 promotion).
+/// - bit 1 `aged`: a young object that survived one minor collection
+///   without promotion (P3.1 C3.3, age-2 promotion). Written only at a
+///   world-stopped promotion; the next minor that finds it live promotes it.
 ///
 /// The pdump image writes this byte as 0 and it is never read for mapped
 /// objects.
@@ -545,6 +547,8 @@ pub struct GenBits(u8);
 
 impl GenBits {
     const PERMANENT: u8 = 1 << 0;
+    #[cfg(feature = "shared-heap")]
+    const AGED: u8 = 1 << 1;
 
     /// No generation bits: a young (or old, not permanent) object.
     pub const NONE: Self = Self(0);
@@ -553,6 +557,20 @@ impl GenBits {
     #[inline(always)]
     pub fn permanent(self) -> bool {
         self.0 & Self::PERMANENT != 0
+    }
+
+    /// Has the (young) object survived a minor collection already?
+    #[cfg(feature = "shared-heap")]
+    #[inline(always)]
+    pub(crate) fn aged(self) -> bool {
+        self.0 & Self::AGED != 0
+    }
+
+    /// These bits with `aged` set.
+    #[cfg(feature = "shared-heap")]
+    #[inline]
+    pub(crate) fn with_aged(self) -> Self {
+        Self(self.0 | Self::AGED)
     }
 
     /// These bits with `permanent` set. Private to [`GcHeader::make_permanent`],
