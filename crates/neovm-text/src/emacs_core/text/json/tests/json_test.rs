@@ -1564,3 +1564,31 @@ fn parse_reports_each_key_symbol_once_per_parse() {
     parser.parse().expect("valid JSON parses");
     assert!(parser.key_ids.is_empty());
 }
+
+/// `json-serialize` writes into a per-thread buffer it reuses: an output
+/// left half-written by an error, or one too large to keep, never leaks
+/// into the next result.
+#[test]
+fn serialize_reuses_its_buffer_without_leaking_output() {
+    crate::test_utils::init_test_tracing();
+    let serialize = |value: Value| {
+        builtin_json_serialize(vec![value]).map(|json| json.as_utf8_str().map(str::to_owned))
+    };
+    let mut nested = Value::fixnum(1);
+    for _ in 0..60 {
+        nested = Value::vector(vec![Value::string("partial"), nested]);
+    }
+    assert!(serialize(nested).is_err(), "51 levels exceed GNU's depth");
+    assert_eq!(serialize(Value::fixnum(7)).unwrap().as_deref(), Some("7"));
+
+    let large = "x".repeat(JsonOutput::MAX_RETAINED_BYTES);
+    let expected = format!("[\"{large}\"]");
+    let parsed = serialize(Value::vector(vec![Value::string(large.as_str())])).unwrap();
+    assert_eq!(parsed.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        serialize(Value::vector(vec![Value::string("a"), Value::T]))
+            .unwrap()
+            .as_deref(),
+        Some(r#"["a",true]"#)
+    );
+}

@@ -655,6 +655,13 @@ const TLS_CLASSIFICATION: &[(&str, &str, TlsClass)] = &[
         "OBJECT_KEY_SYMBOLS",
         TlsClass::CarrierIntrinsic,
     ),
+    // CarrierIntrinsic: no Lisp Value; the JSON serializer's reused output
+    // bytes, taken for one call and given back cleared on the next take.
+    (
+        "neovm-text/src/emacs_core/text/json/mod.rs",
+        "JSON_OUTPUT",
+        TlsClass::CarrierIntrinsic,
+    ),
     (
         "neovm-value/src/error/mod.rs",
         "IN_FLIGHT_ROOTS",

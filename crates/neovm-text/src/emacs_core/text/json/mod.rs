@@ -311,10 +311,59 @@ fn check_container_depth(depth: usize) -> Result<(), Flow> {
     Ok(())
 }
 
-fn serialize_to_json(value: &Value, opts: &SerializeOpts, depth: usize) -> Result<String, Flow> {
-    let mut out = String::new();
-    serialize_into(&mut out, value, opts, depth)?;
+fn serialize_to_json(
+    value: &Value,
+    opts: &SerializeOpts,
+    depth: usize,
+) -> Result<JsonOutput, Flow> {
+    let mut out = JsonOutput::take();
+    serialize_into(&mut out.text, value, opts, depth)?;
     Ok(out)
+}
+
+/// The buffer `json-serialize` and `json-insert` write into: this thread's,
+/// reused from call to call.
+///
+/// A JSON-RPC client serializes a message per request, a few hundred bytes
+/// each; growing a fresh `String` to that size reallocated and copied it
+/// half a dozen times per message, which was most of `json-serialize`'s
+/// cost after the one-buffer serializer. The buffer is taken for the call
+/// and given back on drop (each thread owns its own; a nested call, from a
+/// `json-insert` change hook, just takes an empty one). A buffer that grew
+/// past [`Self::MAX_RETAINED_BYTES`] is freed rather than kept.
+struct JsonOutput {
+    text: String,
+}
+
+thread_local! {
+    static JSON_OUTPUT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+impl JsonOutput {
+    /// Largest buffer kept for the next call.
+    const MAX_RETAINED_BYTES: usize = 1 << 20;
+
+    fn take() -> Self {
+        let mut text = JSON_OUTPUT
+            .try_with(|buffer| std::mem::take(&mut *buffer.borrow_mut()))
+            .unwrap_or_default();
+        text.clear();
+        Self { text }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl Drop for JsonOutput {
+    fn drop(&mut self) {
+        if self.text.capacity() <= Self::MAX_RETAINED_BYTES {
+            let text = std::mem::take(&mut self.text);
+            // During thread teardown the slot is gone; the buffer just goes.
+            let _ = JSON_OUTPUT.try_with(|buffer| *buffer.borrow_mut() = text);
+        }
+    }
 }
 
 fn serialize_into(
@@ -455,7 +504,13 @@ fn json_out_lisp_string(out: &mut String, value: &Value) -> Result<(), Flow> {
     let string = value
         .as_lisp_string()
         .expect("ValueKind::String must carry LispString payload");
-    let rendered = if string.is_multibyte() {
+    let bytes = string.as_bytes();
+    let rendered = if bytes.is_ascii() {
+        // SAFETY: ASCII is valid UTF-8. Most strings are ASCII, and the
+        // word-at-a-time `is_ascii` makes the full UTF-8 validation below a
+        // second pass they do not need.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    } else if string.is_multibyte() {
         string.as_utf8_str().ok_or_else(|| {
             signal(
                 LispCondition::WrongTypeArgument,
@@ -463,13 +518,11 @@ fn json_out_lisp_string(out: &mut String, value: &Value) -> Result<(), Flow> {
             )
         })?
     } else {
-        if !string.as_bytes().iter().all(u8::is_ascii) {
-            return Err(signal(
-                LispCondition::WrongTypeArgument,
-                vec![Value::symbol("json-value-p"), *value],
-            ));
-        }
-        std::str::from_utf8(string.as_bytes()).expect("ASCII unibyte strings must be valid UTF-8")
+        // A unibyte string may only hold ASCII.
+        return Err(signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("json-value-p"), *value],
+        ));
     };
     json_encode_string_into(out, rendered);
     Ok(())
@@ -1749,11 +1802,11 @@ fn json_serialize_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalResult
     // GNU `Fjson_serialize` returns `make_unibyte_string (jo.buf, jo.size)`:
     // a UNIBYTE string of raw UTF-8 bytes (multibyte chars are emitted as
     // their raw UTF-8 byte sequences, see `json_out_string`).  `json` already
-    // holds exactly those bytes (a Rust UTF-8 String), so wrap them unibyte
+    // holds exactly those bytes (a Rust UTF-8 String), so copy them unibyte
     // rather than as a multibyte string.
-    Ok(Value::heap_string(
-        neovm_value::heap_types::LispString::from_unibyte(json.into_bytes()),
-    ))
+    Ok(Value::heap_string(LispString::from_unibyte_slice(
+        json.as_str().as_bytes(),
+    )))
 }
 
 /// `(json-parse-string STRING &rest ARGS)` — parse a JSON string into a Lisp value.
@@ -1901,7 +1954,7 @@ pub fn builtin_json_insert<H: EditHost>(host: &mut H, args: Vec<Value>) -> EvalR
     let before_change = {
         let (edit, _vars) = host.edit_and_vars();
         let current_id = json_insert_target(&edit.buffers)?;
-        json_insertion_at_point(&edit.buffers, current_id, &json)?.0
+        json_insertion_at_point(&edit.buffers, current_id, json.as_str())?.0
     };
     signal_before_text_change(host, before_change)?;
     // GNU `Fjson_insert` works on the current buffer, point and multibyte flag
@@ -1911,11 +1964,12 @@ pub fn builtin_json_insert<H: EditHost>(host: &mut H, args: Vec<Value>) -> EvalR
     let change = {
         let (edit, _vars) = host.edit_and_vars();
         let current_id = json_insert_target(&edit.buffers)?;
-        let (change, multibyte) = json_insertion_at_point(&edit.buffers, current_id, &json)?;
+        let (change, multibyte) =
+            json_insertion_at_point(&edit.buffers, current_id, json.as_str())?;
         if multibyte {
-            let _ = edit.buffers.insert_into_buffer(current_id, &json);
+            let _ = edit.buffers.insert_into_buffer(current_id, json.as_str());
         } else {
-            let bytes = neovm_value::heap_types::LispString::from_unibyte_slice(json.as_bytes());
+            let bytes = LispString::from_unibyte_slice(json.as_str().as_bytes());
             let _ = edit
                 .buffers
                 .insert_lisp_string_into_buffer(current_id, &bytes);
