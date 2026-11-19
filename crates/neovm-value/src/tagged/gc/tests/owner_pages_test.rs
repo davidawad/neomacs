@@ -195,6 +195,17 @@ fn detached_section<R: Send>(
                     };
                     // Park: close every run before the keeper may collect.
                     close_owner_regions(state);
+                    // Leave the World's observation state under the stand-in
+                    // Baton, as an ending Lisp thread does: dropped by this
+                    // thread's thread-local destructor, its `Rc` would count
+                    // down beside the other owners' at their exits.
+                    let mut placeholder =
+                        crate::tagged::collection_reads::world_state_placeholder();
+                    {
+                        let _attached = baton.lock().unwrap();
+                        crate::tagged::collection_reads::swap_world_state(&mut *placeholder);
+                        drop(placeholder);
+                    }
                     result
                 })
             })
