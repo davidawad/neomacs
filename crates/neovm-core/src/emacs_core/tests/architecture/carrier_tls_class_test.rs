@@ -638,6 +638,15 @@ const TLS_CLASSIFICATION: &[(&str, &str, TlsClass)] = &[
         "INTERN_STR_CACHE",
         TlsClass::CarrierIntrinsic,
     ),
+    // CarrierIntrinsic: value-free memo of file-system facts (directory
+    // listings keyed by path, revalidated against the directory's stamp on
+    // every lookup), equally true for any job the carrier runs next.
+    // load_path_search_uses_and_revalidates_the_listing proves revalidation.
+    (
+        "neovm-eval/src/emacs_core/lisp/load/probe_cache.rs",
+        "LOAD_PATH_LISTINGS",
+        TlsClass::CarrierIntrinsic,
+    ),
     (
         "neovm-value/src/error/mod.rs",
         "IN_FLIGHT_ROOTS",

@@ -847,7 +847,12 @@ pub(crate) fn default_load_suffixes() -> Vec<Vec<u8>> {
     default_load_suffixes_for_os(std::env::consts::OS)
 }
 
-fn pick_suffixed(base: &Path, prefer_newer: bool, suffixes: &[Vec<u8>]) -> Option<PathBuf> {
+fn pick_suffixed(
+    base: &Path,
+    prefer_newer: bool,
+    suffixes: &[Vec<u8>],
+    may_exist: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let skip_elc = prefer_el_only();
     // Compressed candidates are not loadable (no jka-compr); they are
     // excluded here and surfaced by the explicit unsupported-artifact check
@@ -857,7 +862,7 @@ fn pick_suffixed(base: &Path, prefer_newer: bool, suffixes: &[Vec<u8>]) -> Optio
         .filter(|suffix| !suffix.ends_with(b".gz"))
         .filter(|suffix| !(skip_elc && suffix.ends_with(b".elc")))
         .map(|suffix| append_load_suffix(base, suffix))
-        .filter(|path| path.is_file());
+        .filter(|path| may_exist(path) && path.is_file());
 
     if prefer_newer {
         // GNU `openp` replaces its saved candidate only when the next one is
@@ -892,14 +897,60 @@ fn find_for_base(
         return None;
     }
 
-    if let Some(suffixed) = pick_suffixed(base, prefer_newer, suffixes) {
+    // Every candidate is BASE plus a suffix; when no suffix adds a directory
+    // component they all live in BASE's directory, and its listing can rule
+    // out the ones that do not exist without a `stat` each.
+    #[cfg(unix)]
+    if let Some((dir, name_start)) = split_candidate_base(base)
+        && !suffixes.iter().any(|suffix| suffix.contains(&b'/'))
+    {
+        let now = SystemTime::now();
+        return probe_cache::with_listings(|listings| {
+            let filter = listings.filter(dir, now);
+            let may_exist = |candidate: &Path| {
+                let name = &candidate.as_os_str().as_bytes()[name_start..];
+                filter.may_exist(OsStr::from_bytes(name))
+            };
+            find_suffixed_or_unsupported(base, prefer_newer, suffixes, &may_exist)
+        });
+    }
+
+    find_suffixed_or_unsupported(base, prefer_newer, suffixes, &|_| true)
+}
+
+fn find_suffixed_or_unsupported(
+    base: &Path,
+    prefer_newer: bool,
+    suffixes: &[Vec<u8>],
+    may_exist: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if let Some(suffixed) = pick_suffixed(base, prefer_newer, suffixes, may_exist) {
         return Some(suffixed);
     }
 
     // Surface unsupported compressed compiled artifacts explicitly.
     unsupported_compiled_suffixed_paths(base)
         .into_iter()
-        .find(|compiled| compiled.exists())
+        .find(|compiled| may_exist(compiled) && compiled.exists())
+}
+
+/// BASE's directory and the byte offset of its final name, when that name is
+/// an ordinary entry name (not empty, `.` or `..`), so that every
+/// `BASE+SUFFIX` names an entry of the directory.
+#[cfg(unix)]
+fn split_candidate_base(base: &Path) -> Option<(&Path, usize)> {
+    let bytes = base.as_os_str().as_bytes();
+    let slash = bytes.iter().rposition(|&byte| byte == b'/')?;
+    let name = &bytes[slash + 1..];
+    if name.is_empty() || name == b"." || name == b".." {
+        return None;
+    }
+    let dir = if slash == 0 {
+        &bytes[..1]
+    } else {
+        &bytes[..slash]
+    };
+    Some((Path::new(OsStr::from_bytes(dir)), slash + 1))
 }
 
 fn expand_tilde_path_buf(path: &LispString) -> PathBuf {
@@ -7178,6 +7229,9 @@ pub(crate) fn expand_tilde(path: &str) -> String {
     }
     path.to_string()
 }
+
+#[cfg(unix)]
+mod probe_cache;
 
 #[cfg(test)]
 #[path = "tests/bootstrap_error_test.rs"]

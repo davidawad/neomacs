@@ -247,6 +247,7 @@ mod lisp_constructs_via_binary_semantics;
 mod list;
 mod listify_key_sequence_semantics;
 mod load_history_semantics;
+mod load_path_probe_semantics;
 mod load_suffixes_semantics;
 mod locate_dominating_file_strict_edge_semantics;
 mod locate_file_strict_edge_semantics;
