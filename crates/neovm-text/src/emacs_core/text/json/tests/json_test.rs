@@ -1257,11 +1257,11 @@ fn plain_ascii_run_len_matches_a_bytewise_scan() {
     assert_eq!(plain_ascii_run_len(b" ~\x7f!#[]{}"), 9);
 }
 
-/// A string decoded into the byte workspace becomes the same Lisp string
-/// `make-string` semantics give its text: ASCII unibyte, anything else
-/// multibyte with its true character count.
+/// A string decoded into the byte workspace becomes a multibyte Lisp string
+/// with its true character count, ASCII and empty strings included, as GNU's
+/// `make_multibyte_string` builds them.
 #[test]
-fn parse_string_builds_the_same_lisp_string_as_its_text() {
+fn parse_string_builds_a_multibyte_lisp_string_of_its_text() {
     crate::test_utils::init_test_tracing();
     let cases = [
         (r#""""#, ""),
@@ -1282,7 +1282,7 @@ fn parse_string_builds_the_same_lisp_string_as_its_text() {
     ];
     for (json, text) in cases {
         let parsed = parse_json(json, &[]);
-        let expected = Value::string(text);
+        let expected = Value::multibyte_string(text);
         let (parsed, expected) = (
             parsed
                 .as_lisp_string()
@@ -1292,7 +1292,7 @@ fn parse_string_builds_the_same_lisp_string_as_its_text() {
                 .expect("Value::string is a Lisp string"),
         );
         assert_eq!(parsed.as_bytes(), expected.as_bytes(), "{json}");
-        assert_eq!(parsed.is_multibyte(), expected.is_multibyte(), "{json}");
+        assert!(parsed.is_multibyte(), "{json}");
         assert_eq!(parsed.schars(), expected.schars(), "{json}");
     }
 }

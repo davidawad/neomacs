@@ -923,14 +923,13 @@ impl<'a> JsonParser<'a> {
     /// The string just decoded into [`Self::byte_workspace`], `chars`
     /// characters long, as a Lisp string.
     ///
-    /// One copy, sized exactly: an all-ASCII string is unibyte, anything
-    /// else multibyte with the character count the decoder already has, so
-    /// the bytes are not walked again to classify or count them.
+    /// Always multibyte, ASCII and empty strings included: GNU builds every
+    /// parsed string with `make_multibyte_string (str, nchars, nbytes)`
+    /// (`json_parse_string`, src/json.c), so `multibyte-string-p` is t for
+    /// all of them. One copy, sized exactly, with the character count the
+    /// decoder already has, so the bytes are not walked again.
     fn workspace_lisp_string(&self, chars: usize) -> LispString {
         let bytes = self.byte_workspace.as_slice();
-        if chars == bytes.len() {
-            return LispString::from_unibyte_slice(bytes);
-        }
         // Room for the NUL every payload carries, so it is not reallocated.
         let mut data = Vec::with_capacity(bytes.len() + 1);
         data.extend_from_slice(bytes);
