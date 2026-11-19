@@ -387,8 +387,12 @@ impl AllocatorCold {
 
     /// Take over an owner's pending state LOCAL, every run of which is
     /// closed: its blocks, pages, boxed objects and charges.
-    /// Every pending page of this owner's own state was carved by OWNER.
+    /// Every pending block and page of this owner's own state was carved
+    /// by OWNER.
     fn mark_owner(&mut self, owner: OwnerKey) {
+        for pending in &mut self.blocks {
+            pending.block.owner = owner;
+        }
         self.floats.mark_owner(owner);
         self.strings.mark_owner(owner);
         self.vectors.mark_owner(owner);

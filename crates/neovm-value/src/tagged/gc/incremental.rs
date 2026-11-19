@@ -461,12 +461,14 @@ impl TaggedHeap {
     /// Sweep, in up to WORKERS shares at once (one per thread a Parallel
     /// World's stop leaves idle), what owner threads allocate the most of:
     /// every float, string, vector and bignum page the deferred sweep has
-    /// left, and the young list's dead boxed strings, floats, vectors and
-    /// hash tables. Their dead payloads only free allocator memory. The
-    /// young list itself is walked here, on this thread, as a slice walks
-    /// it; the slices that finish the sweep find the pages and the list
-    /// done. The caller holds the world stopped, as for a slice; with a
-    /// collection observation active everything stays for the slices.
+    /// left, its cons blocks, and the young list's dead boxed strings,
+    /// floats, vectors and hash tables. Their dead payloads only free
+    /// allocator memory. The young list itself is walked here, on this
+    /// thread, as a slice walks it, and each cons block's dead cells are
+    /// published here in the slices' order; the slices that finish the sweep
+    /// find the pages, the blocks and the list done. The caller holds the
+    /// world stopped, as for a slice; with a collection observation active
+    /// everything stays for the slices.
     ///
     /// RUN_SHARES `(parts, share)` calls `share(i)` once for each `i` in
     /// `0..parts`, on whichever threads it has (the stop's parked threads),
@@ -506,12 +508,29 @@ impl TaggedHeap {
             (self.sweep_vector_page_cursor, self.sweep_vector_page_end),
             (self.sweep_bignum_page_cursor, self.sweep_bignum_page_end),
         ];
+        // The cycle's cons blocks, in the order the slices sweep them, unless
+        // a collection observation needs those slices.
+        let cons_order: Vec<usize> = if collection_observed::has_collection_observations() {
+            Vec::new()
+        } else {
+            (self.sweep_cons_cursor..self.sweep_cons_end)
+                .map(|cursor| {
+                    if generational {
+                        let base = self.cons_allocator.sweep_base_at(cursor);
+                        self.cons_block_index_by_base[&base.addr()]
+                    } else {
+                        cursor
+                    }
+                })
+                .collect()
+        };
         // The stop's parked threads run the shares, so a share costs a
         // wake-up, not a thread start: every class's pages are spread.
         let pages: usize = ranges
             .iter()
             .map(|&(cursor, end)| end.saturating_sub(cursor))
-            .sum();
+            .sum::<usize>()
+            + cons_order.len();
         let spread = workers.get() > 1
             && pages.div_ceil(PAGES_PER_THREAD) + doomed.len().div_ceil(BOXES_PER_THREAD) > 1;
         let TaggedHeap {
@@ -519,6 +538,7 @@ impl TaggedHeap {
             string_arena,
             vector_arena,
             bignum_arena,
+            cons_blocks,
             ..
         } = self;
         // Each owner's pages make one share, which that owner's thread
@@ -538,6 +558,28 @@ impl TaggedHeap {
         shares.add(bignum_arena.owner_runs(ranges[3].0, ranges[3].1), |share| {
             &mut share.bignums
         });
+        let mut wanted: Vec<(usize, usize)> = cons_order
+            .iter()
+            .enumerate()
+            .map(|(position, &index)| (index, position))
+            .collect();
+        wanted.sort_unstable();
+        let mut wanted = wanted.into_iter().peekable();
+        let mut blocks = Vec::with_capacity(cons_order.len());
+        for (index, block) in cons_blocks.iter_mut().enumerate() {
+            if let Some((_, position)) = wanted.next_if(|&(wanted, _)| wanted == index) {
+                blocks.push(ConsShare {
+                    position,
+                    index,
+                    block,
+                });
+            }
+        }
+        assert!(
+            wanted.next().is_none(),
+            "each swept cons block is found once"
+        );
+        shares.add_blocks(blocks);
         let shares = shares.with_boxes(
             &doomed,
             workers.get().min(doomed.len().div_ceil(BOXES_PER_THREAD)),
@@ -582,11 +624,36 @@ impl TaggedHeap {
                         }
                     }
                 }
+                let blocks = share
+                    .cons
+                    .into_iter()
+                    .map(
+                        |ConsShare {
+                             position,
+                             index,
+                             block,
+                         }| {
+                            let mut head = std::ptr::null_mut();
+                            let live = if generational {
+                                block.sweep_generational(&mut head)
+                            } else {
+                                block.sweep(&mut head)
+                            };
+                            SweptBlock {
+                                position,
+                                index,
+                                head,
+                                live,
+                            }
+                        },
+                    )
+                    .collect::<Vec<_>>();
                 (
                     sweep!(share.floats, false),
                     sweep!(share.strings, false),
                     sweep!(share.vectors, true),
                     sweep!(share.bignums, false),
+                    blocks,
                 )
             })
         };
@@ -599,11 +666,38 @@ impl TaggedHeap {
         let mut string_runs = Vec::new();
         let mut vector_runs = Vec::new();
         let mut bignum_runs = Vec::new();
-        for (floats, strings, vectors, bignums) in swept {
+        let mut swept_blocks = Vec::new();
+        for (floats, strings, vectors, bignums, blocks) in swept {
             float_runs.extend(floats);
             string_runs.extend(strings);
             vector_runs.extend(vectors);
             bignum_runs.extend(bignums);
+            swept_blocks.extend(blocks);
+        }
+        // Each block's dead cells are published in the slices' order.
+        swept_blocks.sort_unstable_by_key(|block| block.position);
+        for SweptBlock {
+            index, head, live, ..
+        } in swept_blocks
+        {
+            let block = &self.cons_blocks[index];
+            // SAFETY: as in `incremental_sweep_slice`: this block's sweep
+            // just rebuilt its exact dead-cell list; its storage stays
+            // heap-owned and publication follows rebuilding.
+            unsafe {
+                if !generational {
+                    self.cons_allocator.publish(block, head, live);
+                } else if self.generational.verify {
+                    self.cons_allocator
+                        .publish_generational_verified(block, head, live);
+                } else {
+                    self.cons_allocator.publish_generational(block, head, live);
+                }
+            }
+            self.sweep_cons_live_cells += live;
+        }
+        if !cons_order.is_empty() {
+            self.sweep_cons_cursor = self.sweep_cons_end;
         }
         // Linked in page order, as the serial sweep links them.
         for runs in [
@@ -3042,10 +3136,43 @@ struct Share<'a> {
     strings: Vec<PageRun<'a, StringObj>>,
     vectors: Vec<PageRun<'a, VectorObj>>,
     bignums: Vec<PageRun<'a, BignumObj>>,
+    cons: Vec<ConsShare<'a>>,
     boxes: &'a [DoomedBox],
-    /// Pages in the runs.
+    /// Pages in the runs, and cons blocks.
     pages: usize,
 }
+
+/// A cons block a share of the in-stop sweep sweeps: `position` in the
+/// slices' order, `index` in the heap's `cons_blocks`.
+#[cfg(feature = "shared-heap")]
+struct ConsShare<'a> {
+    position: usize,
+    index: usize,
+    block: &'a mut ConsBlock,
+}
+
+// SAFETY: the blocks of one in-stop sweep are disjoint and the World is
+// stopped, so the share's thread is the only one touching the block, and a
+// block's sweep reads and writes only its own storage (no collection
+// observation is active: `sweep_in_stop_on` leaves the blocks to the slices
+// then).
+#[cfg(feature = "shared-heap")]
+unsafe impl Send for ConsShare<'_> {}
+
+/// What sweeping one [`ConsShare`] gave: the block's dead-cell list and live
+/// count, for the requester to publish.
+#[cfg(feature = "shared-heap")]
+struct SweptBlock {
+    position: usize,
+    index: usize,
+    head: *mut ConsCell,
+    live: usize,
+}
+
+// SAFETY: the list's cells are the block's dead cells, which no thread uses
+// until the requester publishes them.
+#[cfg(feature = "shared-heap")]
+unsafe impl Send for SweptBlock {}
 
 /// The shares of one in-stop sweep as they are formed: one per owner whose
 /// pages are swept, and keeper shares of at most `keeper_pages` pages for
@@ -3122,6 +3249,21 @@ impl<'a> ShareSet<'a> {
                     None => break,
                 }
             }
+        }
+    }
+
+    /// Put each cons block in its owner's share, the keeper's in keeper
+    /// shares.
+    fn add_blocks(&mut self, blocks: Vec<ConsShare<'a>>) {
+        for block in blocks {
+            let owner = block.block.owner;
+            let share = if self.spread && owner != OwnerKey::KEEPER {
+                self.owned(owner)
+            } else {
+                self.keeper()
+            };
+            share.pages += 1;
+            share.cons.push(block);
         }
     }
 

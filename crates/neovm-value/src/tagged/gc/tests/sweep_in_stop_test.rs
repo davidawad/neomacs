@@ -170,3 +170,71 @@ fn the_in_stop_sweep_leaves_dead_payloads_to_the_threads_that_swept_them() {
         assert_eq!(state.swept_payload_count(), 0);
     }
 }
+
+/// 200000 conses, a seventh rooted, after a minor collection's mark.
+fn conses_in_their_sweep() -> (TaggedHeap, Vec<TaggedValue>) {
+    let mut heap = TaggedHeap::new();
+    // SAFETY: serial fixture heap; the caller holds the only heap view and
+    // no collector or compiled leaf runs.
+    unsafe { heap.set_generational_enabled(true) };
+    heap.partition_dump = false;
+    heap.dump_blackened = false;
+    heap.set_gc_threshold(usize::MAX);
+    let mut live = Vec::new();
+    for i in 0..200_000_i64 {
+        let cell = heap.alloc_cons(TaggedValue::fixnum(i), TaggedValue::NIL);
+        if i % 7 == 0 {
+            live.push(cell);
+        }
+    }
+    heap.begin_minor_collection().unwrap();
+    for &root in &live {
+        heap.seed_root(root);
+    }
+    heap.complete_minor_collection();
+    assert!(heap.sweep_in_progress());
+    (heap, live)
+}
+
+/// The in-stop sweep sweeps the cycle's cons blocks on its threads and
+/// publishes their dead cells as the slices do: the slices find no block
+/// left, every rooted cons survives, and the dead cells are allocated again
+/// without a new block.
+#[test]
+fn the_in_stop_sweep_sweeps_the_cons_blocks_as_the_slices_do() {
+    let (mut serial, _) = conses_in_their_sweep();
+    serial.finish_incremental_sweep_now();
+
+    let (mut spread, live) = conses_in_their_sweep();
+    spread.sweep_in_stop_on(NonZeroUsize::new(4).unwrap(), |parts, share| {
+        std::thread::scope(|threads| {
+            for index in 1..parts {
+                threads.spawn(move || share(index));
+            }
+            share(0);
+        });
+    });
+    assert_eq!(
+        spread.sweep_cons_cursor, spread.sweep_cons_end,
+        "the slices find no cons block left"
+    );
+    spread.finish_incremental_sweep_now();
+
+    assert_eq!(swept_state(&spread), swept_state(&serial));
+    assert_eq!(spread.cons_blocks.len(), serial.cons_blocks.len());
+    assert_eq!(spread.cons_live_count, serial.cons_live_count);
+    for (index, &cell) in live.iter().enumerate() {
+        assert!(spread.owns_heap_value_for_test(cell));
+        assert_eq!(
+            cell.cons_car(),
+            TaggedValue::fixnum(i64::try_from(index * 7).unwrap())
+        );
+    }
+    for heap in [&mut serial, &mut spread] {
+        let blocks = heap.cons_blocks.len();
+        for i in 0..150_000_i64 {
+            heap.alloc_cons(TaggedValue::fixnum(i), TaggedValue::NIL);
+        }
+        assert_eq!(heap.cons_blocks.len(), blocks, "the dead cells are reused");
+    }
+}

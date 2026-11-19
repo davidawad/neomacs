@@ -32,6 +32,10 @@ pub(super) struct ConsBlock {
     pub(super) storage: *mut u8,
     /// Index of the first never-allocated cell in this block.
     pub(super) next_index: u16,
+    /// The owner thread that carved the block, or [`OwnerKey::KEEPER`]: a
+    /// stop's in-stop sweep gives each owner's thread its own blocks first.
+    #[cfg(feature = "shared-heap")]
+    pub(super) owner: super::owner_pages::OwnerKey,
 }
 
 impl ConsBlock {
@@ -51,6 +55,8 @@ impl ConsBlock {
         Self {
             storage,
             next_index: 0,
+            #[cfg(feature = "shared-heap")]
+            owner: super::owner_pages::OwnerKey::KEEPER,
         }
     }
 
@@ -64,6 +70,8 @@ impl ConsBlock {
         Self {
             storage,
             next_index: 0,
+            #[cfg(feature = "shared-heap")]
+            owner: super::owner_pages::OwnerKey::KEEPER,
         }
     }
 
