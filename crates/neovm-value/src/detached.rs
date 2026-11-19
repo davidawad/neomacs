@@ -180,13 +180,23 @@ pub fn suspend_detached() -> Option<DetachedGate> {
 }
 
 /// The thread detaches again through GATE; its allocation runs, if it has
-/// any, reopen at its next allocation.
+/// any, reopen at its next allocation. The dead payloads it swept in a stop
+/// while it was attached or parked are freed now, outside the stop.
 #[doc(hidden)]
 pub fn resume_detached(gate: DetachedGate) {
     if let Some(owner) = placement().owner {
+        // SAFETY: this thread's own state (`with_owner_allocation`), not
+        // installed, so no allocation is using it.
+        unsafe { &mut *owner.as_ptr() }.free_swept_payloads();
         crate::tagged::gc::set_installed_owner(owner.as_ptr());
     }
     set_gate(Some(gate));
+}
+
+/// The owner state of this OS thread's detached body, installed or not: a
+/// thread parked for a stop has uninstalled it, and still owns it.
+pub(crate) fn body_owner() -> Option<NonNull<OwnerAllocState>> {
+    placement().owner
 }
 
 /// The detached thread binds a shared cell dynamically at binding depth

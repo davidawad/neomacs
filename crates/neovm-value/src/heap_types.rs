@@ -1493,6 +1493,23 @@ impl LispString {
             storage_capacity: 0,
         })
     }
+
+    /// Move a dead string's payload out for a later drop, leaving this one
+    /// as its drop leaves it: reclaimed (null data), with no storage and no
+    /// interval table, so dropping it in place frees nothing.
+    #[cfg(feature = "shared-heap")]
+    pub(crate) fn take_reclaimed(&mut self) -> LispString {
+        std::mem::replace(
+            self,
+            LispString {
+                size: self.size,
+                size_byte: self.size_byte,
+                intervals: AtomicPtr::new(std::ptr::null_mut()),
+                data: std::ptr::null(),
+                storage_capacity: 0,
+            },
+        )
+    }
 }
 
 impl Clone for LispString {

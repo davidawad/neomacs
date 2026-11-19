@@ -698,6 +698,9 @@ pub(crate) struct OwnerAllocState {
     /// the state was made: permanent runtime roots, copied, never traced from
     /// here. Zero when the heap had none.
     canonical_empty_bits: [usize; 2],
+    /// Dead payloads this owner's thread swept in a stop, to free once the
+    /// stop has ended ([`Self::free_swept_payloads`]).
+    swept: incremental::SweptPayloads,
 }
 
 impl Drop for OwnerAllocState {
@@ -737,6 +740,19 @@ impl OwnerAllocState {
 
     pub(crate) fn stats(&self) -> OwnerAllocStats {
         self.shared.stats()
+    }
+
+    /// Free the dead payloads this owner's thread swept in the last stop:
+    /// the stop has ended, and the memory goes back to the allocator of the
+    /// thread that frees it, not to the stop's.
+    pub(crate) fn free_swept_payloads(&mut self) {
+        self.swept.free();
+    }
+
+    /// How many dead payloads this owner holds for after the stop.
+    #[cfg(test)]
+    pub(crate) fn swept_payload_count(&self) -> usize {
+        self.swept.len()
     }
 
     fn run_mut(&mut self, class: OwnerClass) -> &mut OwnerRun {
@@ -985,6 +1001,20 @@ impl OwnerAllocState {
     }
 }
 
+/// Run F with the swept payloads of the owner this OS thread allocates for,
+/// installed or parked (a detached thread parked for a stop uninstalled its
+/// state, `crate::detached`); `None` on the keeper path. A share of the
+/// in-stop sweep hands its dead payloads there.
+pub(super) fn with_swept_payloads<R>(
+    f: impl FnOnce(Option<&mut incremental::SweptPayloads>) -> R,
+) -> R {
+    let owner = std::ptr::NonNull::new(installed_owner()).or_else(crate::detached::body_owner);
+    // SAFETY: the state is this thread's own and only this thread touches
+    // it; a share runs in a stop, never inside one of its allocations, so no
+    // other borrow of it is live.
+    f(owner.map(|owner| unsafe { &mut (*owner.as_ptr()).swept }))
+}
+
 /// This OS thread's installed owner state becomes STATE (null: none), for
 /// a detached thread's placement (`crate::detached`), which owns it.
 pub(crate) fn set_installed_owner(state: *mut OwnerAllocState) {
@@ -1087,6 +1117,7 @@ impl TaggedHeap {
                 empty(LispStringStorageKind::Unibyte),
                 empty(LispStringStorageKind::Multibyte),
             ],
+            swept: incremental::SweptPayloads::default(),
         })
     }
 

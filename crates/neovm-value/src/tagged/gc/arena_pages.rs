@@ -748,6 +748,9 @@ pub(super) struct ObjectArena<T: PagedObject> {
 /// Consecutive pages of one arena that one thread sweeps while the world
 /// is stopped ([`ObjectArena::page_runs`]).
 #[cfg(feature = "shared-heap")]
+use super::incremental::{SweptPayload, SweptPayloads};
+
+#[cfg(feature = "shared-heap")]
 pub(super) struct PageRun<'a, T: PagedObject> {
     /// The arena index of `pages[0]`.
     first: usize,
@@ -773,15 +776,17 @@ pub(super) struct SweptRun {
 }
 
 #[cfg(feature = "shared-heap")]
-impl<T: PagedObject> PageRun<'_, T> {
+impl<T: SweptPayload> PageRun<'_, T> {
     /// Sweep the run, as `sweep_range` would without an `on_free` or a
     /// collection observation, collecting the freed slots' addresses when
-    /// COLLECT.
+    /// COLLECT. With PAYLOADS, each dead slot's payload moves there instead
+    /// of being freed now.
     pub(super) fn sweep<const GENERATIONAL: bool>(
         self,
         parity: MarkParity,
         scope: CollectionScope,
         collect: bool,
+        mut payloads: Option<&mut SweptPayloads>,
     ) -> SweptRun {
         let mut run = SweptRun {
             live: 0,
@@ -795,6 +800,12 @@ impl<T: PagedObject> PageRun<'_, T> {
                 parity,
                 scope,
                 &mut |slot| {
+                    if let Some(payloads) = payloads.as_deref_mut() {
+                        // SAFETY: `sweep_page` calls this for a dead slot of
+                        // this run's page, which it frees next; runs are
+                        // disjoint, so no other thread touches the slot.
+                        unsafe { T::hand_over(slot as *mut T, payloads) };
+                    }
                     if collect {
                         run.slots.push(slot);
                     }

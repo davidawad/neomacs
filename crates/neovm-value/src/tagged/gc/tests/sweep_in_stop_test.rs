@@ -119,3 +119,54 @@ fn the_in_stop_sweep_on_four_threads_leaves_what_the_slices_leave() {
         assert_eq!(swept_state(heap)[5..], pages[..]);
     }
 }
+
+/// Run on owner threads, the in-stop sweep frees no dead payload while the
+/// World is stopped: each share hands the dead strings', vectors' and
+/// bignums' payloads and the dead boxes to the owner state of the thread
+/// that ran it, which frees them after the stop. The heap is left as the
+/// slices leave it.
+#[test]
+fn the_in_stop_sweep_leaves_dead_payloads_to_the_threads_that_swept_them() {
+    let (mut serial, _, _) = heap_in_its_sweep();
+    serial.finish_incremental_sweep_now();
+
+    let (mut spread, live, dead) = heap_in_its_sweep();
+    // Every dead object but the floats owns allocator memory.
+    let payloads = (0..60_000_i64).filter(|i| i % 7 != 0 && i % 6 != 3).count();
+    let mut states: Vec<_> = (0..4).map(|_| spread.new_owner_alloc_state()).collect();
+    spread.sweep_in_stop_on(NonZeroUsize::new(4).unwrap(), |parts, share| {
+        std::thread::scope(|threads| {
+            for (index, state) in states.iter_mut().enumerate().take(parts) {
+                threads.spawn(move || {
+                    let _installed = state.install();
+                    share(index);
+                });
+            }
+        });
+    });
+    let held: usize = states.iter().map(|state| state.swept_payload_count()).sum();
+    assert_eq!(held, payloads, "every dead payload waits for its thread");
+    assert!(
+        states
+            .iter()
+            .filter(|state| state.swept_payload_count() > 0)
+            .count()
+            > 1,
+        "the shares ran on several owner threads"
+    );
+    spread.finish_incremental_sweep_now();
+    assert_eq!(swept_state(&spread), swept_state(&serial));
+    assert!(
+        live.iter()
+            .all(|&value| spread.owns_heap_value_for_test(value))
+    );
+    assert!(
+        !dead
+            .iter()
+            .any(|&value| spread.owns_heap_value_for_test(value))
+    );
+    for state in &mut states {
+        state.free_swept_payloads();
+        assert_eq!(state.swept_payload_count(), 0);
+    }
+}

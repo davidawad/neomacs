@@ -546,6 +546,9 @@ impl TaggedHeap {
                 )
             })
             .collect();
+        // A share run by an owner thread hands its dead payloads to that
+        // owner, which frees them after the stop; elsewhere (the keeper) it
+        // frees them here.
         let sweep_share = |(floats, strings, vectors, bignums, boxes): (
             Option<PageRun<'_, FloatObj>>,
             Option<PageRun<'_, StringObj>>,
@@ -553,28 +556,35 @@ impl TaggedHeap {
             Option<PageRun<'_, BignumObj>>,
             &[DoomedBox],
         )| {
-            macro_rules! sweep {
-                ($run:expr, $collect:expr) => {
-                    $run.map(|run| {
-                        if generational {
-                            run.sweep::<true>(parity, scope, $collect)
-                        } else {
-                            run.sweep::<false>(parity, scope, $collect)
+            owner_pages::with_swept_payloads(|mut payloads| {
+                macro_rules! sweep {
+                    ($run:expr, $collect:expr) => {
+                        $run.map(|run| {
+                            if generational {
+                                run.sweep::<true>(parity, scope, $collect, payloads.as_deref_mut())
+                            } else {
+                                run.sweep::<false>(parity, scope, $collect, payloads.as_deref_mut())
+                            }
+                        })
+                    };
+                }
+                match payloads.as_deref_mut() {
+                    Some(payloads) => payloads.hold_boxes(boxes),
+                    None => {
+                        for doomed in boxes {
+                            // SAFETY: each dead box is in exactly one share,
+                            // already unlinked from every list and registry.
+                            unsafe { doomed.drop_box() };
                         }
-                    })
-                };
-            }
-            for doomed in boxes {
-                // SAFETY: each dead box is in exactly one share, already
-                // unlinked from every list and registry.
-                unsafe { doomed.drop_box() };
-            }
-            (
-                sweep!(floats, false),
-                sweep!(strings, false),
-                sweep!(vectors, true),
-                sweep!(bignums, false),
-            )
+                    }
+                }
+                (
+                    sweep!(floats, false),
+                    sweep!(strings, false),
+                    sweep!(vectors, true),
+                    sweep!(bignums, false),
+                )
+            })
         };
         let slots = ShareSlots::new(shares);
         run_shares(parts, &|index| slots.run(index, &sweep_share));
@@ -3135,6 +3145,118 @@ impl DoomedBox {
                     _ => drop(Box::from_raw(header as *mut HashTableObj)),
                 },
             }
+        }
+    }
+}
+
+/// Dead payloads a share of [`TaggedHeap::sweep_in_stop_on`] took out of
+/// the heap instead of freeing them in the stop: the strings', vectors' and
+/// bignums' storage and the dead boxes. The owner state of the thread that
+/// swept them holds them, and that thread frees them once the stop has
+/// ended (`OwnerAllocState::free_swept_payloads`), outside the stop and in
+/// parallel with the other threads.
+#[cfg(feature = "shared-heap")]
+#[derive(Default)]
+pub(super) struct SweptPayloads {
+    strings: Vec<crate::heap_types::LispString>,
+    vectors: Vec<LispValueVec>,
+    bignums: Vec<Integer>,
+    boxes: Vec<DoomedBox>,
+}
+
+#[cfg(feature = "shared-heap")]
+impl SweptPayloads {
+    pub(super) fn len(&self) -> usize {
+        self.strings.len() + self.vectors.len() + self.bignums.len() + self.boxes.len()
+    }
+
+    /// Hold the dead boxes of a share.
+    fn hold_boxes(&mut self, boxes: &[DoomedBox]) {
+        self.boxes
+            .extend(boxes.iter().map(|doomed| DoomedBox(doomed.0)));
+    }
+
+    /// Free every payload held. The vectors keep their capacity for the
+    /// next stop.
+    pub(super) fn free(&mut self) {
+        // Every resume of a detached thread asks; most have nothing held.
+        if self.len() == 0 {
+            return;
+        }
+        self.strings.clear();
+        self.vectors.clear();
+        self.bignums.clear();
+        for doomed in self.boxes.drain(..) {
+            // SAFETY: a held box is in no other share and no list or
+            // registry (`hold_boxes`), and is dropped once, here.
+            unsafe { doomed.drop_box() };
+        }
+    }
+}
+
+#[cfg(feature = "shared-heap")]
+impl Drop for SweptPayloads {
+    fn drop(&mut self) {
+        self.free();
+    }
+}
+
+/// A page class whose dead slots' payloads an in-stop sweep share can hand
+/// to [`SweptPayloads`] rather than drop while the World is stopped.
+#[cfg(feature = "shared-heap")]
+pub(super) trait SweptPayload: PagedObject {
+    /// Move the payload of SLOT into PAYLOADS when it owns allocator memory,
+    /// leaving SLOT as a drop leaves it, so that its drop in place frees
+    /// nothing. A payload that owns none stays for that drop.
+    ///
+    /// # Safety
+    /// SLOT is a dead, initialized object of this class that the sweep frees
+    /// next, and no other thread touches it.
+    unsafe fn hand_over(slot: *mut Self, payloads: &mut SweptPayloads);
+}
+
+#[cfg(feature = "shared-heap")]
+impl SweptPayload for FloatObj {
+    /// A float owns no allocator memory.
+    unsafe fn hand_over(_slot: *mut Self, _payloads: &mut SweptPayloads) {}
+}
+
+#[cfg(feature = "shared-heap")]
+impl SweptPayload for StringObj {
+    unsafe fn hand_over(slot: *mut Self, payloads: &mut SweptPayloads) {
+        // SAFETY: per the caller's contract, the slot is ours alone.
+        let string = unsafe { &mut (*slot).data };
+        if string.has_owned_storage() || string.has_intervals() {
+            payloads.strings.push(string.take_reclaimed());
+        }
+    }
+}
+
+#[cfg(feature = "shared-heap")]
+impl SweptPayload for VectorObj {
+    unsafe fn hand_over(slot: *mut Self, payloads: &mut SweptPayloads) {
+        // SAFETY: per the caller's contract, the slot is ours alone.
+        let data = unsafe { &mut (*slot).data };
+        if data.owned_capacity() > 0 {
+            // An empty owned vector holds no allocation.
+            payloads
+                .vectors
+                .push(std::mem::replace(data, LispValueVec::owned(Vec::new())));
+        }
+    }
+}
+
+#[cfg(feature = "shared-heap")]
+impl SweptPayload for BignumObj {
+    unsafe fn hand_over(slot: *mut Self, payloads: &mut SweptPayloads) {
+        // SAFETY: per the caller's contract, the slot is ours alone.
+        let value = unsafe { &mut (*slot).value };
+        // Below 2^64 malachite keeps the value `Small`, with no limb vector
+        // (`bignum_payload_layout`); zero is one.
+        if value.unsigned_abs_ref().as_limbs_asc().len() > 1 {
+            payloads
+                .bignums
+                .push(std::mem::replace(value, Integer::from(0_u32)));
         }
     }
 }
