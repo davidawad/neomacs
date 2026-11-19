@@ -3024,8 +3024,8 @@ struct ModeLinePercentContext<T: TargetPolicy = StoredTarget<'static>> {
     /// Internal zero-based character offset of the first visible character.
     /// Derived from GNU `marker_position(w->start)`, which is Lisp one-based.
     window_start: usize,
-    /// Window end position (last visible character position).
-    /// In GNU this is `BUF_Z(b) - w->window_end_pos`.
+    /// Internal zero-based character offset just past the last visible
+    /// character. GNU's `BUF_Z (b) - w->window_end_pos`, which is one-based.
     window_end: usize,
     /// Frame name for `%F`.  GNU: `f->title` then `f->name` then "Emacs".
     frame_name: Option<Value>,
@@ -3105,10 +3105,13 @@ fn build_mode_line_percent_context<T: TargetPolicy>(
                 let buffer_z = LispCharPos1::from_one_based_usize(
                     buf.point_max_char_pos().get().saturating_add(1),
                 );
+                // 0-based like `window_start`, BEGV and ZV: GNU's `botpos`
+                // (`BUF_Z - window_end_pos`) is compared with 1-based BEGV/ZV.
                 ctx.window_end = window
                     .window_end_charpos(buffer_z)
                     .unwrap_or(buffer_z)
-                    .to_one_based_usize();
+                    .to_char_pos()
+                    .get();
                 // GNU displays a window's mode line with the buffer point set to
                 // that window's `w->pointm`, so `%l`/`%c` reflect THIS window.
                 // The selected window's point is the live buffer point; a
@@ -5591,7 +5594,8 @@ fn decode_one_native_spec<T: TargetPolicy, G: NativeGlobalPolicy>(
                 } else if pos <= begv {
                     "Top".to_owned()
                 } else {
-                    format!("{}%", percent99(pos - begv, zv - begv))
+                    // GNU sprintf "%2d%%": pads one-digit percentages.
+                    format!("{:2}%", percent99(pos - begv, zv - begv))
                 }
             } else {
                 String::new()
@@ -5616,10 +5620,12 @@ fn decode_one_native_spec<T: TargetPolicy, G: NativeGlobalPolicy>(
                     }
                 } else {
                     let pct = percent99(botpos.saturating_sub(begv), zv.saturating_sub(begv));
+                    // GNU sprintf (&"Top%2d%%"[begv < toppos ? 3 : 0]):
+                    // "Top" only while the window starts at BEGV.
                     if toppos <= begv {
-                        format!("{}%", pct)
+                        format!("Top{pct:2}%")
                     } else {
-                        format!("Top{}%", pct)
+                        format!("{pct:2}%")
                     }
                 }
             } else {
@@ -5648,7 +5654,8 @@ fn decode_one_native_spec<T: TargetPolicy, G: NativeGlobalPolicy>(
                 } else {
                     let top_dist = toppos - begv;
                     let bot_dist = zv - botpos;
-                    format!("{}%", percent99(top_dist, top_dist + bot_dist))
+                    // GNU sprintf "%2d%%".
+                    format!("{:2}%", percent99(top_dist, top_dist + bot_dist))
                 }
             } else {
                 String::new()

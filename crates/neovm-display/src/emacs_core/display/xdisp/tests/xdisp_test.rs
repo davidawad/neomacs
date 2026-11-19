@@ -1891,6 +1891,72 @@ fn test_format_mode_line_percent_specs_use_window_buffer_and_completed_window_en
     assert_eq!(rendered, Value::string("Bottom|Bottom|Bottom"));
 }
 
+/// GNU `decode_mode_spec` (xdisp.c, cases `o`, `p`, `P`, `q`) for a window
+/// over a 1000-char buffer, so each percentage is plain arithmetic:
+/// `percent99 (n, d) = (d - 1 + 100.0 * n) / d`, capped at 99, over GNU's
+/// one-based positions. `%p`, `%o` and `%P` print with `%2d`, `%P` prefixes
+/// "Top" only while the window starts at BEGV, and `%q` is unpadded.
+#[test]
+fn test_format_mode_line_percent_specs_pad_and_count_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = interactive_context();
+    let buffer_id = eval.edit.buffers.create_buffer("percent-target");
+    eval.edit
+        .buffers
+        .get_mut(buffer_id)
+        .expect("percent buffer")
+        .insert(&"x".repeat(1000));
+    let frame_id = eval
+        .frame_manager_mut()
+        .create_frame("percent-frame", 80, 24, buffer_id);
+    let selected_window = eval
+        .frame_manager()
+        .get(frame_id)
+        .expect("frame")
+        .selected_window;
+    let mut format_with_start = |start: usize| {
+        {
+            let (frames, buffers) = eval.frame_manager_and_buffers_mut();
+            let buffer = buffers.get(buffer_id).expect("percent buffer");
+            let window = frames
+                .get_mut(frame_id)
+                .expect("frame")
+                .find_window_mut(selected_window)
+                .expect("selected window");
+            match window {
+                crate::window::Window::Leaf { window_start, .. } => {
+                    *window_start = LispCharPos1::from_one_based_usize(start);
+                }
+                other => panic!("expected leaf window, got {:?}", other),
+            }
+            // The last redisplay ended the window before char 61 (GNU
+            // botpos 61): 60 chars above the window's bottom.
+            window.set_window_end_from_positions(
+                LispCharPos1::from_one_based_usize(buffer.point_max_char_pos().get() + 1),
+                buffer.point_max_emacs_byte_pos(),
+                LispCharPos1::from_one_based_usize(61),
+                buffer.char_pos_to_emacs_byte_pos_clamped(CharPos0::new(60)),
+                0,
+            );
+        }
+        builtin_format_mode_line_ctx(
+            &mut eval,
+            &vec![
+                Value::string("%p|%P|%o|%q"),
+                Value::NIL,
+                Value::make_window(selected_window.0),
+            ],
+        )
+        .expect("mode-line percent specs")
+    };
+
+    // Start at char 31: %p = percent99 (30, 1000) = 3, %P = percent99 (60,
+    // 1000) = 6, %o = percent99 (30, 30 + 940) = 4.
+    assert_eq!(format_with_start(31), Value::string(" 3%| 6%| 4%|3-6%"));
+    // Start at BEGV: %p and %o say "Top", %P keeps its "Top" prefix.
+    assert_eq!(format_with_start(1), Value::string("Top|Top 6%|Top|0-6%"));
+}
+
 #[test]
 fn test_invisible_p() {
     crate::test_utils::init_test_tracing();
