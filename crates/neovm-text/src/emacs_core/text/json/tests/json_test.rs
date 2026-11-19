@@ -1217,71 +1217,202 @@ fn assert_parse_signal(input: &str, cond: &str, line: i64, pos: i64) {
     }
 }
 
-/// At each stop point `json-parse-string` offers, a full collection rooted
-/// at nothing but the values the parse holds leaves the document intact:
-/// what it holds is exactly what a stopped thread must keep. Each object
-/// type, against the same parse without stop points (compared serialized).
+// ---------------------------------------------------------------------------
+// The parser's workspaces: strings, containers and keys built in place
+// ---------------------------------------------------------------------------
+
+fn parse_json(json: &str, extra: &[(&'static str, &'static str)]) -> Value {
+    let mut args = vec![Value::string(json)];
+    for (key, value) in extra {
+        args.push(Value::keyword(key));
+        args.push(Value::symbol(*value));
+    }
+    builtin_json_parse_string(args).expect("valid JSON parses")
+}
+
+/// The run scanner reads eight bytes at a time; it must stop exactly where
+/// a byte-at-a-time scan stops, for every byte value in every word lane.
 #[test]
-fn a_collection_at_every_stop_point_keeps_the_partial_document() {
+fn plain_ascii_run_len_matches_a_bytewise_scan() {
+    let bytewise = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .take_while(|&&b| (0x20..0x80).contains(&b) && b != b'"' && b != b'\\')
+            .count()
+    };
+    for stop in 0..=u8::MAX {
+        for len in 1..=19 {
+            for at in 0..len {
+                let mut bytes = vec![b'a'; len];
+                bytes[at] = stop;
+                assert_eq!(
+                    plain_ascii_run_len(&bytes),
+                    bytewise(&bytes),
+                    "byte {stop:#04x} at {at} of {len}"
+                );
+            }
+        }
+    }
+    assert_eq!(plain_ascii_run_len(b""), 0);
+    assert_eq!(plain_ascii_run_len(b" ~\x7f!#[]{}"), 9);
+}
+
+/// A string decoded into the byte workspace becomes the same Lisp string
+/// `make-string` semantics give its text: ASCII unibyte, anything else
+/// multibyte with its true character count.
+#[test]
+fn parse_string_builds_the_same_lisp_string_as_its_text() {
     crate::test_utils::init_test_tracing();
-    let document = r#"{"a":[1,"two",{"three":[3.5,"x",[]]}],"b":{"c":"d","e":[[{}],{"f":null}]},"g":"h","a":false}"#;
-    for object_type in ["hash-table", "alist", "plist"] {
-        let args = || {
-            vec![
-                Value::string(document),
-                Value::keyword(":object-type"),
-                Value::symbol(object_type),
-            ]
-        };
-        let serialized = |value| builtin_json_serialize(vec![value]).expect("serializable");
-        let expected = serialized(builtin_json_parse_string(args()).expect("parses"));
-        let expected = expected
-            .as_lisp_string()
-            .expect("a string")
-            .as_bytes()
-            .to_vec();
-        let mut stops = 0;
-        let mut collect = |held: &[Value]| {
-            stops += 1;
-            neovm_value::tagged::gc::with_tagged_heap(|heap| {
-                heap.collect_exact(held.iter().copied());
-            });
-        };
-        let args = args();
-        let input = args[0].as_lisp_string().expect("a string");
-        let opts = parse_parse_kwargs(&args, 1, SymbolMode::Bare).expect("options");
-        let parsed = JsonParser::new(input.as_bytes(), input.is_multibyte(), opts)
-            .with_stop_points(&args, &mut collect)
-            .parse()
-            .expect("parses with stop points");
-        assert_eq!(
-            stops, 17,
-            "{object_type}: a stop after each element and member"
+    let cases = [
+        (r#""""#, ""),
+        (r#""abc""#, "abc"),
+        (
+            r#""a longer ASCII run that spans several words""#,
+            "a longer ASCII run that spans several words",
+        ),
+        (r#""café""#, "café"),
+        ("\"caf\u{e9} au lait\"", "café au lait"),
+        (r#""é\n\"x\\/\t\b\f\r""#, "é\n\"x\\/\t\u{8}\u{c}\r"),
+        (r#""😀 ok""#, "\u{1F600} ok"),
+        (
+            "\"\u{65e5}\u{672c}\u{8a9e} and ASCII after the multibyte part\"",
+            "\u{65e5}\u{672c}\u{8a9e} and ASCII after the multibyte part",
+        ),
+        (r#""\u0000""#, "\0"),
+    ];
+    for (json, text) in cases {
+        let parsed = parse_json(json, &[]);
+        let expected = Value::string(text);
+        let (parsed, expected) = (
+            parsed
+                .as_lisp_string()
+                .expect("a JSON string is a Lisp string"),
+            expected
+                .as_lisp_string()
+                .expect("Value::string is a Lisp string"),
         );
-        let got = serialized(parsed);
+        assert_eq!(parsed.as_bytes(), expected.as_bytes(), "{json}");
+        assert_eq!(parsed.is_multibyte(), expected.is_multibyte(), "{json}");
+        assert_eq!(parsed.schars(), expected.schars(), "{json}");
+    }
+}
+
+/// Every occurrence of an object key is the one interned symbol, for plists
+/// (keywords) and alists (plain symbols), including non-ASCII names and the
+/// empty name.
+#[test]
+fn parse_repeated_object_keys_are_one_symbol() {
+    crate::test_utils::init_test_tracing();
+    let json = r#"[{"label":1,"kind":2},{"kind":3,"label":4},{"é":5,"":6},{"é":7,"":8}]"#;
+    for (object_type, names) in [
+        ("plist", [":label", ":kind", ":é", ":"]),
+        ("alist", ["label", "kind", "é", ""]),
+    ] {
+        let parsed = parse_json(
+            json,
+            &[(":object-type", object_type), (":array-type", "list")],
+        );
+        let objects = list_to_vec(&parsed).expect("an array parses to a list");
+        let keys: Vec<Vec<Value>> = objects
+            .iter()
+            .map(|object| {
+                let items = list_to_vec(object).expect("an object parses to a list");
+                match object_type {
+                    "plist" => items.iter().step_by(2).copied().collect(),
+                    _ => items.iter().map(|pair| pair.cons_car()).collect(),
+                }
+            })
+            .collect();
+        let symbol = |name: &str| match object_type {
+            "plist" => Value::from_kw_id(intern(name)),
+            _ => Value::from_sym_id(intern(name)),
+        };
+        let [label, kind, e_acute, empty] = names.map(symbol);
         assert_eq!(
-            got.as_lisp_string().expect("a string").as_bytes(),
-            expected.as_slice(),
-            "{object_type}"
+            keys,
+            [
+                vec![label, kind],
+                vec![kind, label],
+                vec![e_acute, empty],
+                vec![e_acute, empty]
+            ]
         );
     }
 }
 
-/// `json-parse-string` offers its stop points to hash-table documents only:
-/// an alist or plist document is conses, which a minor promotes at their
-/// first survival.
+/// Containers nest in the one object workspace: each closes over exactly its
+/// own members, whatever its siblings and children pushed and popped.
 #[test]
-fn json_parse_string_offers_stop_points_to_hash_table_documents_only() {
+fn parse_nested_containers_keep_their_own_members() {
     crate::test_utils::init_test_tracing();
-    for (object_type, expected) in [("hash-table", 3), ("alist", 0), ("plist", 0)] {
-        let mut stops = 0;
-        let args = vec![
-            Value::string(r#"{"a":1,"b":[2]}"#),
-            Value::keyword(":object-type"),
-            Value::symbol(object_type),
-        ];
-        json_parse_string_with_symbols(args, SymbolMode::Bare, Some(&mut |_: &[Value]| stops += 1))
-            .expect("parses");
-        assert_eq!(stops, expected, "{object_type}");
-    }
+    let json = r#"{"a":[1,[2,3],{"b":[4]},[],{}],"c":{"d":{"e":[]}},"f":5}"#;
+    let int = Value::fixnum;
+    let list = |items: &[Value]| Value::list(items.to_vec());
+    let kw = |name: &str| Value::from_kw_id(intern(name));
+
+    let parsed = parse_json(json, &[(":object-type", "plist"), (":array-type", "list")]);
+    let expected = list(&[
+        kw(":a"),
+        list(&[
+            int(1),
+            list(&[int(2), int(3)]),
+            list(&[kw(":b"), list(&[int(4)])]),
+            Value::NIL,
+            Value::NIL,
+        ]),
+        kw(":c"),
+        list(&[kw(":d"), list(&[kw(":e"), Value::NIL])]),
+        kw(":f"),
+        int(5),
+    ]);
+    assert!(equal_value(&parsed, &expected, 0), "{parsed:?}");
+
+    let parsed = parse_json(json, &[(":object-type", "alist")]);
+    let sym = |name: &str| Value::from_sym_id(intern(name));
+    let vector = |items: &[Value]| Value::vector(items.to_vec());
+    let expected = list(&[
+        Value::cons(
+            sym("a"),
+            vector(&[
+                int(1),
+                vector(&[int(2), int(3)]),
+                list(&[Value::cons(sym("b"), vector(&[int(4)]))]),
+                vector(&[]),
+                Value::NIL,
+            ]),
+        ),
+        Value::cons(
+            sym("c"),
+            list(&[Value::cons(
+                sym("d"),
+                list(&[Value::cons(sym("e"), vector(&[]))]),
+            )]),
+        ),
+        Value::cons(sym("f"), int(5)),
+    ]);
+    assert!(equal_value(&parsed, &expected, 0), "{parsed:?}");
+}
+
+/// Hash-table members are keyed by the decoded name, so escapes and
+/// non-ASCII names are found by `gethash` on the plain string, and a
+/// repeated name keeps the last value (GNU `json_parse_object`).
+#[test]
+fn parse_hash_table_keys_are_the_decoded_names() {
+    crate::test_utils::init_test_tracing();
+    let parsed = parse_json(r#"{"café":1,"a\"b":2,"x":3,"x":4}"#, &[]);
+    let table = parsed.as_hash_table().expect("default object type");
+    let get = |key: &str| {
+        let lisp = Value::string(key);
+        let lisp = lisp
+            .as_lisp_string()
+            .expect("Value::string is a Lisp string");
+        table
+            .data
+            .get(&HashKey::string_content(lisp.as_bytes(), lisp.schars()))
+            .and_then(|value| value.as_fixnum())
+    };
+    assert_eq!(get("café"), Some(1));
+    assert_eq!(get("a\"b"), Some(2));
+    assert_eq!(get("x"), Some(4));
+    assert_eq!(table.data.len(), 3);
 }
