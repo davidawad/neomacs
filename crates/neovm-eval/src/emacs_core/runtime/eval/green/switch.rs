@@ -1454,7 +1454,11 @@ impl Context {
         });
         #[cfg(feature = "shared-heap")]
         if let Some(lock) = self.parallel_lock_shared() {
-            if let Err(error) = parallel_thread::spawn(key, Arc::clone(&control), receiver, lock) {
+            let tables =
+                self.with_green_runtime(|runtime| runtime.bootstrap.shared_native_tables());
+            if let Err(error) =
+                parallel_thread::spawn(key, Arc::clone(&control), receiver, lock, tables)
+            {
                 tracing::warn!(?error, "a Parallel Lisp thread's OS thread did not start");
                 // As the carrier refusal below: GNU restores the previous
                 // situation, then signals.

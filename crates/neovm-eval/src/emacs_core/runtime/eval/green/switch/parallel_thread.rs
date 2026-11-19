@@ -7,6 +7,7 @@
 use super::super::super::world::{Baton, BatonLock, detached_gate, prepare_detached_table};
 use super::super::carried::CarriedState;
 use super::super::carrier_tls;
+use super::super::{SharedNativeTables, SubrTables};
 use super::{
     AbortOnPanic, Context, Control, Flow, Lifecycle, ThreadKey, Value, Wake, signal,
     stow_carried_state, stow_owner_state, unstow_carried_state, unstow_owner_state,
@@ -21,12 +22,14 @@ const STACK_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) static PANIC_NEXT_BODY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Start KEY's OS thread. It waits for the Baton, which the caller holds.
+/// Start KEY's OS thread. It installs the startup subr TABLES, then waits
+/// for the Baton, which the caller holds.
 pub(super) fn spawn(
     key: ThreadKey,
     control: Arc<Control>,
     receiver: mpsc::Receiver<Wake>,
     lock: Arc<BatonLock>,
+    tables: SharedNativeTables,
 ) -> std::io::Result<()> {
     let for_thread = Arc::clone(&lock);
     // Counted before the thread can end, which needs the caller's Baton.
@@ -34,7 +37,7 @@ pub(super) fn spawn(
     let spawned = std::thread::Builder::new()
         .name(format!("neovm-lisp-{}", key.id()))
         .stack_size(STACK_SIZE)
-        .spawn(move || run(key, &control, receiver, &for_thread));
+        .spawn(move || run(key, &control, receiver, &for_thread, tables));
     match spawned {
         Ok(handle) => {
             lock.adopt_os_thread(handle);
@@ -143,16 +146,27 @@ fn release_carried_thread_locals() {
 
 /// KEY's whole life on its OS thread (Green's `run_carrier_job`, with the
 /// lock in place of the carrier's channel and pool).
-fn run(key: ThreadKey, control: &Arc<Control>, receiver: mpsc::Receiver<Wake>, lock: &BatonLock) {
+fn run(
+    key: ThreadKey,
+    control: &Arc<Control>,
+    receiver: mpsc::Receiver<Wake>,
+    lock: &BatonLock,
+    tables: SharedNativeTables,
+) {
     // Outside the Lisp body, a panic would lose the Baton with this
     // thread's owner and every other thread would wait for it forever.
     let _abort_on_panic = AbortOnPanic;
+    // The thread-local copy of the startup subr tables is this thread's
+    // own: made before the Baton, it does not hold every other thread's
+    // start while it copies.
+    tables.install();
+    drop(tables);
     let mut baton = lock.attach().into_baton();
     control.parallel_resumed(key);
     #[cfg(feature = "jit")]
     crate::emacs_core::jit::green_owner::begin_owner_turn();
     unstow_carried_state(&baton);
-    let mut owner = Context::new_green_owner(&baton);
+    let mut owner = Context::new_green_owner_with(&baton, SubrTables::Installed);
     unstow_owner_state(&mut owner, &baton);
     let completion_id = match owner.threads.get_thread(key.id()) {
         Some(thread) => thread.id(),

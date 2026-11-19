@@ -33,6 +33,11 @@ pub use api::{green_make_thread, green_world};
 #[cfg(feature = "shared-heap")]
 pub(crate) use api::{parallel_make_thread, parallel_world};
 pub(crate) use bootstrap::GreenBootstrap;
+#[cfg(all(test, feature = "shared-heap"))]
+pub(crate) use bootstrap::OWNER_BUILD_INSTALLS;
+#[cfg(feature = "shared-heap")]
+pub(crate) use bootstrap::SharedNativeTables;
+
 #[cfg(debug_assertions)]
 pub(crate) use bootstrap::debug_assert_native_tables_open;
 pub(crate) use scheduler::{ConditionId, MutexId, ThreadKey, Wait};
@@ -181,6 +186,20 @@ pub(crate) enum GreenStartError {
     MarkExclusion(#[from] FacadeMarkExclusionError),
 }
 
+/// Whether a new owner's OS thread has the startup subr tables yet
+/// ([`Context::new_green_owner_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubrTables {
+    /// Install them while the owner is built (holding the Baton).
+    Install,
+    /// The thread installed them before it took the Baton.
+    #[cfg_attr(
+        not(feature = "shared-heap"),
+        expect(dead_code, reason = "a Parallel thread installs them itself")
+    )]
+    Installed,
+}
+
 impl Context {
     #[cold]
     pub(crate) fn green_admission_readiness(&self) -> Result<(), GreenAdmissionRefusal> {
@@ -243,6 +262,14 @@ impl Context {
     #[cold]
     #[inline(never)]
     pub(crate) fn new_green_owner(baton: &super::world::Baton) -> Context {
+        Self::new_green_owner_with(baton, SubrTables::Install)
+    }
+
+    /// [`Self::new_green_owner`] on an OS thread that installed the startup
+    /// subr tables already when TABLES says so.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn new_green_owner_with(baton: &super::world::Baton, tables: SubrTables) -> Context {
         // The job prologue restored the World's carried state before this
         // call (the carrier reset and `unstow_carried_state` run in
         // `run_carrier_job`). This owner is about to run on this OS thread;
@@ -255,7 +282,9 @@ impl Context {
                 .as_ref()
                 .expect("a started Green runtime issued this Baton")
                 .bootstrap;
-            bootstrap.install_native_tables();
+            if tables == SubrTables::Install {
+                bootstrap.install_native_tables();
+            }
             (
                 bootstrap.seed(),
                 bootstrap.current_buffer,

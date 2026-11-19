@@ -97,8 +97,35 @@ pub(crate) struct GreenBootstrap {
     inhibit_quit: Value,
     throw_on_input: Value,
     registries: RegistryHandles,
-    native: NativeTables,
+    native: std::sync::Arc<NativeTables>,
 }
+
+/// The startup subr tables of a running Green runtime, for a Parallel
+/// thread to install on its own OS thread before it takes the Baton.
+#[cfg(feature = "shared-heap")]
+pub(crate) struct SharedNativeTables(std::sync::Arc<NativeTables>);
+
+// SAFETY: the tables are read-only once captured (no subr registers while a
+// snapshot lives, `debug_assert_native_tables_open`), and installing only
+// clones them. What they hold (subr entries, `&'static` leaf specs and the
+// canonical subr objects, minted before the capture and never freed) is what
+// every owner of the World installs, on whichever OS thread it runs.
+#[cfg(feature = "shared-heap")]
+unsafe impl Send for SharedNativeTables {}
+
+#[cfg(feature = "shared-heap")]
+impl SharedNativeTables {
+    /// Install the tables on this OS thread.
+    pub(crate) fn install(&self) {
+        self.0.install();
+    }
+}
+
+/// Count of the owners built while their OS thread installed the subr
+/// tables, for the tests.
+#[cfg(all(test, feature = "shared-heap"))]
+pub(crate) static OWNER_BUILD_INSTALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl GreenBootstrap {
     /// Capture from the first owner, which is running.
@@ -131,13 +158,21 @@ impl GreenBootstrap {
             inhibit_quit: owner.inhibit_quit,
             throw_on_input: owner.throw_on_input,
             registries: RegistryHandles::of(owner),
-            native: NativeTables::capture(),
+            native: std::sync::Arc::new(NativeTables::capture()),
         }
     }
 
     /// Install the startup subr tables on this OS thread.
     pub(crate) fn install_native_tables(&self) {
+        #[cfg(all(test, feature = "shared-heap"))]
+        OWNER_BUILD_INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.native.install();
+    }
+
+    /// The startup subr tables, for a thread to install itself.
+    #[cfg(feature = "shared-heap")]
+    pub(crate) fn shared_native_tables(&self) -> SharedNativeTables {
+        SharedNativeTables(std::sync::Arc::clone(&self.native))
     }
 
     /// A further owner's execution state: these values and handles, with

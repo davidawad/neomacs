@@ -953,3 +953,34 @@ fn a_compiled_rest_call_on_detached_threads_attaches_a_bounded_number_of_times()
     println!("2 threads x {CALLS} compiled &rest calls: {row:?}");
     assert!(row.attach_by_alloc <= 2, "{row:?}");
 }
+
+/// A Parallel thread installs the startup subr tables on its own OS thread
+/// before it takes the Baton: building three threads' owners copies them
+/// under the Baton no time, and their bodies call subrs through them.
+#[test]
+fn parallel_threads_install_the_subr_tables_before_taking_the_baton() {
+    use crate::emacs_core::eval::green::OWNER_BUILD_INSTALLS;
+    use std::sync::atomic::Ordering;
+    let mut ev = parallel();
+    // The first thread starts the World's Green runtime.
+    assert_eq!(
+        eval(&mut ev, "(thread-join (make-thread (lambda () 0)))"),
+        "0"
+    );
+    let before = OWNER_BUILD_INSTALLS.load(Ordering::Relaxed);
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(mapcar 'thread-join
+                     (list (make-thread (lambda () (+ 1 0)))
+                           (make-thread (lambda () (length (list 1 2))))
+                           (make-thread (lambda () (car (cons 3 nil))))))"
+        ),
+        "(1 2 3)"
+    );
+    assert_eq!(
+        OWNER_BUILD_INSTALLS.load(Ordering::Relaxed) - before,
+        0,
+        "owners built while their thread installed the subr tables"
+    );
+}
