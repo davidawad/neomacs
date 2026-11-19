@@ -15,9 +15,18 @@ fn search(
     short_literal::with_enabled(optimized, || {
         let pattern = regex_compile(expression, false, true).expect("valid pattern");
         let before = matcher_entry_count();
-        let matched = dfa::with_dfa_mode(dfa::DfaMode::Off, || {
-            re_search(&pattern, text, start, range, &DefaultSyntaxLookup, start)
-        });
+        // The control is the matcher itself: with the knob off, a whole
+        // literal would otherwise be answered by the whole-literal scan.
+        let run = || {
+            dfa::with_dfa_mode(dfa::DfaMode::Off, || {
+                re_search(&pattern, text, start, range, &DefaultSyntaxLookup, start)
+            })
+        };
+        let matched = if optimized {
+            run()
+        } else {
+            with_fastmap_disabled(run)
+        };
         (
             matched.map(|(position, regs)| (position, regs.start.to_vec(), regs.end.to_vec())),
             matcher_entry_count() - before,

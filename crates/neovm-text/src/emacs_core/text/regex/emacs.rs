@@ -395,6 +395,11 @@ pub struct CompiledPattern {
     /// Immutable whole-literal codes for bounded folded searches (CL2 knob).
     short_literal: Option<short_literal::Literal>,
 
+    /// The literal run when the whole bytecode is one (`regexp-quote`
+    /// output): `re_search` answers it with one scan instead of a matcher
+    /// entry per candidate (see [`whole_literal`]).
+    whole_literal: Option<whole_literal::WholeLiteral>,
+
     /// The zero-width anchor every path from the start meets before it
     /// consumes anything ([`start_anchor`]), when that is more than the first
     /// opcode shows (`\(?:^a\|^b\)`).  Computed only under
@@ -572,6 +577,11 @@ pub struct CompiledPattern {
 
     /// Immutable whole-literal codes for bounded folded searches (CL2 knob).
     short_literal: Option<short_literal::Literal>,
+
+    /// The literal run when the whole bytecode is one (`regexp-quote`
+    /// output): `re_search` answers it with one scan instead of a matcher
+    /// entry per candidate (see [`whole_literal`]).
+    whole_literal: Option<whole_literal::WholeLiteral>,
 
     /// The zero-width anchor every path from the start meets before it
     /// consumes anything ([`start_anchor`]), when that is more than the first
@@ -1075,6 +1085,7 @@ impl CompiledPattern {
             rewind: RewindView::Buffer,
             prefilter: std::cell::OnceCell::new(),
             short_literal: None,
+            whole_literal: None,
             start_anchor: StartAnchor::None,
             dfa: dfa::DfaCell::default(),
         }
@@ -2389,6 +2400,7 @@ pub(crate) fn regex_compile_lisp_with_translation(
     );
 
     buf.short_literal = short_literal::Literal::compile(&buf);
+    buf.whole_literal = whole_literal::WholeLiteral::derive(&buf);
 
     // Anchors behind alternations (P3.3 Stage 0), for the search's
     // line-start scan; opt-in until measured.
@@ -10116,6 +10128,14 @@ pub(crate) fn re_search(
     {
         return result;
     }
+    // After the opt-in short-literal scan, which keeps its own domain when
+    // `NEOVM_REGEX_SHORT_LITERAL` is on.
+    if !fastmap_force_disabled()
+        && let Some(literal) = &pattern.whole_literal
+        && let Some(result) = literal.search(pattern, text, start, range)
+    {
+        return result;
+    }
     // One scratch for the whole search (see re_match_candidate_in): lease
     // the per-thread one out of its cell for the duration (its Vec capacity
     // moves with it, nothing allocates) and hand it back on every exit; a
@@ -10749,6 +10769,13 @@ mod suffix_literal;
 
 #[path = "short_literal.rs"]
 mod short_literal;
+
+#[path = "whole_literal.rs"]
+mod whole_literal;
+
+#[cfg(test)]
+#[path = "tests/whole_literal_test.rs"]
+mod whole_literal_tests;
 
 #[cfg(test)]
 #[path = "tests/short_literal_test.rs"]
