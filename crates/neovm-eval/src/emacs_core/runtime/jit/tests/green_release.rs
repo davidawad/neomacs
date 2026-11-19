@@ -183,15 +183,26 @@ fn release_deopt_after_thread_yield_park() {
 }
 
 /// `sleep-for` parks the green thread; the peer redefines mid-sleep.
+///
+/// Sequencing is event-driven, never wall-clock: the helper sleeps until
+/// the peer has set `green-release-done` after its redefinition. GNU's
+/// `make-thread` never yields to the new thread (thread.c:885), so the
+/// peer runs only while the helper is parked in `sleep-for`, and the
+/// redefinition always lands inside one of those parks. A single 30 ms
+/// sleep let a peer that was admitted but not yet run (its admission
+/// alone moves the epoch, so the release check still deopts once) leave
+/// the redefinition until after the witness had returned.
 #[test]
 fn release_deopt_after_sleep_for_park() {
     exercise_green_park(
         "(fset 'green-release-peer (lambda ()
               (sleep-for 0 5)
-              (green-release-redefine)))
+              (green-release-redefine)
+              (setq green-release-done t)))
          (fset 'green-release-helper (lambda ()
               (make-thread 'green-release-peer)
-              (sleep-for 0 30)))",
+              (while (null green-release-done)
+                (sleep-for 0 30))))",
     );
 }
 
@@ -230,16 +241,20 @@ fn release_deopt_after_contended_mutex_lock_park() {
     );
 }
 
-/// `accept-process-output` waiting on a timeout parks the thread.
+/// `accept-process-output` waiting on a timeout parks the thread. The
+/// helper waits until the peer's redefinition is done, as in
+/// `release_deopt_after_sleep_for_park`.
 #[test]
 fn release_deopt_after_accept_process_output_park() {
     exercise_green_park(
         "(fset 'green-release-peer (lambda ()
               (sleep-for 0 5)
-              (green-release-redefine)))
+              (green-release-redefine)
+              (setq green-release-done t)))
          (fset 'green-release-helper (lambda ()
               (make-thread 'green-release-peer)
-              (accept-process-output nil 0 30)))",
+              (while (null green-release-done)
+                (accept-process-output nil 0 30))))",
     );
 }
 
