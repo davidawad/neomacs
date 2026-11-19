@@ -5880,7 +5880,16 @@ pub(crate) fn finalize_cached_bootstrap_eval(
         &eval.face_table.face_list(),
     );
     clear_runtime_loader_state(eval);
-    clear_transient_runtime_features(eval);
+    match role {
+        RuntimeImageRole::Bootstrap => clear_transient_runtime_features(eval),
+        // GNU loads a pdump as-is: a final image's `features` are the ones
+        // it was dumped with.  The shipped image was normalized when it was
+        // dumped (`normalize_final_dump_runtime_surface`), so stripping
+        // again here only ever changed a user's `dump-emacs-portable` image,
+        // whose loaded `cl-macs`, `gv`, `pcase`, ... then looked unloaded
+        // and were loaded a second time by the next `require`.
+        RuntimeImageRole::Final => {}
+    }
     crate::emacs_core::eval::lifecycle::install_host_environment_snapshot(eval);
     ensure_startup_compat_variables(eval, project_root);
     restore_cached_runtime_window_system_surface(eval);
@@ -6936,7 +6945,11 @@ pub fn activate_runtime_evaluator(
     role: RuntimeImageRole,
 ) -> Result<(), EvalError> {
     let project_root = runtime_project_root();
-    activate_runtime_evaluator_at_root(eval, &project_root, role)
+    activate_runtime_evaluator_at_root(eval, &project_root, role)?;
+    // A source-built evaluator was never normalized by a dump, so it drops
+    // the helper features its own loading provided, as the shipped image did.
+    clear_transient_runtime_features(eval);
+    Ok(())
 }
 
 fn activate_runtime_evaluator_at_root(
