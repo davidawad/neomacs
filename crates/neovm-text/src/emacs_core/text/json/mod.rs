@@ -1039,13 +1039,25 @@ impl<'a> JsonParser<'a> {
     /// Skip whitespace and return the first non-whitespace byte, consuming it.
     /// Mirrors GNU `json_skip_whitespace`: it reads through `json_input_get`,
     /// so reaching end of input signals `json-end-of-file`.
+    ///
+    /// It runs before every token, so it scans by index and leaves the
+    /// end-of-input error to a cold path, at the same position
+    /// [`Self::consume`] reports it.
+    #[inline]
     fn skip_ws_consume(&mut self) -> Result<u8, Flow> {
-        loop {
-            let b = self.consume()?;
+        while let Some(&b) = self.input.get(self.pos) {
+            self.pos += 1;
             if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
                 return Ok(b);
             }
         }
+        Err(self.end_of_input())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn end_of_input(&self) -> Flow {
+        self.signal_at_pos(JsonError::EndOfFile)
     }
 
     /// Skip whitespace and return the first non-whitespace byte, or `None` at
