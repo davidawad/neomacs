@@ -776,6 +776,8 @@ unsafe impl<T: PagedObject> Send for PageRun<'_, T> {}
 /// What sweeping one [`PageRun`] gave back.
 #[cfg(feature = "shared-heap")]
 pub(super) struct SweptRun {
+    /// The arena index of the run's first page.
+    pub(super) first: usize,
     live: usize,
     freed: usize,
     /// Arena indices of the run's pages that freed a slot.
@@ -785,13 +787,6 @@ pub(super) struct SweptRun {
 }
 
 #[cfg(feature = "shared-heap")]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the in-stop sweep shares by owner in the next commit"
-    )
-)]
 impl<'a, T: PagedObject> PageRun<'a, T> {
     /// How many pages the run has.
     pub(super) fn len(&self) -> usize {
@@ -832,6 +827,7 @@ impl<T: SweptPayload> PageRun<'_, T> {
         mut payloads: Option<&mut SweptPayloads>,
     ) -> SweptRun {
         let mut run = SweptRun {
+            first: self.first,
             live: 0,
             freed: 0,
             partial: Vec::new(),
@@ -1291,40 +1287,9 @@ impl<T: PagedObject> ObjectArena<T> {
         }
     }
 
-    /// Split pages `start..end` into at most PARTS runs of consecutive
-    /// pages, for [`PageRun::sweep`] on as many threads.
-    #[cfg(feature = "shared-heap")]
-    pub(super) fn page_runs(
-        &mut self,
-        start: usize,
-        end: usize,
-        parts: usize,
-    ) -> Vec<PageRun<'_, T>> {
-        let end = end.min(self.pages.len());
-        if start >= end {
-            return Vec::new();
-        }
-        let len = (end - start).div_ceil(parts.max(1));
-        self.pages[start..end]
-            .chunks_mut(len)
-            .enumerate()
-            .map(|(index, pages)| PageRun {
-                first: start + index * len,
-                pages,
-            })
-            .collect()
-    }
-
     /// Split pages `start..end` into runs of consecutive pages one owner
     /// carved, each with that owner, for [`PageRun::sweep`] on its thread.
     #[cfg(feature = "shared-heap")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the in-stop sweep shares by owner in the next commit"
-        )
-    )]
     pub(super) fn owner_runs(
         &mut self,
         start: usize,

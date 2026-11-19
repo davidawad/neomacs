@@ -1040,13 +1040,6 @@ fn this_threads_owner() -> Option<std::ptr::NonNull<OwnerAllocState>> {
 
 /// The key of the owner this OS thread allocates for (`KEEPER` on the
 /// keeper path): the pages a share of the in-stop sweep it takes first.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the in-stop sweep shares by owner in the next commit"
-    )
-)]
 pub(super) fn current_owner_key() -> OwnerKey {
     this_threads_owner().map_or(OwnerKey::KEEPER, |owner| OwnerKey::of(owner.as_ptr()))
 }

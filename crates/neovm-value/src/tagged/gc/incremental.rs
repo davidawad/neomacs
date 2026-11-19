@@ -4,6 +4,8 @@
 //! parent's view of its private items (`use super::*`).
 
 use super::*;
+#[cfg(feature = "shared-heap")]
+use owner_pages::OwnerKey;
 
 impl TaggedHeap {
     /// True while a mark is underway (between the start handshake and sweep).
@@ -510,10 +512,8 @@ impl TaggedHeap {
             .iter()
             .map(|&(cursor, end)| end.saturating_sub(cursor))
             .sum();
-        let parts = workers
-            .get()
-            .min(pages.div_ceil(PAGES_PER_THREAD) + doomed.len().div_ceil(BOXES_PER_THREAD))
-            .max(1);
+        let spread = workers.get() > 1
+            && pages.div_ceil(PAGES_PER_THREAD) + doomed.len().div_ceil(BOXES_PER_THREAD) > 1;
         let TaggedHeap {
             float_arena,
             string_arena,
@@ -521,57 +521,61 @@ impl TaggedHeap {
             bignum_arena,
             ..
         } = self;
-        let mut floats = float_arena
-            .page_runs(ranges[0].0, ranges[0].1, parts)
-            .into_iter();
-        let mut strings = string_arena
-            .page_runs(ranges[1].0, ranges[1].1, parts)
-            .into_iter();
-        let mut vectors = vector_arena
-            .page_runs(ranges[2].0, ranges[2].1, parts)
-            .into_iter();
-        let mut bignums = bignum_arena
-            .page_runs(ranges[3].0, ranges[3].1, parts)
-            .into_iter();
-        let mut boxes = doomed.chunks(doomed.len().div_ceil(parts).max(1));
-        // One thread's share: a run of each class, and some of the boxes.
-        let shares: Vec<_> = (0..parts)
-            .map(|_| {
-                (
-                    floats.next(),
-                    strings.next(),
-                    vectors.next(),
-                    bignums.next(),
-                    boxes.next().unwrap_or_default(),
-                )
-            })
-            .collect();
+        // Each owner's pages make one share, which that owner's thread
+        // takes first (`ShareSlots::run_owned`): their dead payloads go back
+        // to the thread that allocated them, from pages its cache last
+        // held. The keeper's pages are cut into shares any thread takes.
+        let mut shares = ShareSet::new(spread, pages.div_ceil(workers.get()).max(PAGES_PER_THREAD));
+        shares.add(float_arena.owner_runs(ranges[0].0, ranges[0].1), |share| {
+            &mut share.floats
+        });
+        shares.add(string_arena.owner_runs(ranges[1].0, ranges[1].1), |share| {
+            &mut share.strings
+        });
+        shares.add(vector_arena.owner_runs(ranges[2].0, ranges[2].1), |share| {
+            &mut share.vectors
+        });
+        shares.add(bignum_arena.owner_runs(ranges[3].0, ranges[3].1), |share| {
+            &mut share.bignums
+        });
+        let shares = shares.with_boxes(
+            &doomed,
+            workers.get().min(doomed.len().div_ceil(BOXES_PER_THREAD)),
+        );
+        let parts = shares.len();
         // A share run by an owner thread hands its dead payloads to that
         // owner, which frees them after the stop; elsewhere (the keeper) it
         // frees them here.
-        let sweep_share = |(floats, strings, vectors, bignums, boxes): (
-            Option<PageRun<'_, FloatObj>>,
-            Option<PageRun<'_, StringObj>>,
-            Option<PageRun<'_, VectorObj>>,
-            Option<PageRun<'_, BignumObj>>,
-            &[DoomedBox],
-        )| {
+        let sweep_share = |share: Share<'_>| {
             owner_pages::with_swept_payloads(|mut payloads| {
                 macro_rules! sweep {
-                    ($run:expr, $collect:expr) => {
-                        $run.map(|run| {
-                            if generational {
-                                run.sweep::<true>(parity, scope, $collect, payloads.as_deref_mut())
-                            } else {
-                                run.sweep::<false>(parity, scope, $collect, payloads.as_deref_mut())
-                            }
-                        })
+                    ($runs:expr, $collect:expr) => {
+                        $runs
+                            .into_iter()
+                            .map(|run| {
+                                if generational {
+                                    run.sweep::<true>(
+                                        parity,
+                                        scope,
+                                        $collect,
+                                        payloads.as_deref_mut(),
+                                    )
+                                } else {
+                                    run.sweep::<false>(
+                                        parity,
+                                        scope,
+                                        $collect,
+                                        payloads.as_deref_mut(),
+                                    )
+                                }
+                            })
+                            .collect::<Vec<_>>()
                     };
                 }
                 match payloads.as_deref_mut() {
-                    Some(payloads) => payloads.hold_boxes(boxes),
+                    Some(payloads) => payloads.hold_boxes(share.boxes),
                     None => {
-                        for doomed in boxes {
+                        for doomed in share.boxes {
                             // SAFETY: each dead box is in exactly one share,
                             // already unlinked from every list and registry.
                             unsafe { doomed.drop_box() };
@@ -579,15 +583,17 @@ impl TaggedHeap {
                     }
                 }
                 (
-                    sweep!(floats, false),
-                    sweep!(strings, false),
-                    sweep!(vectors, true),
-                    sweep!(bignums, false),
+                    sweep!(share.floats, false),
+                    sweep!(share.strings, false),
+                    sweep!(share.vectors, true),
+                    sweep!(share.bignums, false),
                 )
             })
         };
         let slots = ShareSlots::new(shares);
-        run_shares(parts, &|index| slots.run(index, &sweep_share));
+        run_shares(parts, &|_| {
+            slots.run_owned(owner_pages::current_owner_key(), &sweep_share);
+        });
         let swept = slots.into_results();
         let mut float_runs = Vec::new();
         let mut string_runs = Vec::new();
@@ -598,6 +604,15 @@ impl TaggedHeap {
             string_runs.extend(strings);
             vector_runs.extend(vectors);
             bignum_runs.extend(bignums);
+        }
+        // Linked in page order, as the serial sweep links them.
+        for runs in [
+            &mut float_runs,
+            &mut string_runs,
+            &mut vector_runs,
+            &mut bignum_runs,
+        ] {
+            runs.sort_unstable_by_key(|run| run.first);
         }
         let mut vectors = Vec::new();
         let mut live = 0usize;
@@ -3018,6 +3033,118 @@ impl TaggedHeap {
     }
 }
 
+/// One share of [`TaggedHeap::sweep_in_stop_on`]: runs of pages of each
+/// class, and some of the dead boxes.
+#[cfg(feature = "shared-heap")]
+#[derive(Default)]
+struct Share<'a> {
+    floats: Vec<PageRun<'a, FloatObj>>,
+    strings: Vec<PageRun<'a, StringObj>>,
+    vectors: Vec<PageRun<'a, VectorObj>>,
+    bignums: Vec<PageRun<'a, BignumObj>>,
+    boxes: &'a [DoomedBox],
+    /// Pages in the runs.
+    pages: usize,
+}
+
+/// The shares of one in-stop sweep as they are formed: one per owner whose
+/// pages are swept, and keeper shares of at most `keeper_pages` pages for
+/// the keeper's. Unless `spread`, one keeper share holds everything.
+#[cfg(feature = "shared-heap")]
+struct ShareSet<'a> {
+    spread: bool,
+    keeper_pages: usize,
+    shares: Vec<(OwnerKey, Share<'a>)>,
+}
+
+#[cfg(feature = "shared-heap")]
+impl<'a> ShareSet<'a> {
+    fn new(spread: bool, keeper_pages: usize) -> Self {
+        Self {
+            spread,
+            keeper_pages,
+            shares: Vec::new(),
+        }
+    }
+
+    /// OWNER's share, made when it has none yet.
+    fn owned(&mut self, owner: OwnerKey) -> &mut Share<'a> {
+        let index = match self.shares.iter().position(|(key, _)| *key == owner) {
+            Some(index) => index,
+            None => {
+                self.shares.push((owner, Share::default()));
+                self.shares.len() - 1
+            }
+        };
+        &mut self.shares[index].1
+    }
+
+    /// The last keeper share while it has room, else a new one.
+    fn keeper(&mut self) -> &mut Share<'a> {
+        let open = self.shares.iter().rposition(|(key, share)| {
+            *key == OwnerKey::KEEPER && (!self.spread || share.pages < self.keeper_pages)
+        });
+        let index = open.unwrap_or_else(|| {
+            self.shares.push((OwnerKey::KEEPER, Share::default()));
+            self.shares.len() - 1
+        });
+        &mut self.shares[index].1
+    }
+
+    /// Put each of RUNS, one class's (CLASS picks its runs in a share), in
+    /// its owner's share, the keeper's cut to keeper shares.
+    fn add<T: PagedObject>(
+        &mut self,
+        runs: Vec<(OwnerKey, PageRun<'a, T>)>,
+        class: for<'s> fn(&'s mut Share<'a>) -> &'s mut Vec<PageRun<'a, T>>,
+    ) {
+        for (owner, mut run) in runs {
+            if self.spread && owner != OwnerKey::KEEPER {
+                let share = self.owned(owner);
+                share.pages += run.len();
+                class(share).push(run);
+                continue;
+            }
+            loop {
+                let spread = self.spread;
+                let keeper_pages = self.keeper_pages;
+                let share = self.keeper();
+                let room = if spread {
+                    keeper_pages - share.pages
+                } else {
+                    usize::MAX
+                };
+                let (head, tail) = run.split(room);
+                share.pages += head.len();
+                class(share).push(head);
+                match tail {
+                    Some(tail) => run = tail,
+                    None => break,
+                }
+            }
+        }
+    }
+
+    /// The shares, with DOOMED spread over them, or over BOX_SHARES keeper
+    /// shares when no page is swept.
+    fn with_boxes(
+        mut self,
+        doomed: &'a [DoomedBox],
+        box_shares: usize,
+    ) -> Vec<(OwnerKey, Share<'a>)> {
+        if self.shares.is_empty() {
+            let parts = if self.spread { box_shares.max(1) } else { 1 };
+            self.shares
+                .resize_with(parts, || (OwnerKey::KEEPER, Share::default()));
+        }
+        let chunk = doomed.len().div_ceil(self.shares.len()).max(1);
+        for ((_, share), boxes) in self.shares.iter_mut().zip(doomed.chunks(chunk)) {
+            share.boxes = boxes;
+        }
+        self.shares
+    }
+}
+
 /// The shares of [`TaggedHeap::sweep_in_stop_on`]: each one's input and,
 /// once it ran, its result, for whichever thread runs it.
 #[cfg(feature = "shared-heap")]
@@ -3027,6 +3154,8 @@ struct ShareSlots<In, Out> {
 
 #[cfg(feature = "shared-heap")]
 struct ShareSlot<In, Out> {
+    /// The owner whose pages the share holds, whose thread takes it first.
+    owner: OwnerKey,
     /// Set by the one call that runs this share.
     claimed: std::sync::atomic::AtomicBool,
     /// Set, with release, once `out` holds the result.
@@ -3043,10 +3172,11 @@ unsafe impl<In: Send, Out: Send> Sync for ShareSlots<In, Out> {}
 
 #[cfg(feature = "shared-heap")]
 impl<In, Out> ShareSlots<In, Out> {
-    fn new(inputs: Vec<In>) -> Self {
+    fn new(inputs: Vec<(OwnerKey, In)>) -> Self {
         let slots = inputs
             .into_iter()
-            .map(|input| ShareSlot {
+            .map(|(owner, input)| ShareSlot {
+                owner,
                 claimed: std::sync::atomic::AtomicBool::new(false),
                 done: std::sync::atomic::AtomicBool::new(false),
                 input: std::cell::UnsafeCell::new(Some(input)),
@@ -3056,14 +3186,27 @@ impl<In, Out> ShareSlots<In, Out> {
         Self { slots }
     }
 
-    /// Run share INDEX with WORK. Panics when it ran already.
-    fn run(&self, index: usize, work: impl FnOnce(In) -> Out) {
+    /// Run one share no call has claimed with WORK: OWNER's own while one is
+    /// left, else a keeper share, else any. Each call claims one share, so
+    /// as many calls as shares run every share once; more panic.
+    fn run_owned(&self, owner: OwnerKey, work: impl FnOnce(In) -> Out) {
         use std::sync::atomic::Ordering;
-        let slot = &self.slots[index];
-        assert!(
-            !slot.claimed.swap(true, Ordering::AcqRel),
-            "share {index} runs once"
-        );
+        let claim = |slot: &&ShareSlot<In, Out>| {
+            !slot.claimed.load(Ordering::Relaxed) && !slot.claimed.swap(true, Ordering::AcqRel)
+        };
+        let slot = self
+            .slots
+            .iter()
+            .filter(|slot| slot.owner == owner)
+            .find(claim)
+            .or_else(|| {
+                self.slots
+                    .iter()
+                    .filter(|slot| slot.owner == OwnerKey::KEEPER)
+                    .find(claim)
+            })
+            .or_else(|| self.slots.iter().rev().find(claim))
+            .expect("a share task runs once per share");
         // SAFETY: this call won `claimed`, so no other thread touches the
         // cells until `done` publishes the result.
         let input =
