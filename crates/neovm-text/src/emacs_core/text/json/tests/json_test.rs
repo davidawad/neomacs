@@ -1216,3 +1216,72 @@ fn assert_parse_signal(input: &str, cond: &str, line: i64, pos: i64) {
         other => panic!("expected {cond} signal for {input:?}, got {other:?}"),
     }
 }
+
+/// At each stop point `json-parse-string` offers, a full collection rooted
+/// at nothing but the values the parse holds leaves the document intact:
+/// what it holds is exactly what a stopped thread must keep. Each object
+/// type, against the same parse without stop points (compared serialized).
+#[test]
+fn a_collection_at_every_stop_point_keeps_the_partial_document() {
+    crate::test_utils::init_test_tracing();
+    let document = r#"{"a":[1,"two",{"three":[3.5,"x",[]]}],"b":{"c":"d","e":[[{}],{"f":null}]},"g":"h","a":false}"#;
+    for object_type in ["hash-table", "alist", "plist"] {
+        let args = || {
+            vec![
+                Value::string(document),
+                Value::keyword(":object-type"),
+                Value::symbol(object_type),
+            ]
+        };
+        let serialized = |value| builtin_json_serialize(vec![value]).expect("serializable");
+        let expected = serialized(builtin_json_parse_string(args()).expect("parses"));
+        let expected = expected
+            .as_lisp_string()
+            .expect("a string")
+            .as_bytes()
+            .to_vec();
+        let mut stops = 0;
+        let mut collect = |held: &[Value]| {
+            stops += 1;
+            neovm_value::tagged::gc::with_tagged_heap(|heap| {
+                heap.collect_exact(held.iter().copied());
+            });
+        };
+        let args = args();
+        let input = args[0].as_lisp_string().expect("a string");
+        let opts = parse_parse_kwargs(&args, 1, SymbolMode::Bare).expect("options");
+        let parsed = JsonParser::new(input.as_bytes(), input.is_multibyte(), opts)
+            .with_stop_points(&args, &mut collect)
+            .parse()
+            .expect("parses with stop points");
+        assert_eq!(
+            stops, 17,
+            "{object_type}: a stop after each element and member"
+        );
+        let got = serialized(parsed);
+        assert_eq!(
+            got.as_lisp_string().expect("a string").as_bytes(),
+            expected.as_slice(),
+            "{object_type}"
+        );
+    }
+}
+
+/// `json-parse-string` offers its stop points to hash-table documents only:
+/// an alist or plist document is conses, which a minor promotes at their
+/// first survival.
+#[test]
+fn json_parse_string_offers_stop_points_to_hash_table_documents_only() {
+    crate::test_utils::init_test_tracing();
+    for (object_type, expected) in [("hash-table", 3), ("alist", 0), ("plist", 0)] {
+        let mut stops = 0;
+        let args = vec![
+            Value::string(r#"{"a":1,"b":[2]}"#),
+            Value::keyword(":object-type"),
+            Value::symbol(object_type),
+        ];
+        json_parse_string_with_symbols(args, SymbolMode::Bare, Some(&mut |_: &[Value]| stops += 1))
+            .expect("parses");
+        assert_eq!(stops, expected, "{object_type}");
+    }
+}

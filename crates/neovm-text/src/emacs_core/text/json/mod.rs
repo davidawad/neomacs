@@ -695,15 +695,20 @@ fn json_utf8_decode_error(start: usize, end: usize) -> Flow {
 // Keep guarded mutation out of the inactive insertion clone.
 #[cold]
 #[inline(never)]
-fn insert_json_hash_member_concurrent(
-    table_value: Value,
-    hash_key: HashKey,
-    key_value: Value,
-    value: Value,
-) {
-    let _ = table_value.with_hash_table_mut_concurrent(|table| {
-        table.insert(hash_key, key_value, value);
-    });
+#[cold]
+#[inline(never)]
+fn build_json_hash_table_concurrent(hash_keys: Vec<HashKey>, members: &[Value]) -> Value {
+    // The same build contract applies to this active clone. Each insertion
+    // keeps the normal snapshot/mutation lease.
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    let _guard = neovm_value::tagged::mutate::HeapMutClosureGuard::enter();
+    let table_value = Value::hash_table(HashTableTest::Equal);
+    for (hash_key, member) in hash_keys.into_iter().zip(members.chunks_exact(2)) {
+        let _ = table_value.with_hash_table_mut_concurrent(|table| {
+            table.insert(hash_key, member[0], member[1]);
+        });
+    }
+    table_value
 }
 
 /// Parser state: a cursor over the input bytes.
@@ -723,6 +728,14 @@ struct JsonParser<'a> {
     /// occurrence. Interned symbols are permanently rooted, so caching the
     /// resulting value is safe for the life of the parse.
     keyword_cache: FxHashMap<String, Value>,
+    /// Every value the parse holds that no finished Lisp object references
+    /// yet: its arguments, and each open array's elements and object's
+    /// members, innermost last. What [`Self::stop`] is offered.
+    held: Vec<Value>,
+    /// Called after each array element and object member with
+    /// [`Self::held`]: where a Parallel World's detached thread may join a
+    /// requested stop-the-world collection with those values rooted.
+    stop: Option<&'a mut dyn FnMut(&[Value])>,
 }
 
 /// Maximum object/array nesting accepted while parsing, mirroring GNU
@@ -740,6 +753,24 @@ impl<'a> JsonParser<'a> {
             depth: 0,
             opts,
             keyword_cache: FxHashMap::default(),
+            held: Vec::new(),
+            stop: None,
+        }
+    }
+
+    /// Offer STOP the parse's held values at every stop point; ROOTS (the
+    /// input string and the options' values) are held throughout.
+    fn with_stop_points(mut self, roots: &[Value], stop: &'a mut dyn FnMut(&[Value])) -> Self {
+        self.held.extend_from_slice(roots);
+        self.stop = Some(stop);
+        self
+    }
+
+    /// A stop point: every value the parse holds is in [`Self::held`].
+    #[inline]
+    fn stop_point(&mut self) {
+        if let Some(stop) = self.stop.as_deref_mut() {
+            stop(&self.held);
         }
     }
 
@@ -1198,14 +1229,15 @@ impl<'a> JsonParser<'a> {
     /// Mirrors GNU `json_parse_array`.
     fn parse_array(&mut self) -> Result<Value, Flow> {
         let mut c = self.skip_ws_consume()?;
-        let mut items: Vec<Value> = Vec::new();
+        let start = self.held.len();
 
         if c != b']' {
             // GNU only counts nesting depth for non-empty containers.
             self.enter_nesting()?;
             loop {
                 let val = self.parse_value(c)?;
-                items.push(val);
+                self.held.push(val);
+                self.stop_point();
 
                 c = self.skip_ws_consume()?;
                 if c == b']' {
@@ -1219,6 +1251,7 @@ impl<'a> JsonParser<'a> {
             }
         }
 
+        let items = self.held.split_off(start);
         match self.opts.array_type {
             ArrayType::Vector => Ok(Value::vector(items)),
             ArrayType::List => Ok(Value::list(items)),
@@ -1256,106 +1289,71 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_object_hash_table(&mut self, mut c: u8) -> Result<Value, Flow> {
-        if neovm_value::tagged::gc::concurrent_hash_mutation_active() {
-            return self.parse_object_hash_table_concurrent(c);
+        if c == b'}' {
+            return Ok(Value::hash_table(HashTableTest::Equal));
         }
-        // The parser only scans bytes, allocates Values and constructs Flow
-        // errors. Allocation/refill never collects or runs Lisp, and signal()
-        // returns a pinned payload; signal hooks run after parsing returns.
-        // Neither recursion nor an error path can install a heap or change
-        // its Tier-H mode. Keep that contract enforced at GC entry whenever
-        // the GEN-5 guard family is compiled (debug builds and test builds,
+        self.enter_nesting()?;
+        // Each member's key string and value wait in `held` (rooted at the
+        // stop points) and the table is built when the object closes, so no
+        // table is mutated across a stop point.
+        let start = self.held.len();
+        let mut hash_keys = Vec::new();
+        loop {
+            let (key, val) = self.parse_object_member(c)?;
+            // A JSON member name becomes a Lisp STRING key, so it must be
+            // keyed the way any Lisp string is -- `HashKey::Text` is a
+            // runtime tag and a `gethash` probe would never match it.
+            self.held.push(Value::string(&key));
+            self.held.push(val);
+            hash_keys.push(HashKey::from_str(key));
+            self.stop_point();
+
+            c = self.skip_ws_consume()?;
+            if c == b'}' {
+                self.leave_nesting();
+                break;
+            }
+            if c != b',' {
+                return Err(self.signal_at_pos(JsonError::Parse));
+            }
+            c = self.skip_ws_consume()?;
+        }
+        let members = self.held.split_off(start);
+        if neovm_value::tagged::gc::concurrent_hash_mutation_active() {
+            return Ok(build_json_hash_table_concurrent(hash_keys, &members));
+        }
+        // Building only allocates the table and inserts: no callback or GC
+        // safe point. Keep that contract enforced at GC entry whenever the
+        // GEN-5 guard family is compiled (debug builds and test builds,
         // including the release workspace test graph).
         #[cfg(any(test, debug_assertions, feature = "test-support"))]
         let _guard = neovm_value::tagged::mutate::HeapMutClosureGuard::enter();
         let ht = Value::hash_table(HashTableTest::Equal);
-        if c == b'}' {
-            return Ok(ht);
+        for (hash_key, member) in hash_keys.into_iter().zip(members.chunks_exact(2)) {
+            // SAFETY: the dispatch above selected inactive Tier-H, and the
+            // build has no callback or GC safe point that could change that
+            // selection.
+            let _ = unsafe {
+                ht.with_hash_table_mut_inactive(|table| {
+                    table.insert(hash_key, member[0], member[1]);
+                })
+            };
         }
-        self.enter_nesting()?;
-
-        loop {
-            let (key, val) = self.parse_object_member(c)?;
-
-            {
-                let key_val = Value::string(&key);
-                // A JSON member name becomes a Lisp STRING key, so it must
-                // be keyed the way any Lisp string is -- `HashKey::Text` is a
-                // runtime tag and a `gethash` probe would never match it.
-                let hash_key = HashKey::from_str(key);
-                // SAFETY: the entry dispatch selected inactive Tier-H, and
-                // the entire parser extent above has no callback or GC safe
-                // point that could change that selection.
-                let _ = unsafe {
-                    ht.with_hash_table_mut_inactive(|table| {
-                        table.insert(hash_key, key_val, val);
-                    })
-                };
-            }
-
-            c = self.skip_ws_consume()?;
-            if c == b'}' {
-                self.leave_nesting();
-                break;
-            }
-            if c != b',' {
-                return Err(self.signal_at_pos(JsonError::Parse));
-            }
-            c = self.skip_ws_consume()?;
-        }
-
-        Ok(ht)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn parse_object_hash_table_concurrent(&mut self, mut c: u8) -> Result<Value, Flow> {
-        // The same parser mode-stability contract applies to this active
-        // clone. Each insertion keeps the normal snapshot/mutation lease.
-        #[cfg(any(test, debug_assertions, feature = "test-support"))]
-        let _guard = neovm_value::tagged::mutate::HeapMutClosureGuard::enter();
-        let ht = Value::hash_table(HashTableTest::Equal);
-        if c == b'}' {
-            return Ok(ht);
-        }
-        self.enter_nesting()?;
-
-        loop {
-            let (key, val) = self.parse_object_member(c)?;
-
-            {
-                let key_val = Value::string(&key);
-                // A JSON member name becomes a Lisp STRING key, so it must
-                // be keyed the way any Lisp string is -- `HashKey::Text` is a
-                // runtime tag and a `gethash` probe would never match it.
-                let hash_key = HashKey::from_str(key);
-                insert_json_hash_member_concurrent(ht, hash_key, key_val, val);
-            }
-
-            c = self.skip_ws_consume()?;
-            if c == b'}' {
-                self.leave_nesting();
-                break;
-            }
-            if c != b',' {
-                return Err(self.signal_at_pos(JsonError::Parse));
-            }
-            c = self.skip_ws_consume()?;
-        }
-
         Ok(ht)
     }
 
     fn parse_object_alist(&mut self, mut c: u8) -> Result<Value, Flow> {
-        let mut pairs: Vec<Value> = Vec::new();
         if c == b'}' {
             return Ok(Value::NIL);
         }
         self.enter_nesting()?;
+        let start = self.held.len();
 
         loop {
             let (key, val) = self.parse_object_member(c)?;
-            pairs.push(Value::cons(Value::from_sym_id(intern(&key)), val));
+            self.held
+                .push(Value::cons(Value::from_sym_id(intern(&key)), val));
+            self.stop_point();
 
             c = self.skip_ws_consume()?;
             if c == b'}' {
@@ -1368,7 +1366,7 @@ impl<'a> JsonParser<'a> {
             c = self.skip_ws_consume()?;
         }
 
-        Ok(Value::list(pairs))
+        Ok(Value::list(self.held.split_off(start)))
     }
 
     /// The keyword symbol for plist key `key`, interning it at most once per
@@ -1386,17 +1384,19 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_object_plist(&mut self, mut c: u8) -> Result<Value, Flow> {
-        let mut items: Vec<Value> = Vec::new();
         if c == b'}' {
             return Ok(Value::NIL);
         }
         self.enter_nesting()?;
+        let start = self.held.len();
 
         loop {
             let (key, val) = self.parse_object_member(c)?;
             // Plist keys are keywords (symbols with leading colon).
-            items.push(self.plist_keyword(&key));
-            items.push(val);
+            let keyword = self.plist_keyword(&key);
+            self.held.push(keyword);
+            self.held.push(val);
+            self.stop_point();
 
             c = self.skip_ws_consume()?;
             if c == b'}' {
@@ -1409,7 +1409,7 @@ impl<'a> JsonParser<'a> {
             c = self.skip_ws_consume()?;
         }
 
-        Ok(Value::list(items))
+        Ok(Value::list(self.held.split_off(start)))
     }
 }
 
@@ -1455,7 +1455,7 @@ fn json_serialize_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalResult
 /// - `:false-object VALUE` — Lisp value for JSON false (default: :false)
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn builtin_json_parse_string(args: Vec<Value>) -> EvalResult {
-    json_parse_string_with_symbols(args, SymbolMode::Bare)
+    json_parse_string_with_symbols(args, SymbolMode::Bare, None)
 }
 
 #[doc(hidden)]
@@ -1463,10 +1463,18 @@ pub fn builtin_json_parse_string_in_state<H: TextHost>(
     host: &mut H,
     args: Vec<Value>,
 ) -> EvalResult {
-    json_parse_string_with_symbols(args, host.symbol_mode())
+    let mode = host.symbol_mode();
+    json_parse_string_with_symbols(args, mode, Some(&mut |held| host.join_world_stop(held)))
 }
 
-fn json_parse_string_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalResult {
+/// Parse ARGS' string; with STOP and hash-table objects, offer STOP the
+/// parse's held values (ARGS among them) after each array element and
+/// object member.
+fn json_parse_string_with_symbols(
+    args: Vec<Value>,
+    mode: SymbolMode,
+    stop: Option<&mut dyn FnMut(&[Value])>,
+) -> EvalResult {
     expect_min_args("json-parse-string", &args, 1)?;
     let input = match args[0].kind() {
         ValueKind::String => args[0]
@@ -1481,6 +1489,14 @@ fn json_parse_string_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalRes
     };
     let opts = parse_parse_kwargs(&args, 1, mode)?;
     let mut parser = JsonParser::new(input.as_bytes(), input.is_multibyte(), opts);
+    // Stop points pay only where a partial document a stop finds can still
+    // die young: a minor promotes conses at their first survival, and an
+    // alist or plist document is conses.
+    if let Some(stop) = stop
+        && parser.opts.object_type == ObjectType::HashTable
+    {
+        parser = parser.with_stop_points(&args, stop);
+    }
     let result = parser.parse()?;
 
     // Ensure there is no trailing non-whitespace, mirroring GNU's

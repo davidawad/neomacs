@@ -105,6 +105,13 @@ pub trait TextHost: EditHost {
     /// pure read (T5.3).
     fn current_buffer_is_displayed(&self) -> bool;
 
+    /// A stop point of a long primitive (`json-parse-string`'s members and
+    /// elements): a Parallel World's detached thread joins a requested
+    /// stop-the-world collection here with HELD, every value the primitive
+    /// holds outside its arguments' reach, rooted. Elsewhere it does
+    /// nothing. TEXT-HOST row.
+    fn join_world_stop(&mut self, _held: &[Value]) {}
+
     /// Acquire the reusable code-conversion buffer (GNU
     /// `code_conversion_save`), through the evaluator so the localized
     /// forwarding metadata is updated. TEXT-HOST row.
