@@ -786,6 +786,47 @@ pub(super) struct SweptRun {
     slots: Vec<usize>,
 }
 
+/// A swept page with few live slots lent to owner threads to carve its
+/// free slots ([`ObjectArena::lend_sparse_pages`]). The page stays in its
+/// arena, so its live objects stay owned, but the keeper allocates nothing
+/// from it until it comes back ([`ObjectArena::return_lent_page`]): owners
+/// read only this copy of its alloc bits, and write only slots it shows
+/// free, which no thread reads.
+#[cfg(feature = "shared-heap")]
+pub(super) struct LentPage {
+    pub(super) base: usize,
+    bits: [usize; OBJECT_PAGE_MAX_ALLOC_WORDS],
+    /// The first slot no run has reserved.
+    scan: usize,
+    /// `(first slot, slots)` of every closed run's handed-out head.
+    pub(super) handed: Vec<(usize, usize)>,
+    pub(super) open_runs: usize,
+}
+
+#[cfg(feature = "shared-heap")]
+impl LentPage {
+    fn is_free(&self, index: usize) -> bool {
+        self.bits[index / usize::BITS as usize] & (1usize << (index % usize::BITS as usize)) == 0
+    }
+
+    /// The next run of up to WANT free slots of a page of SLOTS, reserved,
+    /// as `(first, count)`; `None` when none is left.
+    pub(super) fn reserve(&mut self, want: usize, slots: usize) -> Option<(usize, usize)> {
+        let first = (self.scan..slots).find(|&i| self.is_free(i))?;
+        let count = (first..slots)
+            .take(want)
+            .take_while(|&i| self.is_free(i))
+            .count();
+        self.scan = first + count;
+        Some((first, count))
+    }
+
+    /// Whether [`Self::reserve`] would find a slot.
+    pub(super) fn has_room(&self, slots: usize) -> bool {
+        (self.scan..slots).any(|i| self.is_free(i))
+    }
+}
+
 #[cfg(feature = "shared-heap")]
 impl<'a, T: PagedObject> PageRun<'a, T> {
     /// How many pages the run has.
@@ -1377,7 +1418,104 @@ impl<T: PagedObject> ObjectArena<T> {
         }
         self.spare_unused_floor = self.spare_storage.len();
         self.pages.shrink_to_fit();
+        self.rebuild_page_indices();
 
+        old_len - self.pages.len()
+    }
+
+    /// Lend up to MAX_PAGES pages whose live slots, at most MAX_LIVE, are all
+    /// old (a young one's page empties at the next minor anyway), and that
+    /// have a free one, to owner threads to carve (`owner_pages.rs`): the keeper
+    /// stops allocating from it (off the partial chain, bump cursor at the
+    /// end, free list dropped) until [`Self::return_lent_page`]. After a
+    /// whole-class sweep, with every owner's runs closed.
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn lend_sparse_pages(&mut self, max_live: usize, max_pages: usize) -> Vec<LentPage> {
+        let mut lent = Vec::new();
+        for page in &mut self.pages {
+            if lent.len() == max_pages {
+                break;
+            }
+            let has_free = page.free_head != PAGE_NONE || page.next_index < ObjectPage::<T>::SLOTS;
+            if page.retired
+                || page.allocated == 0
+                || page.allocated > max_live
+                || !has_free
+                || !page.allocated_slots().all(|slot| {
+                    // SAFETY: an allocated slot holds a fully written object.
+                    unsafe { (*(slot as *const GcHeader)).tenured }
+                })
+            {
+                continue;
+            }
+            page.free_head = PAGE_NONE;
+            page.next_index = ObjectPage::<T>::SLOTS;
+            lent.push(LentPage {
+                base: page.base_addr(),
+                bits: page.alloc_bits,
+                scan: 0,
+                handed: Vec::new(),
+                open_runs: 0,
+            });
+        }
+        if !lent.is_empty() {
+            self.rebuild_partial_chain();
+        }
+        lent
+    }
+
+    /// Take back a page [`Self::lend_sparse_pages`] lent: set the alloc bits
+    /// of the slots owners handed out, thread every other free slot, and put
+    /// the page on the partial chain if any is left. No owner run is open in
+    /// it.
+    #[cfg(feature = "shared-heap")]
+    pub(super) fn return_lent_page(&mut self, lent: &LentPage) {
+        debug_assert_eq!(lent.open_runs, 0);
+        let index = self.page_index_by_base[&lent.base];
+        let page = &mut self.pages[index];
+        debug_assert_eq!(page.free_head, PAGE_NONE, "a lent page has no free list");
+        for &(first, count) in &lent.handed {
+            page.set_allocated_range(first, count);
+        }
+        const BITS: usize = usize::BITS as usize;
+        for word_index in 0..ObjectPage::<T>::ALLOC_WORDS {
+            let base = word_index * BITS;
+            let mut free = !page.alloc_bits[word_index];
+            if ObjectPage::<T>::SLOTS - base < BITS {
+                free &= (1usize << (ObjectPage::<T>::SLOTS - base)) - 1;
+            }
+            while free != 0 {
+                let slot = base + free.trailing_zeros() as usize;
+                free &= free - 1;
+                // SAFETY: a free slot of this page that no owner writes any
+                // more; only its trailing link word is written.
+                unsafe { page.free_link_ptr(slot).write(page.free_head) };
+                page.free_head = slot;
+            }
+        }
+        if page.free_head != PAGE_NONE {
+            self.link_partial(index);
+        }
+    }
+
+    /// Rebuild the partial chain from every page's free list.
+    #[cfg(feature = "shared-heap")]
+    fn rebuild_partial_chain(&mut self) {
+        self.partial_head = PAGE_NONE;
+        for (page_index, page) in self.pages.iter_mut().enumerate() {
+            page.next_partial = PAGE_NONE;
+            page.on_partial = false;
+            if page.free_head != PAGE_NONE {
+                page.on_partial = true;
+                page.next_partial = self.partial_head;
+                self.partial_head = page_index;
+            }
+        }
+    }
+
+    /// Rebuild the page-base registry, the chunk map entries and the partial
+    /// chain after pages left `pages`.
+    fn rebuild_page_indices(&mut self) {
         self.page_index_by_base =
             FxHashMap::with_capacity_and_hasher(self.pages.len(), Default::default());
         self.partial_head = PAGE_NONE;
@@ -1399,8 +1537,6 @@ impl<T: PagedObject> ObjectArena<T> {
                 self.partial_head = page_index;
             }
         }
-
-        old_len - self.pages.len()
     }
 
     /// Adopt a page owner threads carved (`owner_pages.rs`): its alloc bits

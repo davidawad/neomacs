@@ -49,6 +49,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 /// be freed. A block or page is 64 KB of allocation per cold-mutex take.
 const SPARE_BATCH: usize = 1;
 
+/// A swept bignum page with live slots but at most 1/SPARSE_LIVE_FRACTION
+/// of them is lent to owners to carve.
+const SPARSE_LIVE_FRACTION: usize = 2;
+
 /// How many cells or slots an owner takes per refill, at most: a run never
 /// crosses its block or page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +176,11 @@ struct PagePool<T: PagedObject> {
     carving: Option<usize>,
     /// Storage of swept, empty pages a new page is made over first.
     spare: Vec<*mut u8>,
+    /// Swept arena pages with few live slots, lent for owners to carve
+    /// before they start a page of their own; none started yet.
+    lent: Vec<LentPage>,
+    /// Lent pages owners started carving.
+    lent_open: Vec<LentPage>,
     /// Pages started (over spare storage or fresh) since the last recycle.
     carved: usize,
     /// How many spare storages recycling keeps: the pages owners started
@@ -193,6 +202,8 @@ impl<T: PagedObject> PagePool<T> {
             pages: Vec::new(),
             carving: None,
             spare: Vec::new(),
+            lent: Vec::new(),
+            lent_open: Vec::new(),
             carved: 0,
             limit: 0,
         }
@@ -200,8 +211,15 @@ impl<T: PagedObject> PagePool<T> {
 
     /// Whether the next carve starts a page.
     fn opens_page(&mut self) -> bool {
-        self.carving
-            .is_none_or(|base| self.page_mut(base).page.next_index >= ObjectPage::<T>::SLOTS)
+        self.carving.is_none_or(|base| !self.has_room(base))
+    }
+
+    /// Whether the page at BASE, pending or lent, has a slot left to carve.
+    fn has_room(&mut self, base: usize) -> bool {
+        match self.lent_open.iter().rev().find(|lent| lent.base == base) {
+            Some(lent) => lent.has_room(ObjectPage::<T>::SLOTS),
+            None => self.page_mut(base).page.next_index < ObjectPage::<T>::SLOTS,
+        }
     }
 
     fn page_mut(&mut self, base: usize) -> &mut PendingPage<T> {
@@ -212,14 +230,21 @@ impl<T: PagedObject> PagePool<T> {
             .expect("an owner run names a pending page")
     }
 
-    /// Reserve up to `want` never-used slots: the carving page's tail, else a
-    /// fresh page.
+    /// Reserve up to `want` never-used slots: the carving page's next free
+    /// run, else a new page's over spare storage, else a lent page's first,
+    /// else a fresh page's.
     fn carve(&mut self, want: usize) -> OwnerRun {
-        let open = self
-            .carving
-            .filter(|&base| self.page_mut(base).page.next_index < ObjectPage::<T>::SLOTS);
+        let open = self.carving.filter(|&base| self.has_room(base));
         let base = match open {
             Some(base) => base,
+            None if self.spare.is_empty() && !self.lent.is_empty() => {
+                let lent = self.lent.pop().expect("a lent page");
+                self.carved += 1;
+                let base = lent.base;
+                self.lent_open.push(lent);
+                self.carving = Some(base);
+                base
+            }
             None => {
                 let page = self
                     .spare
@@ -232,6 +257,23 @@ impl<T: PagedObject> PagePool<T> {
                 base
             }
         };
+        if let Some(lent) = self
+            .lent_open
+            .iter_mut()
+            .rev()
+            .find(|lent| lent.base == base)
+        {
+            let (first, count) = lent
+                .reserve(want, ObjectPage::<T>::SLOTS)
+                .expect("the lent page has room");
+            lent.open_runs += 1;
+            let start = base + first * T::SLOT_BYTES;
+            return OwnerRun {
+                start,
+                cur: start,
+                lim: start + count * T::SLOT_BYTES,
+            };
+        }
         let pending = self.page_mut(base);
         let first = pending.page.next_index;
         let count = want.min(ObjectPage::<T>::SLOTS - first);
@@ -249,8 +291,20 @@ impl<T: PagedObject> PagePool<T> {
     /// many it handed out.
     fn close(&mut self, run: OwnerRun) -> usize {
         let base = run.start & !(OBJECT_PAGE_ALIGN - 1);
-        let pending = self.page_mut(base);
         let used = (run.cur - run.start) / T::SLOT_BYTES;
+        if let Some(lent) = self
+            .lent_open
+            .iter_mut()
+            .rev()
+            .find(|lent| lent.base == base)
+        {
+            if used > 0 {
+                lent.handed.push(((run.start - base) / T::SLOT_BYTES, used));
+            }
+            lent.open_runs -= 1;
+            return used;
+        }
+        let pending = self.page_mut(base);
         if used > 0 {
             pending
                 .page
@@ -274,13 +328,38 @@ impl<T: PagedObject> PagePool<T> {
         self.pages.append(&mut other.pages);
         other.carving = None;
         self.spare.append(&mut other.spare);
+        self.lent.append(&mut other.lent);
+        self.lent_open.append(&mut other.lent_open);
         self.carved += std::mem::take(&mut other.carved);
     }
 
-    /// Move up to SPARE_BATCH spare storages to TO.
+    /// Move up to SPARE_BATCH spare storages to TO, else a lent page.
     fn lend_spare(&mut self, to: &mut Self) {
+        if self.spare.is_empty() {
+            to.lent.extend(self.lent.pop());
+            return;
+        }
         let at = self.spare.len().saturating_sub(SPARE_BATCH);
         to.spare.extend(self.spare.drain(at..));
+    }
+
+    /// What a page start takes before fresh memory: spare storages and
+    /// lent pages.
+    fn spare_len(&self) -> usize {
+        self.spare.len() + self.lent.len()
+    }
+
+    /// Every lent page no run is open in, the carving one too when `all`;
+    /// call before [`Self::drain`].
+    fn drain_lent(&mut self, all: bool) -> Vec<LentPage> {
+        let carving = self.carving;
+        let (back, kept) = std::mem::take(&mut self.lent_open)
+            .into_iter()
+            .partition::<Vec<_>, _>(|lent| {
+                lent.open_runs == 0 && (all || Some(lent.base) != carving)
+            });
+        self.lent_open = kept;
+        back.into_iter().chain(self.lent.drain(..)).collect()
     }
 
     /// A sweep released pages to ARENA's spare storage: keep as many as
@@ -367,6 +446,8 @@ pub(super) struct AdoptedBlock {
 /// What one adoption moves into the heap.
 struct Adoption {
     blocks: Vec<AdoptedBlock>,
+    /// Lent bignum pages coming back to their arena.
+    lent_bignums: Vec<LentPage>,
     floats: Vec<ObjectPage<FloatObj>>,
     strings: Vec<ObjectPage<StringObj>>,
     vectors: Vec<ObjectPage<VectorObj>>,
@@ -439,10 +520,10 @@ impl AllocatorCold {
     fn spare_len(&self, class: OwnerClass) -> usize {
         match class {
             OwnerClass::Cons => self.spare_blocks.len(),
-            OwnerClass::Float => self.floats.spare.len(),
-            OwnerClass::String => self.strings.spare.len(),
-            OwnerClass::Vector => self.vectors.spare.len(),
-            OwnerClass::Bignum => self.bignums.spare.len(),
+            OwnerClass::Float => self.floats.spare_len(),
+            OwnerClass::String => self.strings.spare_len(),
+            OwnerClass::Vector => self.vectors.spare_len(),
+            OwnerClass::Bignum => self.bignums.spare_len(),
         }
     }
 
@@ -584,8 +665,10 @@ impl AllocatorCold {
                 unused: pending.unused,
             })
             .collect();
+        let lent_bignums = self.bignums.drain_lent(all);
         Adoption {
             blocks,
+            lent_bignums,
             floats: self.floats.drain(all),
             strings: self.strings.drain(all),
             vectors: self.vectors.drain(all),
@@ -1224,7 +1307,19 @@ impl TaggedHeap {
         cold.floats.recycle(&mut self.float_arena);
         cold.strings.recycle(&mut self.string_arena);
         cold.vectors.recycle(&mut self.vector_arena);
+        let started = cold.bignums.carved;
         cold.bignums.recycle(&mut self.bignum_arena);
+        // Bignums are leaves nothing writes after construction: a page a few
+        // live (often promoted) ones pin is carved again, not a new one. As
+        // many as owners started beyond the spare storage kept for them:
+        // none while owners are idle, so the keeper keeps the rest.
+        let wanted = started.saturating_sub(cold.bignums.spare.len());
+        cold.bignums
+            .lent
+            .extend(self.bignum_arena.lend_sparse_pages(
+                ObjectPage::<BignumObj>::SLOTS / SPARSE_LIVE_FRACTION,
+                wanted,
+            ));
         shared.publish_spare(&cold);
     }
 
@@ -1243,6 +1338,7 @@ impl TaggedHeap {
         };
         let Adoption {
             blocks,
+            lent_bignums,
             floats,
             strings,
             vectors,
@@ -1281,6 +1377,9 @@ impl TaggedHeap {
         }
         for page in bignums {
             self.bignum_arena.adopt_page(page);
+        }
+        for lent in &lent_bignums {
+            self.bignum_arena.return_lent_page(lent);
         }
         for header in boxed {
             self.link_veclike(header);
