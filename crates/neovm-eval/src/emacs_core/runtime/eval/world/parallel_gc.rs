@@ -163,6 +163,9 @@ pub(crate) struct StopWorld {
     stop_wait_ns: AtomicU64,
     stop_max_ns: AtomicU64,
     requester_parks: AtomicU64,
+    /// The notifications [`Self::notify_if_none_runs`] made.
+    #[cfg(test)]
+    none_running_notifies: AtomicU64,
 }
 
 fn elapsed_ns(since: Instant) -> u64 {
@@ -191,6 +194,8 @@ impl StopWorld {
             stop_wait_ns: AtomicU64::new(0),
             stop_max_ns: AtomicU64::new(0),
             requester_parks: AtomicU64::new(0),
+            #[cfg(test)]
+            none_running_notifies: AtomicU64::new(0),
         }
     }
 
@@ -203,6 +208,20 @@ impl StopWorld {
         self.changed
             .wait(state)
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A thread stopped running (it parked, or left for good): wake the
+    /// waiters once none runs, under STATE. A waiter on the running count
+    /// (a stop's requester, a holder waiting in place) waits for it to
+    /// reach zero; a parked thread waits for the stop to end or for shares,
+    /// which a park does not change. Woken at every park, each parked
+    /// thread woke again for every thread that parked after it.
+    fn notify_if_none_runs(&self, state: &StopState) {
+        if state.running == 0 {
+            #[cfg(test)]
+            self.none_running_notifies.fetch_add(1, Ordering::Relaxed);
+            self.changed.notify_all();
+        }
     }
 
     /// The counters now.
@@ -264,7 +283,7 @@ impl StopWorld {
             state.phase = Phase::Stopping;
             ASYNC_ATTENTION.raise(AsyncSource::StopRequest);
         }
-        self.changed.notify_all();
+        self.notify_if_none_runs(&state);
         loop {
             state = self.help(state);
             match state.phase {
@@ -366,8 +385,7 @@ impl StopWorld {
         debug_assert!(state.running > 0, "only a running thread parks");
         state.running -= 1;
         state.images.insert(me, image);
-        drop(state);
-        self.changed.notify_all();
+        self.notify_if_none_runs(&state);
     }
 
     /// The calling thread, parked, runs again once no stop is in progress.
@@ -417,8 +435,7 @@ impl StopWorld {
         debug_assert!(state.running > 0, "only a running thread leaves");
         state.running -= 1;
         state.images.remove(&me);
-        drop(state);
-        self.changed.notify_all();
+        self.notify_if_none_runs(&state);
     }
 
     /// The calling thread holds the Baton and asks to stop every detached

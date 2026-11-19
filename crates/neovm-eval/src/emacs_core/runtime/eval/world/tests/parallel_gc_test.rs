@@ -574,3 +574,47 @@ fn stats_report_the_stop_counters() {
         "(1 0 t t)"
     );
 }
+
+/// Threads parking for a stop wake its waiters once, when the last of them
+/// parks: the stop's requester waits for no thread to run, and each parked
+/// thread for the stop's end, so a notification at every park only woke
+/// every thread parked so far.
+#[test]
+fn parks_for_a_stop_notify_its_waiters_once_no_thread_runs() {
+    const THREADS: usize = 6;
+    let stop = Arc::new(StopWorld::new());
+    let ready = Arc::new(Barrier::new(THREADS + 1));
+    let release = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..THREADS as i64)
+        .map(|k| {
+            let (stop, ready, release) =
+                (Arc::clone(&stop), Arc::clone(&ready), Arc::clone(&release));
+            std::thread::spawn(move || {
+                stop.enter_parked(vec![Value::fixnum(k).bits()]);
+                stop.resume();
+                ready.wait();
+                while !release.load(Ordering::Acquire) {
+                    stop.safepoint(|| vec![Value::fixnum(k).bits()]);
+                    std::thread::yield_now();
+                }
+                stop.leave();
+            })
+        })
+        .collect();
+    ready.wait();
+    let before = stop.none_running_notifies.load(Ordering::Relaxed);
+    let mut by_parks = None;
+    stop.collect_stopped(|roots| {
+        assert_eq!(roots.len(), THREADS, "every thread parked");
+        by_parks = Some(stop.none_running_notifies.load(Ordering::Relaxed) - before);
+    });
+    release.store(true, Ordering::Release);
+    for worker in workers {
+        worker.join().expect("worker left the stop");
+    }
+    assert_eq!(
+        by_parks,
+        Some(1),
+        "{THREADS} parks notified the stop's waiters once"
+    );
+}
