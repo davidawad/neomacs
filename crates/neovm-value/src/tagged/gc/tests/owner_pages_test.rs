@@ -891,3 +891,76 @@ fn owners_carve_an_accumulators_page_again_once_it_dies_young() {
         "fresh pages per round: {fresh:?}"
     );
 }
+
+/// An owner fills three bignum pages per round and keeps the last bignum,
+/// an accumulator, live for good: it is promoted at its second minor and
+/// pins its page until a major. Without reuse, each round started one
+/// fresh page for the one pinned; with the sweep lending pages that few
+/// live slots pin, the owner carves their free slots instead, and every
+/// accumulator stays readable. (One owner: which of several owners takes
+/// a lent page, a slot or more short of a whole one, decides whether one
+/// of them starts another page.)
+#[test]
+fn owners_carve_the_free_slots_of_pages_old_accumulators_pin() {
+    crate::test_utils::init_test_tracing();
+    const OWNERS: usize = 1;
+    const PAGES: usize = 3;
+    const ROUNDS: usize = 6;
+    let (mut heap, first) = generational_heap_with_an_owner();
+    let mut states = vec![first];
+    states.extend((1..OWNERS).map(|_| heap.new_owner_alloc_state()));
+    let n = PAGES * ObjectPage::<BignumObj>::SLOTS;
+    let mut kept: Vec<(usize, usize, TaggedValue)> = Vec::new();
+    let mut fresh = Vec::new();
+    for round in 0..ROUNDS {
+        let before = heap.owner_alloc_stats().fresh;
+        let accumulators = detached_section(&heap, &mut states, |tag| {
+            let mut last = 0;
+            for i in 0..n {
+                last = Value::make_integer(owner_bignum(tag, round * n + i)).bits();
+            }
+            last
+        });
+        fresh.push(heap.owner_alloc_stats().fresh - before);
+        kept.extend(
+            accumulators
+                .iter()
+                .enumerate()
+                .map(|(tag, &bits)| (tag, round * n + n - 1, value(bits))),
+        );
+        let roots: Vec<_> = kept.iter().map(|&(_, _, root)| root).collect();
+        minor(&mut heap, &roots);
+        for &(tag, i, root) in &kept {
+            assert_eq!(root.as_bignum(), Some(&owner_bignum(tag, i)));
+        }
+        for state in &mut states {
+            reopen_owner_regions(state);
+        }
+    }
+    assert!(heap.value_is_old_for_test(kept[0].2));
+    assert_eq!(
+        fresh[0],
+        (OWNERS * PAGES) as u64,
+        "the first round starts every page fresh"
+    );
+    // A round's accumulator is old, and its page lent, from the minor
+    // after the next round.
+    assert_eq!(
+        fresh[3..],
+        [0; ROUNDS - 3],
+        "fresh pages per round: {fresh:?}"
+    );
+    // With the owner idle since the last collection nothing is lent: the
+    // keeper allocates into the free slots of the pages the old bignums pin.
+    let roots: Vec<_> = kept.iter().map(|&(_, _, root)| root).collect();
+    minor(&mut heap, &roots);
+    let pages = heap.bignum_arena.pages_len_for_test();
+    for i in 0..ObjectPage::<BignumObj>::SLOTS / 4 {
+        heap.alloc_bignum(owner_bignum(9, i));
+    }
+    assert_eq!(heap.bignum_arena.pages_len_for_test(), pages);
+    heap.collect_exact(kept.iter().map(|&(_, _, root)| root));
+    for &(tag, i, root) in &kept {
+        assert_eq!(root.as_bignum(), Some(&owner_bignum(tag, i)));
+    }
+}
