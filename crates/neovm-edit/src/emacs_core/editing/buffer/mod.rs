@@ -200,15 +200,6 @@ pub fn expect_integer_or_marker_in_buffers(
     crate::emacs_core::position::fix_position_with_buffers(buffers, value)
 }
 
-/// Local copy of the lisp builtins layer's `integer-or-marker-p` extractor
-/// (per-module copies are established practice below the split). Strictly
-/// fixnum-or-marker with the live-buffer marker read — NOT
-/// `position::fix_position_eval`, which additionally clamps bignums and so
-/// is not behavior-equivalent here.
-fn canonicalize_or_self(path: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
 /// Run a named hook through the host seam — the C13 editfns idiom: resolve
 /// the symbol by name (alias-resolving), read the buffer-local-aware hook
 /// value, run with `inherit_global` as `Frun_hooks`/`run-hook-with-args`
@@ -540,41 +531,27 @@ pub fn builtin_get_truename_buffer<H: EditHost>(host: &mut H, args: Vec<Value>) 
     Ok(Value::NIL)
 }
 
+/// GNU `Fget_file_buffer`'s buffer scan (src/buffer.c:515-521): the first
+/// live buffer whose `buffer-file-name` is `string-equal` to FILENAME.
+///
+/// FILENAME is already the `expand-file-name` result and the file-name handler
+/// has already declined (the system layer's `get-file-buffer` owns both
+/// steps). GNU compares the stored names as they are: it does not expand them
+/// and never resolves a symlink, so a buffer visiting the same file under
+/// another name is found by `find-buffer-visiting`, not here.
 #[doc(hidden)]
-pub fn builtin_get_file_buffer<H: EditHost>(host: &mut H, args: Vec<Value>) -> EvalResult {
-    expect_args("get-file-buffer", &args, 1)?;
-    let resolved = host.resolve_filename(expect_lisp_string(&args[0])?);
-    let resolved_path = super::file_name::lisp_file_name_to_path_buf(&resolved);
-    let resolved_true = canonicalize_or_self(&resolved_path);
-
-    let buffer_ids = {
-        let (edit, _) = host.edit_and_vars();
-        edit.buffers.buffer_list()
-    };
-    for id in buffer_ids {
-        let file_name = {
-            let (edit, _) = host.edit_and_vars();
-            match edit
-                .buffers
-                .get(id)
-                .and_then(|buf| buf.file_name_lisp_string())
-            {
-                Some(name) => name.clone(),
-                None => continue,
-            }
-        };
-
-        let candidate = host.resolve_filename(&file_name);
-        if candidate == resolved {
-            return Ok(Value::make_buffer(id));
-        }
-        let candidate_path = super::file_name::lisp_file_name_to_path_buf(&candidate);
-        if canonicalize_or_self(&candidate_path) == resolved_true {
-            return Ok(Value::make_buffer(id));
-        }
-    }
-
-    Ok(Value::NIL)
+pub fn buffer_visiting_file_name(
+    buffers: &BufferManager,
+    filename: &neovm_value::heap_types::LispString,
+) -> Option<BufferId> {
+    buffers.buffer_list().into_iter().find(|&id| {
+        buffers
+            .get(id)
+            .and_then(|buf| buf.file_name_lisp_string())
+            .is_some_and(|name| {
+                name.schars() == filename.schars() && name.as_bytes() == filename.as_bytes()
+            })
+    })
 }
 
 /// What `kill-buffer`'s hooks decided.

@@ -176,7 +176,7 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     ctx.register_subr(neovm_eval::emacs_core::builtins::misc_eval::MAKE_INDIRECT_BUFFER_SUBR);
     ctx.register_subr(crate::emacs_core::subr::world_subr!(SubrSpec::new(
         "get-file-buffer",
-        NativeFn::ContextVec(|ctx, args| builtin_get_file_buffer(ctx, args)),
+        NativeFn::ContextVec(crate::emacs_core::fileio::builtin_get_file_buffer),
         SubrArity::new(1, Some(1)),
     )));
     ctx.register_subr(

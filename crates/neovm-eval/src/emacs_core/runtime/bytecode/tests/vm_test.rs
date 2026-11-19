@@ -4309,42 +4309,22 @@ fn vm_make_thread_records_join_error_on_shared_runtime() {
 
 #[test]
 fn vm_buffer_identity_builtins_use_shared_runtime_state() {
+    // `get-file-buffer` left this list when its body moved to the system
+    // layer (it expands through `expand-file-name`, which the unit runtime
+    // does not carry); neovm-core's builtins tests cover it.
     crate::test_utils::init_test_tracing();
-    let path =
-        std::env::temp_dir().join(format!("neovm-vm-gfb-{}-{}", std::process::id(), "shared"));
-    std::fs::write(&path, b"vm-gfb").expect("write test file");
-    let file = path.to_string_lossy().to_string();
-    let default_dir = format!("{}/", path.parent().unwrap().to_string_lossy());
-    let basename = path.file_name().unwrap().to_string_lossy().to_string();
-    let form = format!(
-        r#"(let ((default-directory {:?}))
-             (list
-              (buffer-name (get-file-buffer {:?}))
+    let form = r#"(list
+              (buffer-name)
               (progn
                 (rename-buffer "*vm-renamed-buffer*")
                 (buffer-name))
               (condition-case err
                   (bury-buffer-internal 'x)
                 (error (car err)))
-              (bury-buffer-internal (current-buffer))))"#,
-        default_dir, basename
-    );
-
-    let result = vm_eval_with_init_str(&form, |eval| {
-        let current = eval
-            .edit
-            .buffers
-            .current_buffer_id()
-            .expect("scratch buffer");
-        eval.edit
-            .buffers
-            .set_buffer_file_name(current, Value::string(file.clone()))
-            .expect("current buffer should accept file name");
-    });
-    let _ = std::fs::remove_file(path);
+              (bury-buffer-internal (current-buffer)))"#;
 
     assert_eq!(
-        result,
+        vm_eval_str(form),
         r#"OK ("*scratch*" "*vm-renamed-buffer*" wrong-type-argument nil)"#
     );
 }

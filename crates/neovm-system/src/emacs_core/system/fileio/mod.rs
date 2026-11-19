@@ -4602,6 +4602,35 @@ pub fn expand_file_operation(
     )
 }
 
+/// `(get-file-buffer FILENAME)` -- GNU `Fget_file_buffer` (src/buffer.c:493).
+///
+/// GNU checks the argument, expands it with `expand-file-name`, lets a
+/// `get-file-buffer` file-name handler answer (anything but a buffer counts as
+/// nil), and otherwise returns the first live buffer whose `buffer-file-name` is
+/// `string-equal` to the expansion. It never touches the file system, so
+/// neither does this: a buffer visiting the file through a symlink or a hard
+/// link is not this function's match.
+#[doc(hidden)]
+pub fn builtin_get_file_buffer(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    expect_args("get-file-buffer", &args, 1)?;
+    expect_lisp_string_strict(&args[0])?;
+    let expanded = match expand_file_operation(eval, "get-file-buffer", &args, 1)? {
+        ExpandedFileOperation::Handled(result) => {
+            return Ok(if result.is_buffer() {
+                result
+            } else {
+                Value::NIL
+            });
+        }
+        ExpandedFileOperation::Local { expanded_filename } => expanded_filename,
+    };
+    let expanded = eval.expect_lisp_string(expanded)?;
+    Ok(
+        neovm_edit::emacs_core::buffer::buffer_visiting_file_name(&eval.edit.buffers, expanded)
+            .map_or(Value::NIL, Value::make_buffer),
+    )
+}
+
 /// `(directory-files DIRECTORY &optional FULL MATCH NOSORT COUNT)`
 #[doc(hidden)]
 pub fn builtin_directory_files(eval: &mut Context, args: Vec<Value>) -> EvalResult {

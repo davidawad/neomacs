@@ -3323,10 +3323,10 @@ mod unit_runtime {
         use crate::emacs_core::subr::{FixedMin1, FixedMin2, NativeFn, SubrArity, SubrSpec};
         use neovm_edit::emacs_core::buffer::{
             builtin_char_after_1, builtin_current_buffer_0, builtin_get_buffer,
-            builtin_get_buffer_create, builtin_get_file_buffer, builtin_goto_char_1,
-            builtin_insert, builtin_insert_byte, builtin_kill_all_local_variables,
-            builtin_narrow_to_region_2, builtin_ntake, builtin_point_0, builtin_point_max_0,
-            builtin_point_min_0, builtin_set_buffer_1, builtin_widen_0,
+            builtin_get_buffer_create, builtin_goto_char_1, builtin_insert, builtin_insert_byte,
+            builtin_kill_all_local_variables, builtin_narrow_to_region_2, builtin_ntake,
+            builtin_point_0, builtin_point_max_0, builtin_point_min_0, builtin_set_buffer_1,
+            builtin_widen_0,
         };
         use neovm_edit::emacs_core::navigation::{builtin_bolp_0, builtin_forward_char_1};
         use neovm_value::error::EvalResult;
@@ -3337,9 +3337,6 @@ mod unit_runtime {
         }
         fn bind_get_buffer(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
             builtin_get_buffer(&mut ctx.edit.buffers, args)
-        }
-        fn bind_get_file_buffer(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
-            builtin_get_file_buffer(ctx, args)
         }
         fn bind_current_buffer(ctx: &mut Context) -> EvalResult {
             builtin_current_buffer_0(&mut ctx.edit.buffers)
@@ -3397,11 +3394,6 @@ mod unit_runtime {
             "get-buffer" => SubrSpec::new(
                 "get-buffer",
                 NativeFn::ContextVec(bind_get_buffer),
-                SubrArity::new(1, Some(1)),
-            ),
-            "get-file-buffer" => SubrSpec::new(
-                "get-file-buffer",
-                NativeFn::ContextVec(bind_get_file_buffer),
                 SubrArity::new(1, Some(1)),
             ),
             "current-buffer" => SubrSpec::fixed0("current-buffer", bind_current_buffer),

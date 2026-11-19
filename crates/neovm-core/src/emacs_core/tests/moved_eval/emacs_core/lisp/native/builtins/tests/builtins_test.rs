@@ -1883,14 +1883,20 @@ fn key_description_accepts_raw_unibyte_string_sequences() {
     assert_eq!(described, Value::string("C-M-@ M-ESC M-x M-DEL"));
 }
 
+#[cfg(unix)]
 #[test]
 fn eval_get_file_buffer_matches_visited_paths() {
+    use crate::emacs_core::fileio::builtin_get_file_buffer;
     crate::test_utils::init_test_tracing();
     let mut eval = crate::test_utils::new_context();
     let id = eval.edit.buffers.create_buffer("gfb");
 
-    let path = std::env::temp_dir().join(format!("neovm-gfb-{}-{}", std::process::id(), "eval"));
+    let dir = std::env::temp_dir().join(format!("neovm-gfb-{}-eval", std::process::id()));
+    std::fs::create_dir_all(dir.join("sub")).expect("create test directory");
+    let path = dir.join("file");
     std::fs::write(&path, b"gfb").expect("write test file");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&path, &link).expect("symlink test file");
     let file = path.to_string_lossy().to_string();
     eval.edit
         .buffers
@@ -1901,28 +1907,42 @@ fn eval_get_file_buffer_matches_visited_paths() {
     let exact = builtin_get_file_buffer(&mut eval, vec![Value::string(&file)]).unwrap();
     assert_eq!(exact, Value::make_buffer(id));
 
-    let truename = std::fs::canonicalize(&path)
-        .expect("canonicalize file")
-        .to_string_lossy()
-        .to_string();
-    let true_match = builtin_get_file_buffer(&mut eval, vec![Value::string(truename)]).unwrap();
-    assert_eq!(true_match, Value::make_buffer(id));
+    // GNU compares the expansion with `buffer-file-name` and never resolves
+    // a symlink: the link's own name is visited by no buffer.
+    let through_link = builtin_get_file_buffer(
+        &mut eval,
+        vec![Value::string(link.to_string_lossy().to_string())],
+    )
+    .unwrap();
+    assert!(through_link.is_nil());
 
-    let default_dir = format!("{}/", path.parent().unwrap().to_string_lossy());
-    let basename = path.file_name().unwrap().to_string_lossy().to_string();
+    let default_dir = format!("{}/", dir.to_string_lossy());
     eval.edit
         .buffers
         .current_buffer_mut()
         .unwrap()
         .set_buffer_local("default-directory", Value::string(default_dir));
-    let relative = builtin_get_file_buffer(&mut eval, vec![Value::string(basename)]).unwrap();
+    let relative = builtin_get_file_buffer(&mut eval, vec![Value::string("file")]).unwrap();
     assert_eq!(relative, Value::make_buffer(id));
+    // The argument is expanded (`.` and `..` folded) before the comparison.
+    let dotted = builtin_get_file_buffer(&mut eval, vec![Value::string("./sub/../file")]).unwrap();
+    assert_eq!(dotted, Value::make_buffer(id));
 
-    let _ = std::fs::remove_file(path);
+    // A stored relative name is compared as stored, not expanded.
+    eval.edit
+        .buffers
+        .get_mut(id)
+        .unwrap()
+        .set_file_name_value(Value::string("file"));
+    let stored_relative = builtin_get_file_buffer(&mut eval, vec![Value::string("file")]).unwrap();
+    assert!(stored_relative.is_nil());
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn eval_get_file_buffer_type_and_missing_paths() {
+    use crate::emacs_core::fileio::builtin_get_file_buffer;
     crate::test_utils::init_test_tracing();
     let mut eval = crate::test_utils::new_context();
     let missing = builtin_get_file_buffer(
