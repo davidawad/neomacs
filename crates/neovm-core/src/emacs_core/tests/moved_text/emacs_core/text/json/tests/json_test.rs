@@ -218,6 +218,63 @@ fn json_parse_buffer_end_of_file_uses_gnu_signal_shape() {
     );
 }
 
+/// `json-parse-buffer` reads the buffer's own text. When the gap sits inside
+/// the unread text it is moved out first; the value, the point it leaves and
+/// the error positions are those of a parse of the same text with the gap
+/// elsewhere, in a multibyte buffer and under narrowing.
+#[test]
+fn json_parse_buffer_reads_text_on_both_sides_of_the_gap() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::test_utils::new_context();
+    let mut eval_in_buffer =
+        |form: &str| neovm_eval::emacs_core::print::format_eval_result(&eval.eval_str(form));
+    // The insertion at 6 leaves the gap after `["é",0,`: inside the value.
+    eval_in_buffer(
+        r#"(progn
+             (erase-buffer)
+             (insert "[\"é\",{\"k\":[1,2]},\"ok\"] tail")
+             (goto-char 6)
+             (insert "0,")
+             (goto-char (point-min)))"#,
+    );
+    {
+        let buf = eval.edit.buffers.current_buffer().expect("current buffer");
+        let unread = neovm_edit::buffer::EmacsByteRange::new(
+            buf.point_emacs_byte_pos(),
+            buf.point_max_emacs_byte_pos(),
+        );
+        assert!(
+            !buf.has_contiguous_emacs_byte_range(unread),
+            "the fixture must put the gap inside the unread text"
+        );
+    }
+    let mut eval_in_buffer =
+        |form: &str| neovm_eval::emacs_core::print::format_eval_result(&eval.eval_str(form));
+    assert_eq!(
+        eval_in_buffer(
+            r#"(list (json-parse-buffer :object-type 'plist :array-type 'list)
+                     (point)
+                     (buffer-substring-no-properties (point) (point-max)))"#
+        ),
+        r#"OK (("é" 0 (:k (1 2)) "ok") 25 " tail")"#
+    );
+    // Narrowed short of the value's end: the parse runs out of input at the
+    // narrowing, and point stays put.
+    assert_eq!(
+        eval_in_buffer(
+            r#"(progn
+                 (goto-char 6)
+                 (insert " ")
+                 (goto-char (point-min))
+                 (save-restriction
+                   (narrow-to-region 1 12)
+                   (list (condition-case err (json-parse-buffer) (error err))
+                         (point))))"#
+        ),
+        r#"OK ((json-end-of-file 1 nil 11) 1)"#
+    );
+}
+
 #[test]
 fn json_insert_writes_at_point_and_advances() {
     crate::test_utils::init_test_tracing();

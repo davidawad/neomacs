@@ -1562,25 +1562,41 @@ fn json_parse_string_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalRes
 /// Unlike `json-parse-string`, this parses a single JSON value starting at the
 /// current point (after leading whitespace), leaves trailing buffer content
 /// untouched, and advances point to just after the parsed value.
+///
+/// The parser reads the buffer's own bytes, as GNU's does (`Fjson_parse_buffer`
+/// points its input at the text on each side of the gap). It used to read a
+/// copy of everything from point to the end of the accessible region, text
+/// properties included, so one LSP message cost a copy and a character count
+/// of the whole unread process buffer before a byte was parsed.
 #[doc(hidden)]
 pub fn builtin_json_parse_buffer<H: EditHost>(host: &mut H, args: Vec<Value>) -> EvalResult {
     let opts = parse_parse_kwargs(&args, 0, host.symbol_mode())?;
-    let (input, point_base) = {
+    let (result, new_point) = {
         let (edit, _vars) = host.edit_and_vars();
         let buf = edit
             .buffers
             .current_buffer()
             .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
-        let accessible = buf.accessible_emacs_byte_region();
         let point_base = buf.point_emacs_byte_pos();
-        let input = buf
-            .buffer_substring_lisp_string_range(EmacsByteRange::new(point_base, accessible.end()));
-        (input, point_base)
+        let unread = EmacsByteRange::new(point_base, buf.accessible_emacs_byte_region().end());
+        let multibyte = buf.get_multibyte();
+        let parse = |input: &[u8]| {
+            let mut parser = JsonParser::new(input, multibyte, opts.clone());
+            parser.parse().map(|value| (value, parser.pos))
+        };
+        // Moving the gap out of the unread text is what GNU's searches do
+        // too; a chunked text backend lends no window, and gets the copy.
+        buf.try_make_emacs_byte_range_contiguous(unread);
+        let parsed = match buf.with_contiguous_emacs_byte_range(unread, parse) {
+            Some(parsed) => parsed,
+            None => parse(
+                buf.buffer_substring_lisp_string_no_properties_range(unread)
+                    .as_bytes(),
+            ),
+        };
+        let (value, consumed) = parsed?;
+        (value, point_base.add_len(EmacsByteLen::new(consumed)))
     };
-
-    let mut parser = JsonParser::new(input.as_bytes(), input.is_multibyte(), opts);
-    let result = parser.parse()?;
-    let new_point = point_base.add_len(EmacsByteLen::new(parser.pos));
     let (edit, _vars) = host.edit_and_vars();
     if let Some(current_id) = edit.buffers.current_buffer_id() {
         let _ = edit
