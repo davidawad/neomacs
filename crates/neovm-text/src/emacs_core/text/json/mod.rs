@@ -151,12 +151,19 @@ impl JsonOptionKey {
 
 /// Parse keyword arguments from the &rest tail (starting at `start_index`).
 /// Returns `ParseOpts`.  Unknown keywords signal `json-error`.
+///
+/// The `:null` and `:false` defaults are made only for an option the call
+/// leaves out: a JSON-RPC client passes both on every message, and building
+/// a default keyword interns its name.
 fn parse_parse_kwargs(
     args: &[Value],
     start_index: usize,
     mode: SymbolMode,
 ) -> Result<ParseOpts, Flow> {
-    let mut opts = ParseOpts::default();
+    let mut object_type = ObjectType::HashTable;
+    let mut array_type = ArrayType::Vector;
+    let mut null_object = None;
+    let mut false_object = None;
     let rest = &args[start_index..];
     if !rest.len().is_multiple_of(2) {
         return Err(signal(
@@ -170,8 +177,8 @@ fn parse_parse_kwargs(
         let value = &rest[i + 1];
         match JsonOptionKey::from_value(key, mode) {
             Some(JsonOptionKey::ObjectType) => {
-                if let Some(object_type) = ObjectType::from_symbol_value(value, mode) {
-                    opts.object_type = object_type;
+                if let Some(requested) = ObjectType::from_symbol_value(value, mode) {
+                    object_type = requested;
                 } else {
                     return Err(signal(
                         "error",
@@ -183,8 +190,8 @@ fn parse_parse_kwargs(
                 }
             }
             Some(JsonOptionKey::ArrayType) => {
-                if let Some(array_type) = ArrayType::from_symbol_value(value, mode) {
-                    opts.array_type = array_type;
+                if let Some(requested) = ArrayType::from_symbol_value(value, mode) {
+                    array_type = requested;
                 } else {
                     return Err(signal(
                         "error",
@@ -196,10 +203,10 @@ fn parse_parse_kwargs(
                 }
             }
             Some(JsonOptionKey::NullObject) => {
-                opts.null_object = *value;
+                null_object = Some(*value);
             }
             Some(JsonOptionKey::FalseObject) => {
-                opts.false_object = *value;
+                false_object = Some(*value);
             }
             _ => {
                 return Err(signal(
@@ -214,19 +221,24 @@ fn parse_parse_kwargs(
             }
         }
     }
-    Ok(opts)
+    Ok(ParseOpts {
+        object_type,
+        array_type,
+        null_object: null_object.unwrap_or_else(|| Value::keyword(":null")),
+        false_object: false_object.unwrap_or_else(|| Value::keyword(":false")),
+    })
 }
 
-/// Parse keyword arguments relevant to `json-serialize` / `json-insert`.
+/// Parse keyword arguments relevant to `json-serialize` / `json-insert`,
+/// making a default sentinel only for an option the call leaves out (see
+/// [`parse_parse_kwargs`]).
 fn parse_serialize_kwargs(
     args: &[Value],
     start_index: usize,
     mode: SymbolMode,
 ) -> Result<SerializeOpts, Flow> {
-    let mut opts = SerializeOpts {
-        symbol_mode: mode,
-        ..SerializeOpts::default()
-    };
+    let mut null_object = None;
+    let mut false_object = None;
     let rest = &args[start_index..];
     if !rest.len().is_multiple_of(2) {
         return Err(signal(
@@ -240,10 +252,10 @@ fn parse_serialize_kwargs(
         let value = &rest[i + 1];
         match JsonOptionKey::from_value(key, mode) {
             Some(JsonOptionKey::NullObject) => {
-                opts.null_object = *value;
+                null_object = Some(*value);
             }
             Some(JsonOptionKey::FalseObject) => {
-                opts.false_object = *value;
+                false_object = Some(*value);
             }
             _ => {
                 return Err(signal(
@@ -256,7 +268,11 @@ fn parse_serialize_kwargs(
             }
         }
     }
-    Ok(opts)
+    Ok(SerializeOpts {
+        symbol_mode: mode,
+        null_object: null_object.unwrap_or_else(|| Value::keyword(":null")),
+        false_object: false_object.unwrap_or_else(|| Value::keyword(":false")),
+    })
 }
 
 // ===========================================================================
@@ -720,17 +736,15 @@ struct JsonParser<'a> {
     /// Decoded bytes of the string being read (GNU `byte_workspace`). The
     /// Lisp string is made from it with one exact-size copy.
     byte_workspace: Vec<u8>,
-    /// Symbol for each distinct alist or plist key seen in this document,
-    /// by its decoded name.
-    ///
-    /// A JSON document repeats its keys: an LSP completion response carries
-    /// the same dozen (`label`, `kind`, `textEdit`, `range`, ...) once per
-    /// item, thousands of times over. Interning each occurrence would hash
-    /// and probe the obarray per key; the name's bytes, still in
-    /// [`Self::byte_workspace`], find it here without allocating. Interned
-    /// symbols are permanently rooted, so caching them is safe for the life
-    /// of the parse.
-    key_symbols: FxHashMap<Box<[u8]>, Value>,
+    /// Alist and plist key symbols, this thread's [`ObjectKeySymbols`] for
+    /// the length of the parse.
+    key_symbols: ObjectKeySymbols,
+}
+
+impl Drop for JsonParser<'_> {
+    fn drop(&mut self) {
+        std::mem::take(&mut self.key_symbols).give_back();
+    }
 }
 
 /// Maximum object/array nesting accepted while parsing, mirroring GNU
@@ -739,8 +753,128 @@ struct JsonParser<'a> {
 /// input instead of signalling a catchable error.
 const MAX_PARSE_DEPTH: usize = 10000;
 
+/// Integer literals up to this many digits are converted while they are
+/// scanned: 10^18 - 1 is below `i64::MAX`.
+const MAX_ACCUMULATED_DIGITS: usize = 18;
+
+/// A string [`JsonParser::parse_string_body`] decoded: where its bytes are,
+/// and how many characters they hold.
+#[derive(Clone, Copy, Debug)]
+struct DecodedString {
+    bytes: DecodedBytes,
+    chars: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DecodedBytes {
+    /// The string had no escape, so its decoded bytes are this stretch of
+    /// the input.
+    Input { start: usize, end: usize },
+    /// [`JsonParser::byte_workspace`] holds them.
+    Workspace,
+}
+
+/// The symbols of alist and plist keys this thread has parsed, by decoded
+/// name: one map of plain symbols (alists) and one of keywords (plists).
+///
+/// Each thread owns its own, and a parser takes it for the length of the
+/// parse (no lock, nothing shared). An entry stays right as long as the
+/// symbol registry maps the name to the same symbol, which only `unintern`
+/// or a dump restore changes, and both advance
+/// [`symbol_registry_epoch_value`]; the maps are dropped whenever that
+/// epoch has moved. Interned symbols are permanent, so an entry never
+/// outlives its value. Bounded: names longer than [`Self::MAX_NAME_BYTES`]
+/// are not kept, and a map that reaches [`Self::MAX_ENTRIES`] starts over,
+/// so a document keyed by unique names (file URIs, ids) cannot grow it
+/// without limit.
+#[derive(Debug, Default)]
+struct ObjectKeySymbols {
+    /// The registry epoch the entries were made under.
+    epoch: u64,
+    symbols: FxHashMap<Box<[u8]>, Value>,
+    keywords: FxHashMap<Box<[u8]>, Value>,
+    /// Whether this is the thread's cache, to be given back on drop.
+    taken: bool,
+}
+
+thread_local! {
+    static OBJECT_KEY_SYMBOLS: std::cell::RefCell<ObjectKeySymbols> =
+        std::cell::RefCell::default();
+}
+
+impl ObjectKeySymbols {
+    /// Longest name kept. Real object keys are short; this bounds the
+    /// memory a map can hold to about `MAX_ENTRIES * MAX_NAME_BYTES`.
+    const MAX_NAME_BYTES: usize = 64;
+    /// Most names a map keeps before it starts over.
+    const MAX_ENTRIES: usize = 4096;
+
+    /// This thread's cache, emptied first if the symbol registry has moved
+    /// since it was filled.
+    fn take() -> Self {
+        let mut cache = OBJECT_KEY_SYMBOLS
+            .try_with(|cache| std::mem::take(&mut *cache.borrow_mut()))
+            .unwrap_or_default();
+        let epoch = neovm_value::intern::symbol_registry_epoch_value();
+        if cache.epoch != epoch {
+            cache.symbols.clear();
+            cache.keywords.clear();
+            cache.epoch = epoch;
+        }
+        cache.taken = true;
+        cache
+    }
+
+    /// Return a cache [`Self::take`] lent out to its thread.
+    fn give_back(self) {
+        if self.taken {
+            // During thread teardown the slot is gone; the entries just go.
+            let _ = OBJECT_KEY_SYMBOLS.try_with(|cache| *cache.borrow_mut() = self);
+        }
+    }
+
+    /// The symbol (`keyword` false) or keyword for the key named `name`,
+    /// which is valid UTF-8.
+    fn symbol(&mut self, name: &[u8], keyword: bool) -> Value {
+        let map = if keyword {
+            &mut self.keywords
+        } else {
+            &mut self.symbols
+        };
+        if let Some(&symbol) = map.get(name) {
+            return symbol;
+        }
+        let symbol = Self::intern_key(name, keyword);
+        if name.len() <= Self::MAX_NAME_BYTES {
+            if map.len() >= Self::MAX_ENTRIES {
+                map.clear();
+            }
+            map.insert(name.into(), symbol);
+        }
+        symbol
+    }
+
+    #[inline(never)]
+    fn intern_key(name: &[u8], keyword: bool) -> Value {
+        let name = std::str::from_utf8(name).expect("the string decoder only accepts UTF-8");
+        if keyword {
+            let mut keyword = String::with_capacity(name.len() + 1);
+            keyword.push(':');
+            keyword.push_str(name);
+            Value::from_kw_id(intern(&keyword))
+        } else {
+            Value::from_sym_id(intern(name))
+        }
+    }
+}
+
 impl<'a> JsonParser<'a> {
     fn new(input: &'a [u8], input_multibyte: bool, opts: ParseOpts) -> Self {
+        // A hash-table parse makes string keys and needs no symbols.
+        let key_symbols = match opts.object_type {
+            ObjectType::Alist | ObjectType::Plist => ObjectKeySymbols::take(),
+            ObjectType::HashTable => ObjectKeySymbols::default(),
+        };
         Self {
             input,
             input_multibyte,
@@ -749,7 +883,7 @@ impl<'a> JsonParser<'a> {
             opts,
             object_workspace: Vec::new(),
             byte_workspace: Vec::new(),
-            key_symbols: FxHashMap::default(),
+            key_symbols,
         }
     }
 
@@ -916,44 +1050,102 @@ impl<'a> JsonParser<'a> {
 
     /// Parse a JSON string value; the opening `"` has already been consumed.
     fn parse_string_value(&mut self) -> Result<Value, Flow> {
-        let chars = self.parse_string_body()?;
-        Ok(Value::heap_string(self.workspace_lisp_string(chars)))
+        let decoded = self.parse_string_body()?;
+        Ok(Value::heap_string(self.decoded_lisp_string(decoded)))
     }
 
-    /// The string just decoded into [`Self::byte_workspace`], `chars`
-    /// characters long, as a Lisp string.
+    /// The bytes of a string [`Self::parse_string_body`] decoded.
+    fn decoded_bytes(&self, decoded: DecodedString) -> &[u8] {
+        match decoded.bytes {
+            DecodedBytes::Input { start, end } => &self.input[start..end],
+            DecodedBytes::Workspace => &self.byte_workspace,
+        }
+    }
+
+    /// A decoded string as a Lisp string.
     ///
     /// Always multibyte, ASCII and empty strings included: GNU builds every
     /// parsed string with `make_multibyte_string (str, nchars, nbytes)`
     /// (`json_parse_string`, src/json.c), so `multibyte-string-p` is t for
     /// all of them. One copy, sized exactly, with the character count the
     /// decoder already has, so the bytes are not walked again.
-    fn workspace_lisp_string(&self, chars: usize) -> LispString {
-        let bytes = self.byte_workspace.as_slice();
+    fn decoded_lisp_string(&self, decoded: DecodedString) -> LispString {
+        let bytes = self.decoded_bytes(decoded);
         // Room for the NUL every payload carries, so it is not reallocated.
         let mut data = Vec::with_capacity(bytes.len() + 1);
         data.extend_from_slice(bytes);
-        LispString::from_emacs_bytes_with_chars(data, chars)
+        LispString::from_emacs_bytes_with_chars(data, decoded.chars)
     }
 
     /// Decode a JSON string body (the opening `"` has already been consumed)
-    /// into [`Self::byte_workspace`] and return its length in characters.
-    /// Mirrors GNU `json_parse_string`, which reads bytes through
-    /// `json_input_get`, so a string left open at end of input signals
-    /// `json-end-of-file`.
-    fn parse_string_body(&mut self) -> Result<usize, Flow> {
-        self.byte_workspace.clear();
+    /// and say where its bytes are.  Mirrors GNU `json_parse_string`, which
+    /// reads bytes through `json_input_get`, so a string left open at end of
+    /// input signals `json-end-of-file`.
+    ///
+    /// Until its first escape a string's decoded bytes are its input bytes,
+    /// so a string without escapes -- nearly every key and value in practice
+    /// -- is only scanned and validated here, and copied once, by its
+    /// consumer. The first backslash moves the decoding to the byte
+    /// workspace.
+    fn parse_string_body(&mut self) -> Result<DecodedString, Flow> {
+        let start = self.pos;
         let mut chars = 0usize;
         loop {
-            // Copy the run of plain ASCII up to the next byte that needs
+            // Skip the run of plain ASCII up to the next byte that needs
             // deciding on -- quote, backslash, control, or a multi-byte lead.
-            // JSON strings are overwhelmingly such runs.
-            let rest = &self.input[self.pos..];
-            let run = &rest[..plain_ascii_run_len(rest)];
-            if !run.is_empty() {
-                self.byte_workspace.extend_from_slice(run);
-                chars += run.len();
-                self.pos += run.len();
+            let run = plain_ascii_run_len(&self.input[self.pos..]);
+            self.pos += run;
+            chars += run;
+            match self.peek() {
+                None => {
+                    return Err(self.signal_at_pos(JsonError::EndOfFile));
+                }
+                Some(b'"') => {
+                    let end = self.pos;
+                    self.advance();
+                    return Ok(DecodedString {
+                        bytes: DecodedBytes::Input { start, end },
+                        chars,
+                    });
+                }
+                Some(b'\\') => {
+                    self.byte_workspace.clear();
+                    self.byte_workspace
+                        .extend_from_slice(&self.input[start..self.pos]);
+                    return self.parse_escaped_string_body(chars);
+                }
+                Some(b) if b < 0x20 => {
+                    // Unescaped control characters are not valid inside a
+                    // JSON string (GNU marks 0x00-0x1F as non-plain in
+                    // `json_plain_char` and signals a parse error).  GNU has
+                    // already consumed the byte (`json_input_get`), so the
+                    // position is just after it.
+                    self.advance();
+                    return Err(self.signal_at_pos(JsonError::Parse));
+                }
+                Some(lead) => {
+                    // A byte >= 0x80: the run above stops at every byte
+                    // outside 0x20..0x7F, and the arms above take the rest.
+                    self.advance();
+                    self.consume_utf8_char(lead)?;
+                    chars += 1;
+                }
+            }
+        }
+    }
+
+    /// The rest of [`Self::parse_string_body`] from the first backslash, with
+    /// the `chars` characters before it already in the byte workspace.
+    #[inline(never)]
+    fn parse_escaped_string_body(&mut self, mut chars: usize) -> Result<DecodedString, Flow> {
+        loop {
+            let run_start = self.pos;
+            let run = plain_ascii_run_len(&self.input[run_start..]);
+            if run > 0 {
+                self.byte_workspace
+                    .extend_from_slice(&self.input[run_start..run_start + run]);
+                chars += run;
+                self.pos += run;
             }
             match self.peek() {
                 None => {
@@ -961,7 +1153,10 @@ impl<'a> JsonParser<'a> {
                 }
                 Some(b'"') => {
                     self.advance();
-                    return Ok(chars);
+                    return Ok(DecodedString {
+                        bytes: DecodedBytes::Workspace,
+                        chars,
+                    });
                 }
                 Some(b'\\') => {
                     self.advance();
@@ -997,28 +1192,25 @@ impl<'a> JsonParser<'a> {
                     chars += 1;
                 }
                 Some(b) if b < 0x20 => {
-                    // Unescaped control characters are not valid inside a
-                    // JSON string (GNU marks 0x00-0x1F as non-plain in
-                    // `json_plain_char` and signals a parse error).  GNU has
-                    // already consumed the byte (`json_input_get`), so the
-                    // position is just after it.
+                    // See the same arm in `parse_string_body`.
                     self.advance();
                     return Err(self.signal_at_pos(JsonError::Parse));
                 }
                 Some(lead) => {
-                    // A byte >= 0x80: the run above stops at every byte
-                    // outside 0x20..0x7F, and the arms above take the rest.
+                    let char_start = self.pos;
                     self.advance();
-                    self.parse_utf8_char(lead)?;
+                    self.consume_utf8_char(lead)?;
+                    self.byte_workspace
+                        .extend_from_slice(&self.input[char_start..self.pos]);
                     chars += 1;
                 }
             }
         }
     }
 
-    /// Copy one UTF-8 character whose first byte `lead` (>= 0x80) has just
-    /// been consumed, validating it strictly, as the `c & 0x80` branch of
-    /// GNU `json_parse_string` does.
+    /// Consume the rest of one UTF-8 character whose first byte `lead`
+    /// (>= 0x80) has just been consumed, validating it strictly, as the
+    /// `c & 0x80` branch of GNU `json_parse_string` does.
     ///
     /// Like GNU, this reads each further byte through the consuming reader,
     /// so input that ends inside a character signals `json-end-of-file`,
@@ -1027,8 +1219,8 @@ impl<'a> JsonParser<'a> {
     /// one is required, an overlong form, a surrogate, or a code point above
     /// U+10FFFF. The input is UTF-8 whether the Lisp string holding it is
     /// unibyte or multibyte, so a raw-byte character's internal bytes are
-    /// malformed here too.
-    fn parse_utf8_char(&mut self, lead: u8) -> Result<(), Flow> {
+    /// malformed here too. A valid character's bytes are its decoded bytes.
+    fn consume_utf8_char(&mut self, lead: u8) -> Result<(), Flow> {
         let is_continuation = |b: u8| b & 0xC0 == 0x80;
         let c1 = self.consume()?;
         if !is_continuation(c1) || lead <= 0xC1 {
@@ -1036,7 +1228,6 @@ impl<'a> JsonParser<'a> {
         }
         let (lead_bits, c1_bits) = (u32::from(lead), u32::from(c1 & 0x3F));
         if lead <= 0xDF {
-            self.byte_workspace.extend_from_slice(&[lead, c1]);
             return Ok(());
         }
         if lead <= 0xEF {
@@ -1045,7 +1236,6 @@ impl<'a> JsonParser<'a> {
             if !is_continuation(c2) || v < 0x800 || (0xD800..=0xDFFF).contains(&v) {
                 return Err(self.signal_at_pos(JsonError::Utf8Decode));
             }
-            self.byte_workspace.extend_from_slice(&[lead, c1, c2]);
             return Ok(());
         }
         if lead <= 0xF7 {
@@ -1058,7 +1248,6 @@ impl<'a> JsonParser<'a> {
             if !is_continuation(c2) || !is_continuation(c3) || !(0x10000..=0x10FFFF).contains(&v) {
                 return Err(self.signal_at_pos(JsonError::Utf8Decode));
             }
-            self.byte_workspace.extend_from_slice(&[lead, c1, c2, c3]);
             return Ok(());
         }
         Err(self.signal_at_pos(JsonError::Utf8Decode))
@@ -1145,16 +1334,22 @@ impl<'a> JsonParser<'a> {
             c
         };
 
-        // Integer part: a single 0, or 1-9 followed by more digits.
+        // Integer part: a single 0, or 1-9 followed by more digits. Its value
+        // is accumulated on the way: eighteen digits cannot overflow, and a
+        // longer literal is converted from its text below.
+        let int_start = self.pos - 1;
+        let mut magnitude = u64::from(first_digit - b'0');
         if first_digit != b'0' {
             while let Some(b) = self.peek() {
                 if b.is_ascii_digit() {
+                    magnitude = magnitude.wrapping_mul(10).wrapping_add(u64::from(b - b'0'));
                     self.advance();
                 } else {
                     break;
                 }
             }
         }
+        let int_digits = self.pos - int_start;
 
         // Fractional part.
         if self.peek() == Some(b'.') {
@@ -1191,6 +1386,11 @@ impl<'a> JsonParser<'a> {
             if self.pos == exp_start {
                 return Err(self.signal_at_pos(JsonError::Parse));
             }
+        }
+
+        if !is_float && int_digits <= MAX_ACCUMULATED_DIGITS {
+            let n = i64::try_from(magnitude).expect("eighteen decimal digits fit in i64");
+            return Ok(Value::make_int(if c == b'-' { -n } else { n }));
         }
 
         let num_str = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("0");
@@ -1264,11 +1464,10 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    /// Read an object member's key into [`Self::byte_workspace`] and return
-    /// its length in characters.  `c` is the already-consumed first char of
-    /// the key, which must be `"`.  Mirrors GNU's per-member handling in
+    /// Read an object member's key.  `c` is the already-consumed first char
+    /// of the key, which must be `"`.  Mirrors GNU's per-member handling in
     /// `json_parse_object`.
-    fn parse_object_key(&mut self, c: u8) -> Result<usize, Flow> {
+    fn parse_object_key(&mut self, c: u8) -> Result<DecodedString, Flow> {
         if c != b'"' {
             return Err(self.signal_at_pos(JsonError::Parse));
         }
@@ -1291,9 +1490,12 @@ impl<'a> JsonParser<'a> {
     /// A JSON member name becomes a Lisp STRING key, so it must be keyed the
     /// way any Lisp string is -- `HashKey::Text` is a runtime tag and a
     /// `gethash` probe would never match it.
-    fn workspace_hash_key(&self, chars: usize) -> (Value, HashKey) {
-        let key = Value::heap_string(self.workspace_lisp_string(chars));
-        (key, HashKey::string_content(&self.byte_workspace, chars))
+    fn member_hash_key(&self, name: DecodedString) -> (Value, HashKey) {
+        let key = Value::heap_string(self.decoded_lisp_string(name));
+        (
+            key,
+            HashKey::string_content(self.decoded_bytes(name), name.chars),
+        )
     }
 
     fn parse_object_hash_table(&mut self, mut c: u8) -> Result<Value, Flow> {
@@ -1316,8 +1518,8 @@ impl<'a> JsonParser<'a> {
         self.enter_nesting()?;
 
         loop {
-            let chars = self.parse_object_key(c)?;
-            let (key_val, hash_key) = self.workspace_hash_key(chars);
+            let name = self.parse_object_key(c)?;
+            let (key_val, hash_key) = self.member_hash_key(name);
             let val = self.parse_object_member_value()?;
             // SAFETY: the entry dispatch selected inactive Tier-H, and
             // the entire parser extent above has no callback or GC safe
@@ -1356,8 +1558,8 @@ impl<'a> JsonParser<'a> {
         self.enter_nesting()?;
 
         loop {
-            let chars = self.parse_object_key(c)?;
-            let (key_val, hash_key) = self.workspace_hash_key(chars);
+            let name = self.parse_object_key(c)?;
+            let (key_val, hash_key) = self.member_hash_key(name);
             let val = self.parse_object_member_value()?;
             insert_json_hash_member_concurrent(ht, hash_key, key_val, val);
 
@@ -1375,37 +1577,24 @@ impl<'a> JsonParser<'a> {
         Ok(ht)
     }
 
-    /// The symbol for the alist or plist key just read into
-    /// [`Self::byte_workspace`], interned at most once per document. See
-    /// [`JsonParser::key_symbols`].
-    fn object_key_symbol(&mut self) -> Value {
-        match self.key_symbols.get(self.byte_workspace.as_slice()) {
-            Some(&symbol) => symbol,
-            None => self.intern_object_key(),
-        }
-    }
-
-    /// Intern a key [`Self::object_key_symbol`] has not met yet: the name
-    /// itself for an alist, the keyword `:NAME` for a plist (GNU
-    /// `json_parse_string` with `leading_colon`).
-    #[inline(never)]
-    fn intern_object_key(&mut self) -> Value {
-        let name = std::str::from_utf8(&self.byte_workspace)
-            .expect("the string decoder only ever writes UTF-8");
-        let symbol = match self.opts.object_type {
-            ObjectType::Plist => {
-                let mut keyword = String::with_capacity(name.len() + 1);
-                keyword.push(':');
-                keyword.push_str(name);
-                Value::from_kw_id(intern(&keyword))
-            }
-            ObjectType::Alist | ObjectType::HashTable => Value::from_sym_id(intern(name)),
+    /// The symbol for the alist or plist key `name`: the name itself for an
+    /// alist, the keyword `:NAME` for a plist (GNU `json_parse_string` with
+    /// `leading_colon`).
+    ///
+    /// A JSON document repeats its keys -- an LSP completion response carries
+    /// the same dozen (`label`, `kind`, `textEdit`, `range`, ...) once per
+    /// item -- and a JSON-RPC client parses thousands of messages made of
+    /// the same few dozen. [`ObjectKeySymbols`] finds a key it has met
+    /// before by its bytes, without building its name or probing the
+    /// obarray; a new key is interned.
+    fn object_key_symbol(&mut self, name: DecodedString) -> Value {
+        let bytes = match name.bytes {
+            DecodedBytes::Input { start, end } => &self.input[start..end],
+            DecodedBytes::Workspace => self.byte_workspace.as_slice(),
         };
-        self.key_symbols
-            .insert(self.byte_workspace.as_slice().into(), symbol);
-        symbol
+        let keyword = matches!(self.opts.object_type, ObjectType::Plist);
+        self.key_symbols.symbol(bytes, keyword)
     }
-
     /// Parse an object as an alist `((KEY . VALUE) ...)` or a plist
     /// `(:KEY VALUE ...)`, mirroring GNU `json_parse_object`.  The list
     /// elements collect in the object workspace and the list is consed once
@@ -1418,8 +1607,8 @@ impl<'a> JsonParser<'a> {
         self.enter_nesting()?;
 
         loop {
-            self.parse_object_key(c)?;
-            let key = self.object_key_symbol();
+            let name = self.parse_object_key(c)?;
+            let key = self.object_key_symbol(name);
             match self.opts.object_type {
                 ObjectType::Plist => {
                     // The key is pushed before the value is parsed: nested

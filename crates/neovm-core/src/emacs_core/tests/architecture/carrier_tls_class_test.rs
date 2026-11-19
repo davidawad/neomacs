@@ -647,6 +647,14 @@ const TLS_CLASSIFICATION: &[(&str, &str, TlsClass)] = &[
         "LOAD_PATH_LISTINGS",
         TlsClass::CarrierIntrinsic,
     ),
+    // CarrierIntrinsic: no Lisp heap Value; JSON object-key name bytes to
+    // SymId, validated against symbol_registry_epoch_value like
+    // INTERN_STR_CACHE above. A parse takes it and gives it back.
+    (
+        "neovm-text/src/emacs_core/text/json/mod.rs",
+        "OBJECT_KEY_SYMBOLS",
+        TlsClass::CarrierIntrinsic,
+    ),
     (
         "neovm-value/src/error/mod.rs",
         "IN_FLIGHT_ROOTS",

@@ -1462,3 +1462,78 @@ fn parse_utf8_errors_report_gnu_condition_and_position() {
         }
     }
 }
+
+/// Integer literals are converted while they are scanned up to eighteen
+/// digits, and from their text beyond: both give the integer the literal
+/// denotes, a fixnum while it fits and a bignum past `most-positive-fixnum`.
+#[test]
+fn parse_integers_on_both_sides_of_the_accumulated_digits() {
+    crate::test_utils::init_test_tracing();
+    for literal in [
+        "0",
+        "-0",
+        "7",
+        "-1",
+        "123456789012345678",
+        "-999999999999999999",
+        "1234567890123456789",
+        "-1234567890123456789",
+        "2305843009213693951",
+        "-2305843009213693952",
+        "2305843009213693952",
+        "-2305843009213693953",
+        "123456789012345678901234567890",
+    ] {
+        let parsed = parse_json(&format!("[{literal}]"), &[(":array-type", "list")]);
+        let parsed = list_to_vec(&parsed).expect("an array parses to a list")[0];
+        let expected = Value::make_integer_from_str_or_zero(literal);
+        assert!(equal_value(&parsed, &expected, 0), "{literal}: {parsed:?}");
+        assert_eq!(parsed.is_fixnum(), expected.is_fixnum(), "{literal}");
+    }
+}
+
+/// Key symbols outlive a parse: the next document's keys are the same
+/// symbols, and a key past the cache's bounds -- a long name, or one of more
+/// distinct names than it keeps -- is still the interned symbol.
+#[test]
+fn parse_object_keys_stay_interned_across_parses_and_bounds() {
+    crate::test_utils::init_test_tracing();
+    let first_key = |json: &str, object_type: &'static str| {
+        let parsed = parse_json(json, &[(":object-type", object_type)]);
+        let items = list_to_vec(&parsed).expect("an object parses to a list");
+        match object_type {
+            "plist" => items[0],
+            _ => items[0].cons_car(),
+        }
+    };
+    let long = "k".repeat(ObjectKeySymbols::MAX_NAME_BYTES + 1);
+    for (object_type, prefix) in [("plist", ":"), ("alist", "")] {
+        let symbol = |name: &str| {
+            let id = intern(&format!("{prefix}{name}"));
+            if prefix.is_empty() {
+                Value::from_sym_id(id)
+            } else {
+                Value::from_kw_id(id)
+            }
+        };
+        assert_eq!(first_key(r#"{"label":1}"#, object_type), symbol("label"));
+        assert_eq!(first_key(r#"{"label":2}"#, object_type), symbol("label"));
+        let long_json = format!(r#"{{"{long}":1}}"#);
+        assert_eq!(first_key(&long_json, object_type), symbol(&long));
+        assert_eq!(first_key(&long_json, object_type), symbol(&long));
+        let many: Vec<String> = (0..ObjectKeySymbols::MAX_ENTRIES + 10)
+            .map(|i| format!(r#""many{i}":{i}"#))
+            .collect();
+        let many_json = format!("{{{}}}", many.join(","));
+        let parsed = parse_json(&many_json, &[(":object-type", object_type)]);
+        assert_eq!(
+            list_length(&parsed),
+            Some(match object_type {
+                "plist" => 2 * many.len(),
+                _ => many.len(),
+            })
+        );
+        assert_eq!(first_key(r#"{"many0":0}"#, object_type), symbol("many0"));
+        assert_eq!(first_key(r#"{"label":3}"#, object_type), symbol("label"));
+    }
+}
