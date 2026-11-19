@@ -895,20 +895,21 @@ fn completion_candidates_from_list_value(collection: &Value) -> Vec<CompletionCa
         Some(items) => items,
         None => return Vec::new(),
     };
-    items
-        .into_iter()
-        .filter_map(|item| {
-            let key = match item.kind() {
-                ValueKind::Cons => item.cons_car(),
-                _other => item,
-            };
-            completion_text_from_value(&key).map(|completion| CompletionCandidate {
-                completion,
-                predicate_arg: item,
-                predicate_extra_arg: None,
-            })
+    // Sized up front: grown from empty, a 45k-symbol list reallocated (and
+    // copied) its candidate vector a dozen times on every keystroke.
+    let mut candidates = Vec::with_capacity(items.len());
+    candidates.extend(items.into_iter().filter_map(|item| {
+        let key = match item.kind() {
+            ValueKind::Cons => item.cons_car(),
+            _other => item,
+        };
+        completion_text_from_value(&key).map(|completion| CompletionCandidate {
+            completion,
+            predicate_arg: item,
+            predicate_extra_arg: None,
         })
-        .collect()
+    }));
+    candidates
 }
 
 /// The prefix state shared by GNU's three scanning completion primitives.
@@ -1002,7 +1003,9 @@ fn completion_prefix_matches_with_parity(
     ignore_case: bool,
     parity: bool,
 ) -> Result<bool, Flow> {
-    if !ignore_case || !parity {
+    // GNU's `Fcompare_strings` over zero characters is `t` under any case
+    // table, so the empty input needs no case-table comparison at all.
+    if !ignore_case || !parity || *prefix == CompletionPrefix::Empty {
         return Ok(prefix.matches(completion, ignore_case));
     }
     if string.schars() > completion.lisp_string().schars() {
@@ -1258,6 +1261,7 @@ pub(crate) fn builtin_try_completion_with_candidates(
     let Some(candidates) = candidates else {
         return eval.apply(collection, vec![args[0], predicate_value, Value::NIL]);
     };
+    let mut regexps = CompletionRegexps::new(syntax, regexps, ignore_case);
 
     // Faithful port of GNU `Ftry_completion` (src/minibuf.c).  We iterate over
     // the candidates maintaining a running `bestmatch` whose leading
@@ -1285,16 +1289,7 @@ pub(crate) fn builtin_try_completion_with_candidates(
         )? {
             continue;
         }
-        if !regexps.is_empty()
-            && !matches_completion_regexps(
-                syntax,
-                eval.variables(),
-                &eval.edit.buffers,
-                &candidate.completion,
-                regexps,
-                ignore_case,
-            )?
-        {
+        if !regexps.matches(eval.variables(), &eval.edit.buffers, &candidate.completion)? {
             continue;
         }
         if !predicate.matches(eval, candidate)? {
@@ -1420,6 +1415,15 @@ pub(crate) fn builtin_all_completions_with_candidates(
     let Some(candidates) = candidates else {
         return eval.apply(collection, vec![args[0], predicate_value, Value::T]);
     };
+    let mut regexps = CompletionRegexps::new(syntax, regexps, ignore_case);
+    let narrowing_key = predicate_value
+        .is_nil()
+        .then(|| CompletionNarrowingKey::new(&string, &regexps, ignore_case))
+        .flatten();
+    let (snapshot, reusable) = match &narrowing_key {
+        Some(key) => CompletionNarrowing::take_for(key, &candidates),
+        None => (None, None),
+    };
 
     // Two-pass approach: first filter candidates using the predicate
     // (which may trigger GC via apply), then create string Values.
@@ -1428,7 +1432,13 @@ pub(crate) fn builtin_all_completions_with_candidates(
     let prefix = CompletionPrefix::from_lisp_string(&string);
     let case_table_parity = ignore_case && crate::emacs_core::fns::compare_strings_parity_enabled();
     let mut matching_completions: Vec<CompletionText> = Vec::new();
-    for candidate in &candidates {
+    let mut survivors = Vec::new();
+    let tested = match reusable {
+        Some(previous) => CandidateScan::Survivors(previous.into_iter()),
+        None => CandidateScan::All(0..candidates.len()),
+    };
+    for index in tested {
+        let candidate = &candidates[index];
         if !completion_prefix_matches_with_parity(
             eval,
             &string,
@@ -1439,21 +1449,16 @@ pub(crate) fn builtin_all_completions_with_candidates(
         )? {
             continue;
         }
-        if !regexps.is_empty()
-            && !matches_completion_regexps(
-                syntax,
-                eval.variables(),
-                &eval.edit.buffers,
-                &candidate.completion,
-                regexps,
-                ignore_case,
-            )?
-        {
+        if !regexps.matches(eval.variables(), &eval.edit.buffers, &candidate.completion)? {
             continue;
         }
+        survivors.push(index);
         if predicate.matches(eval, candidate)? {
             matching_completions.push(candidate.completion.clone());
         }
+    }
+    if let Some(key) = narrowing_key {
+        CompletionNarrowing::store(key, snapshot, &candidates, survivors);
     }
     // Now create Values — no GC can trigger between creation and list building
     let matches: Vec<Value> = matching_completions
@@ -1483,6 +1488,7 @@ pub(crate) fn builtin_test_completion_with_candidates(
             vec![args[0], predicate, Value::symbol("lambda")],
         );
     };
+    let mut regexps = CompletionRegexps::new(syntax, regexps, ignore_case);
 
     let prefix = CompletionPrefix::from_lisp_string(&string);
     let case_table_parity = ignore_case && crate::emacs_core::fns::compare_strings_parity_enabled();
@@ -1497,16 +1503,7 @@ pub(crate) fn builtin_test_completion_with_candidates(
         )? {
             continue;
         }
-        if !regexps.is_empty()
-            && !matches_completion_regexps(
-                syntax,
-                eval.variables(),
-                &eval.edit.buffers,
-                &candidate.completion,
-                regexps,
-                ignore_case,
-            )?
-        {
+        if !regexps.matches(eval.variables(), &eval.edit.buffers, &candidate.completion)? {
             continue;
         }
         if ordinary_completion_predicate_matches_with(
@@ -1722,28 +1719,263 @@ pub fn completion_regexp_lisp_list(
         .collect()
 }
 
-/// Return `true` when `candidate` matches **all** regexps in `regexps`.
+/// `completion-regexp-list` prepared for one completion call.
 ///
-/// GNU `match_regexps` / `Ftry_completion` (`src/minibuf.c:1592`,
-/// `src/minibuf.c` candidate loop) run `fast_string_match_internal`, so the
-/// match carries the current buffer's syntax state via `syntax`.
-fn matches_completion_regexps(
+/// GNU `match_regexps` (`src/minibuf.c:1584`) runs `fast_string_match_internal`
+/// for each regexp, in list order, on each candidate that passed the prefix
+/// test, so the match carries the current buffer's syntax state via `syntax`.
+/// Each regexp here is compiled on the first candidate that reaches it (an
+/// invalid one signals there, as GNU's does) and the compile is kept for the
+/// rest of the call.
+pub(crate) struct CompletionRegexps<'r> {
     syntax: crate::emacs_core::builtins::search::FastStringMatchSyntax,
-    vars: VariableView<'_>,
-    buffers: &neovm_edit::buffer::BufferManager,
-    candidate: &CompletionText,
-    regexps: &[neovm_value::heap_types::LispString],
+    patterns: Vec<neovm_text::emacs_core::regex::RepeatedStringMatch<'r>>,
+}
+
+impl<'r> CompletionRegexps<'r> {
+    pub(crate) fn new(
+        syntax: crate::emacs_core::builtins::search::FastStringMatchSyntax,
+        regexps: &'r [neovm_value::heap_types::LispString],
+        ignore_case: bool,
+    ) -> Self {
+        Self {
+            syntax,
+            patterns: regexps
+                .iter()
+                .map(|regexp| {
+                    neovm_text::emacs_core::regex::RepeatedStringMatch::new(regexp, ignore_case)
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether `candidate` matches **all** the regexps.
+    fn matches(
+        &mut self,
+        vars: VariableView<'_>,
+        buffers: &neovm_edit::buffer::BufferManager,
+        candidate: &CompletionText,
+    ) -> Result<bool, Flow> {
+        let heap_identity = match candidate {
+            CompletionText::LispObject(value) => Some(*value),
+            CompletionText::Atom { .. } => None,
+        };
+        self.matches_string(vars, buffers, candidate.lisp_string(), heap_identity)
+    }
+
+    fn matches_string(
+        &mut self,
+        vars: VariableView<'_>,
+        buffers: &neovm_edit::buffer::BufferManager,
+        candidate: &neovm_value::heap_types::LispString,
+        heap_identity: Option<Value>,
+    ) -> Result<bool, Flow> {
+        #[cfg(test)]
+        COMPLETION_REGEXP_TESTS.with(|tests| tests.set(tests.get() + 1));
+        for pattern in &mut self.patterns {
+            match self
+                .syntax
+                .search_repeated(vars, buffers, pattern, candidate, heap_identity)
+            {
+                Ok(Some(_)) => {} // matched — continue checking remaining regexps
+                Ok(None) => return Ok(false),
+                Err(crate::emacs_core::builtins::search::FastStringMatchError::Regexp(message)) => {
+                    return Err(signal(
+                        LispCondition::InvalidRegexp,
+                        vec![Value::string(message)],
+                    ));
+                }
+                Err(error) => return Err(error.into_signal()),
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// What decides which candidates of an `all-completions` call reach its
+/// predicate: the input prefix, `completion-ignore-case`, and the regexps of
+/// `completion-regexp-list`, when every one of them is a literal run
+/// (`regexp-quote` output, what `orderless-literal` emits).
+///
+/// Such a call accepts a subset of what an earlier call over the same
+/// candidates accepted whenever its prefix extends the earlier prefix and
+/// each earlier literal is a substring of one of its literals
+/// ([`Self::narrows`]): typing one more character into the minibuffer. GNU's
+/// `Fall_completions` tests every candidate again; the answer is the same
+/// when only the earlier survivors are tested, because matching a literal
+/// has no side effect (`fast_string_match_internal` sets no match data) and
+/// depends on nothing but the candidate's characters and the case fold.
+struct CompletionNarrowingKey {
+    prefix: Vec<u8>,
+    prefix_multibyte: bool,
     ignore_case: bool,
-) -> Result<bool, Flow> {
-    completion_string_matches_regexps(
-        syntax,
-        vars,
-        buffers,
-        candidate.lisp_string(),
-        candidate.searched_string(),
-        regexps,
-        ignore_case,
-    )
+    literals: Vec<neovm_text::emacs_core::regex::LiteralRegexpText>,
+}
+
+impl CompletionNarrowingKey {
+    fn new(
+        string: &LispString,
+        regexps: &CompletionRegexps<'_>,
+        ignore_case: bool,
+    ) -> Option<Self> {
+        // A case-ignoring prefix test reads the current buffer's case table
+        // (`compare_strings_parity_enabled`), which can change between two
+        // calls; an empty prefix accepts every candidate under any table.
+        if ignore_case && string.byte_len() != 0 {
+            return None;
+        }
+        let literals = regexps
+            .patterns
+            .iter()
+            .map(neovm_text::emacs_core::regex::RepeatedStringMatch::literal_text)
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            prefix: string.as_bytes().to_vec(),
+            prefix_multibyte: string.is_multibyte(),
+            ignore_case,
+            literals,
+        })
+    }
+
+    /// Whether every candidate SELF accepts is one EARLIER accepted.
+    fn narrows(&self, earlier: &Self) -> bool {
+        self.ignore_case == earlier.ignore_case
+            && self.prefix.starts_with(&earlier.prefix)
+            && (earlier.prefix.is_ascii() || self.prefix_multibyte == earlier.prefix_multibyte)
+            && earlier
+                .literals
+                .iter()
+                .all(|literal| self.literals.iter().any(|longer| longer.contains(literal)))
+    }
+}
+
+/// The texts of a candidate list, in order: what an earlier call's
+/// survivors were computed from. Equal texts give equal answers, whatever
+/// objects carry them, so no identity is kept (and no Lisp value either).
+struct CandidateTexts {
+    bytes: Vec<u8>,
+    spans: Vec<CandidateTextSpan>,
+}
+
+#[derive(PartialEq, Eq)]
+struct CandidateTextSpan {
+    end: usize,
+    schars: usize,
+    multibyte: bool,
+}
+
+impl CandidateTexts {
+    fn span(text: &LispString, end: usize) -> CandidateTextSpan {
+        CandidateTextSpan {
+            end,
+            schars: text.schars(),
+            multibyte: text.is_multibyte(),
+        }
+    }
+
+    fn of(candidates: &[CompletionCandidate]) -> Self {
+        let mut bytes = Vec::new();
+        let spans = candidates
+            .iter()
+            .map(|candidate| {
+                let text = candidate.completion.lisp_string();
+                bytes.extend_from_slice(text.as_bytes());
+                Self::span(text, bytes.len())
+            })
+            .collect();
+        Self { bytes, spans }
+    }
+
+    fn describes(&self, candidates: &[CompletionCandidate]) -> bool {
+        if self.spans.len() != candidates.len() {
+            return false;
+        }
+        let mut start = 0;
+        self.spans.iter().zip(candidates).all(|(span, candidate)| {
+            let text = candidate.completion.lisp_string();
+            let end = start + text.byte_len();
+            let same = *span == Self::span(text, end)
+                && self.bytes.get(start..end) == Some(text.as_bytes());
+            start = end;
+            same
+        })
+    }
+}
+
+/// The last `all-completions` call with a [`CompletionNarrowingKey`]: its
+/// key, its candidates' texts and the indices of the candidates that passed
+/// the prefix and the regexps.
+struct CompletionNarrowing {
+    key: CompletionNarrowingKey,
+    texts: CandidateTexts,
+    survivors: Vec<usize>,
+}
+
+thread_local! {
+    // One per evaluator thread: each mutator owns its own, and a value
+    // left by another evaluator on the thread is harmless, since it is
+    // only used for candidates whose texts it describes.
+    static LAST_NARROWING: std::cell::RefCell<Option<CompletionNarrowing>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl CompletionNarrowing {
+    /// Take the last call's record for a call keyed KEY over CANDIDATES:
+    /// its candidate texts when they are CANDIDATES' (to keep), and its
+    /// survivors when KEY also narrows its key (the only ones to test).
+    fn take_for(
+        key: &CompletionNarrowingKey,
+        candidates: &[CompletionCandidate],
+    ) -> (Option<CandidateTexts>, Option<Vec<usize>>) {
+        let Some(last) = LAST_NARROWING.with(|slot| slot.borrow_mut().take()) else {
+            return (None, None);
+        };
+        if !last.texts.describes(candidates) {
+            return (None, None);
+        }
+        let survivors = key.narrows(&last.key).then_some(last.survivors);
+        (Some(last.texts), survivors)
+    }
+
+    fn store(
+        key: CompletionNarrowingKey,
+        texts: Option<CandidateTexts>,
+        candidates: &[CompletionCandidate],
+        survivors: Vec<usize>,
+    ) {
+        let texts = texts.unwrap_or_else(|| CandidateTexts::of(candidates));
+        LAST_NARROWING.with(|slot| {
+            *slot.borrow_mut() = Some(Self {
+                key,
+                texts,
+                survivors,
+            });
+        });
+    }
+}
+
+/// The candidate indices an `all-completions` call tests, in order.
+enum CandidateScan {
+    All(std::ops::Range<usize>),
+    Survivors(std::vec::IntoIter<usize>),
+}
+
+impl Iterator for CandidateScan {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::All(indices) => indices.next(),
+            Self::Survivors(indices) => indices.next(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Candidates tested against `completion-regexp-list`, for the tests
+    /// that pin which candidates a call tests.
+    static COMPLETION_REGEXP_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn lisp_string_matches_completion_regexps(
@@ -1754,49 +1986,8 @@ pub fn lisp_string_matches_completion_regexps(
     regexps: &[neovm_value::heap_types::LispString],
     ignore_case: bool,
 ) -> Result<bool, Flow> {
-    completion_string_matches_regexps(
-        syntax,
-        vars,
-        buffers,
-        candidate,
-        neovm_text::emacs_core::regex::SearchedString::Owned(candidate.clone()),
-        regexps,
-        ignore_case,
-    )
-}
-
-#[allow(clippy::too_many_arguments)] // match-time state stays explicit at the GNU-regexp boundary
-fn completion_string_matches_regexps(
-    syntax: crate::emacs_core::builtins::search::FastStringMatchSyntax,
-    vars: VariableView<'_>,
-    buffers: &neovm_edit::buffer::BufferManager,
-    candidate: &neovm_value::heap_types::LispString,
-    searched_string: neovm_text::emacs_core::regex::SearchedString,
-    regexps: &[neovm_value::heap_types::LispString],
-    ignore_case: bool,
-) -> Result<bool, Flow> {
-    for re in regexps {
-        match syntax.search(
-            vars,
-            buffers,
-            re,
-            candidate,
-            searched_string.clone(),
-            0,
-            ignore_case,
-        ) {
-            Ok(Some(_)) => {} // matched — continue checking remaining regexps
-            Ok(None) => return Ok(false),
-            Err(crate::emacs_core::builtins::search::FastStringMatchError::Regexp(message)) => {
-                return Err(signal(
-                    LispCondition::InvalidRegexp,
-                    vec![Value::string(message)],
-                ));
-            }
-            Err(error) => return Err(error.into_signal()),
-        }
-    }
-    Ok(true)
+    CompletionRegexps::new(syntax, regexps, ignore_case)
+        .matches_string(vars, buffers, candidate, None)
 }
 
 /// Thread every heap Value a completion-candidate set holds (original string
@@ -1857,8 +2048,13 @@ pub fn builtin_all_completions(
     let syntax =
         crate::emacs_core::builtins::search::FastStringMatchSyntax::for_current_buffer(eval);
     // Root the candidate set across the predicate calls (see the holder doc).
+    // Without a predicate no Lisp runs before the result list is built, and
+    // every candidate stays reachable from the (rooted) collection, so the
+    // holder -- one cons per candidate, per keystroke -- is not built.
     let root_scope = eval.save_specpdl_roots();
-    if let Some(candidates) = &candidates {
+    if let Some(candidates) = &candidates
+        && args.get(2).is_some_and(|predicate| !predicate.is_nil())
+    {
         eval.push_specpdl_root(completion_candidates_root_holder(candidates));
     }
     let result = builtin_all_completions_with_candidates(

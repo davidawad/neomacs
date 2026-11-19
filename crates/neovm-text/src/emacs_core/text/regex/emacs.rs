@@ -599,6 +599,16 @@ pub struct CompiledPattern {
 const PREFILTER_MIN_BUILD_SPAN: usize = 256;
 
 impl CompiledPattern {
+    /// The bytes of the literal run when the whole pattern is one (see
+    /// [`whole_literal`]), as the bytecode stores them: translated when the
+    /// pattern is case-folded, in the pattern's representation
+    /// ([`CompiledPattern::multibyte`]).
+    pub(crate) fn whole_literal_bytes(&self) -> Option<&[u8]> {
+        self.whole_literal
+            .as_ref()
+            .map(whole_literal::WholeLiteral::bytes)
+    }
+
     /// Inspect compiler output without allowing a caller to invalidate its seal.
     #[cfg(any(test, feature = "test-support"))]
     #[cfg_attr(feature = "test-support", visibility::make(pub))]

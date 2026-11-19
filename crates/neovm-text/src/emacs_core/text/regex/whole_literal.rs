@@ -64,6 +64,10 @@ impl WholeLiteral {
         })
     }
 
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// `re_search (PATTERN, TEXT, START, RANGE)` for this literal. The outer
     /// `None` hands the search back to the general matcher: backward
     /// searches, a pending quit (the matcher polls it), and folded or

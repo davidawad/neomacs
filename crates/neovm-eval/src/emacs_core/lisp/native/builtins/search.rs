@@ -320,6 +320,25 @@ impl FastStringMatchSyntax {
         })
     }
 
+    /// [`Self::search_start`] for one pattern tried against many strings
+    /// (`completion-regexp-list` over a completion table): REPEATED keeps the
+    /// compiled pattern across the calls instead of probing the compile cache
+    /// for every string. HEAP_IDENTITY is STRING's Lisp object, when it has
+    /// one, for its `syntax-table` properties.
+    #[doc(hidden)]
+    pub fn search_repeated(
+        &self,
+        vars: VariableView<'_>,
+        buffers: &neovm_edit::buffer::BufferManager,
+        repeated: &mut super::regex::RepeatedStringMatch<'_>,
+        string: &neovm_value::heap_types::LispString,
+        heap_identity: Option<Value>,
+    ) -> Result<Option<neovm_edit::buffer::EmacsBytePos>, FastStringMatchError> {
+        self.search_with(vars, buffers, string, heap_identity, |syntax| {
+            repeated.search_start(string, syntax)
+        })
+    }
+
     /// The syntax-source setup shared by every string engine entry: resolve
     /// the current buffer's syntax/category tables and the searched string's
     /// syntax properties once, then run `search` against that lookup.

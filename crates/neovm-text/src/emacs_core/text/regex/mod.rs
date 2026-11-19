@@ -1134,6 +1134,128 @@ pub fn compile_string_search_pattern(
     )
 }
 
+/// The text of a regexp that is one literal run, in the pattern's own
+/// representation ([`RepeatedStringMatch::literal_text`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct LiteralRegexpText {
+    bytes: Vec<u8>,
+    multibyte: bool,
+}
+
+impl LiteralRegexpText {
+    /// Whether every string that contains SELF's characters in a row (as the
+    /// matcher compares them) also contains OTHER's: OTHER's characters are
+    /// a contiguous run of SELF's. Bytes compare as characters when both
+    /// texts share one representation or OTHER is ASCII, and a run found in
+    /// an encoded text starts on a character, never inside one.
+    #[doc(hidden)]
+    pub fn contains(&self, other: &Self) -> bool {
+        (self.multibyte == other.multibyte || other.bytes.is_ascii())
+            && memchr::memmem::find(&self.bytes, &other.bytes).is_some()
+    }
+}
+
+/// One Lisp regexp matched against many strings, as GNU
+/// `fast_string_match_internal` does for each `completion-regexp-list` entry
+/// and candidate: no match data, never POSIX, the standard case translation.
+///
+/// GNU's `compile_pattern` finds the compiled pattern in its cache on every
+/// candidate; this keeps the compiled pattern for each target representation
+/// instead, so a candidate costs no cache probe. A pattern whose fastmap bakes
+/// syntax-table content (`used_syntax`) is looked up per candidate as before,
+/// because a candidate's own `syntax-table` properties can change the lookup
+/// it is compiled against. The owner is one caller's loop; nothing is shared.
+#[doc(hidden)]
+pub struct RepeatedStringMatch<'p> {
+    pattern: &'p LispString,
+    case_fold: bool,
+    /// The reusable compile, by `target_multibyte`, with the symbol mode it
+    /// was keyed by.
+    compiled: [Option<(Rc<CompiledPattern>, SymbolMode)>; 2],
+}
+
+impl<'p> RepeatedStringMatch<'p> {
+    #[doc(hidden)]
+    pub fn new(pattern: &'p LispString, case_fold: bool) -> Self {
+        Self {
+            pattern,
+            case_fold,
+            compiled: [None, None],
+        }
+    }
+
+    /// The literal this regexp matches, when it is nothing but one literal
+    /// run (`regexp-quote` output): its characters as the matcher compares
+    /// them (case-translated under CASE_FOLD), `None` for any other or an
+    /// invalid regexp. Matching it can then be reasoned about as substring
+    /// containment: a string matching a literal matches every literal whose
+    /// text is a substring of it.
+    #[doc(hidden)]
+    pub fn literal_text(&self) -> Option<LiteralRegexpText> {
+        let compiled = compile_lisp_pattern_with_posix_translation(
+            self.pattern,
+            self.case_fold,
+            false,
+            true,
+            None,
+            &DefaultSyntaxLookup,
+        )
+        .ok()?;
+        Some(LiteralRegexpText {
+            bytes: compiled.whole_literal_bytes()?.to_vec(),
+            multibyte: compiled.multibyte,
+        })
+    }
+
+    /// The byte start of the first match in STRING, compiling the pattern on
+    /// first use exactly as [`string_search_start_with_case_fold_source_lisp_pattern_posix_syntax`]
+    /// would, so an invalid regexp signals at the same candidate it did.
+    #[doc(hidden)]
+    pub fn search_start(
+        &mut self,
+        string: &LispString,
+        syntax: &dyn SyntaxLookup,
+    ) -> Result<Option<EmacsBytePos>, String> {
+        let multibyte = string.is_multibyte();
+        let mode = syntax.symbol_mode();
+        let slot = &mut self.compiled[usize::from(multibyte)];
+        let compiled = match slot {
+            Some((compiled, compiled_mode)) if *compiled_mode == mode => compiled.clone(),
+            _ => {
+                let compiled = compile_lisp_pattern_with_posix_translation(
+                    self.pattern,
+                    self.case_fold,
+                    false,
+                    multibyte,
+                    None,
+                    syntax,
+                )?;
+                if !compiled.used_syntax {
+                    *slot = Some((compiled.clone(), mode));
+                }
+                compiled
+            }
+        };
+        let text = string.as_bytes();
+        if let Some((_pos, regs)) = regex_emacs::re_search(
+            &compiled,
+            text,
+            0,
+            text.len() as isize,
+            syntax,
+            STRING_MATCH_AT_DOT_UNREACHABLE,
+        ) {
+            // Group 0 of a successful search is always set.
+            Ok(Some(EmacsBytePos::new(regs.start[0] as usize)))
+        } else if regex_emacs::take_matcher_overflow() {
+            Err(regex_emacs::MATCHER_OVERFLOW_MESSAGE.to_string())
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 /// `string-match`'s search for a pattern the caller compiled
 /// ([`compile_string_search_pattern`]): the matcher run of
 /// `string_search_full_with_case_fold_source_lisp_pattern_posix_syntax`,
