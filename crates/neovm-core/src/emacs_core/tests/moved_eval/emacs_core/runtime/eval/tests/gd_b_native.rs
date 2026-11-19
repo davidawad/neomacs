@@ -18,6 +18,8 @@ impl RawCallTestPolicy {
     pub fn enter() -> Self {
         neovm_eval::test_support::authority::force_inline_for_test(Some(false));
         neovm_eval::test_support::authority::force_profit_defer_for_test(Some(1));
+        // The warmed leaf must be native before the test signals: compile in line.
+        neovm_eval::test_support::authority::force_inline_insts_for_test(Some(u64::MAX));
         Self {
             _thread: std::marker::PhantomData,
         }
@@ -29,6 +31,7 @@ impl Drop for RawCallTestPolicy {
     fn drop(&mut self) {
         neovm_eval::test_support::authority::force_inline_for_test(None);
         neovm_eval::test_support::authority::force_profit_defer_for_test(None);
+        neovm_eval::test_support::authority::force_inline_insts_for_test(None);
     }
 }
 

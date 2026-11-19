@@ -29,8 +29,8 @@ fn jit_bg_worker_installs_under_a_collection_per_allocation() {
     force_mode_for_test(Some(BgMode::Threaded));
     force_stress_for_test(Some(true));
     force_deopt_for_test(false);
-    // These tiny bodies normally compile in line. Keep them unchanged while
-    // exercising worker installs, and restore the enclosing knob on unwind.
+    // Pin the worker route (the production default) so an enclosing knob
+    // cannot move these tiny bodies in line; restored on unwind.
     let _worker_route = neovm_value::tls_scope::TlsScope::new(&INLINE_INSTS_TEST, Some(0));
     let mut ev = Context::new(crate::test_utils::unit_runtime());
     let ctx = &mut ev as *mut Context;
@@ -66,17 +66,17 @@ fn jit_bg_worker_installs_under_a_collection_per_allocation() {
             if round == 0 {
                 let (insts, _) = crate::emacs_core::jit::compile::clif_size_now();
                 let insts = u64::from(insts);
-                assert!(
-                    insts > 0 && insts <= INLINE_INSTS,
-                    "{symbol}: tiny body stays within the production inline limit: {insts}"
-                );
+                assert!(insts > 0, "{symbol}: a backend to defer");
                 assert!(!backend_in_line(JobClass::Entry, insts));
                 {
                     let _default_route = neovm_value::tls_scope::TlsScope::new(
                         &INLINE_INSTS_TEST,
                         Some(INLINE_INSTS),
                     );
-                    assert!(backend_in_line(JobClass::Entry, insts));
+                    assert!(
+                        !backend_in_line(JobClass::Entry, insts),
+                        "{symbol}: the production limit defers even a {insts}-instruction backend"
+                    );
                 }
             }
             let value = match bits {

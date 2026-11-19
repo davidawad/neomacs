@@ -13,7 +13,7 @@
 //! |---|---|---|
 //! | `legacy` | `Legacy` | the persistent per-thread module defines each leaf in place (the B4 path) |
 //! | `sync` | `Sync` | the split, run in line: the eval thread's backend compiles each packaged function at once. Deterministic |
-//! | `on` | `Threaded` | entry tier-ups, first-sight and OSR compiles of a function larger than `NEOVM_JIT_BG_INLINE_INSTS` CLIF instructions hand their package to a worker thread (`bg::worker`); the function stays interpreted until its leaf is installed. Smaller ones run their backend in line, as under `sync`. Under `NEOVM_JIT_TIER2=on`, upgrades use a worker too, and the old native leaf keeps serving calls until install. Other re-tiers and the AOT drain run as under `sync`. x86-64 Linux; elsewhere `on` is `sync` |
+//! | `on` | `Threaded` | entry tier-ups, first-sight and OSR compiles of a function larger than `NEOVM_JIT_BG_INLINE_INSTS` CLIF instructions (default 0: all of them) hand their package to a worker thread (`bg::worker`); the function stays interpreted until its leaf is installed. Smaller ones run their backend in line, as under `sync`. Under `NEOVM_JIT_TIER2=on`, upgrades use a worker too, and the old native leaf keeps serving calls until install. Other re-tiers and the AOT drain run as under `sync`. x86-64 Linux; elsewhere `on` is `sync` |
 //! | `auto` (default) | `Threaded` or `Sync` | `on` when the process's affinity has at least two CPUs, else `sync` (a worker on the eval thread's only CPU just competes with it) |
 //!
 //! The companions -- worker count, queue caps, the classes that defer, worker
@@ -1200,17 +1200,23 @@ fn in_line_insts_knob() -> u64 {
     *LIMIT.get_or_init(|| knob_count("NEOVM_JIT_BG_INLINE_INSTS", INLINE_INSTS as usize) as u64)
 }
 
-/// See [`in_line_insts`]. A backend this large takes about 5 ms; below it
-/// what a deferral costs -- the calls interpreted until the leaf installs,
-/// however soon the install follows the backend -- outweighs the stall it
-/// saves. Re-measured with the shortest-first queue, the parked install and
-/// OSR requests waiting on the entry job (2026-10-13, two CPUs): 1024..4096
-/// cut the first call of a body between 4,096 and 8,192 instructions from
-/// 3.2 to 0.8 ms and pass the benchmark rows (geomean +0.02..+0.05%), but
-/// cost the editing board +0.47% (org) and +31% (sustained editing, whose
-/// window then counts the worker's backend of `syntax-ppss`, 5,489
-/// instructions).
-pub(crate) const INLINE_INSTS: u64 = 8192;
+/// See [`in_line_insts`]. Every backend defers: the eval thread pays the
+/// front only, and the function interprets until its leaf installs.
+///
+/// The earlier limit (8192, about a 5 ms backend) was chosen on instruction
+/// counts that add the worker's backend to the eval thread's (an editing
+/// window "counted the worker's backend of `syntax-ppss`"). Timed on the
+/// wall clock with a worker on its own CPU (2026-11-19, stock `aaba1f55229c`,
+/// interleaved runs, one process each): with 8192 every typing and scrolling
+/// compile ran in line and the JIT cost them 30 ms of stall, 7% of the run;
+/// with 0 the stall is 8 ms, the 2000-key typing replay runs in 0.382 s
+/// against 0.413 s (the interpreter alone: 0.388 s) and the 50k-line scroll
+/// in 0.503 s against 0.528 s (0.513 s). The calls interpreted while a
+/// small leaf waits cost less than its backend did in line: a limit of 1024
+/// kept typing at 0.399 s. The hot-Lisp rows do not move (org agenda 1.01x,
+/// elisp-benchmarks 0.96-1.02x, byte compile 0.87x). A one-CPU process
+/// never reaches this: `auto` picks `sync` there.
+pub(crate) const INLINE_INSTS: u64 = 0;
 
 /// Start worker `index` for `pool` (x86-64 Linux only; see
 /// [`workers_supported`]).

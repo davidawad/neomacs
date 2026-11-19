@@ -65,6 +65,20 @@ fn jit_bg_inline_size_policy_spares_upgrades_and_is_inclusive() {
     assert_eq!(in_line_insts_knob(), INLINE_INSTS);
 }
 
+/// The production limit defers every backend: a one-instruction OSR,
+/// first-sight or entry backend goes to the worker, so the eval thread pays
+/// only the front.
+#[test]
+fn jit_bg_production_limit_defers_every_backend() {
+    force_inline_insts_for_test(None);
+    if std::env::var_os("NEOVM_JIT_BG_INLINE_INSTS").is_some() {
+        return;
+    }
+    for class in [JobClass::Osr, JobClass::FirstSight, JobClass::Entry] {
+        assert!(!backend_in_line(class, 1), "{class:?} defers");
+    }
+}
+
 /// `(lambda (x) (+ x 1))`.
 fn add1() -> ByteCodeFunction {
     function(

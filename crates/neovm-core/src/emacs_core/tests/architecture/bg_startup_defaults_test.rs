@@ -28,7 +28,7 @@ fn bg_unarmed_startup_matches_production_defaults_on_linux_x86_64() {
     let expected_insts = std::env::var("NEOVM_JIT_BG_INLINE_INSTS")
         .ok()
         .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(8192);
+        .unwrap_or(0);
     assert_eq!(
         neovm_eval::test_support::authority::in_line_insts_for_test(),
         expected_insts,

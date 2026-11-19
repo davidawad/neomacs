@@ -230,9 +230,12 @@ fn worker_native_select_timeout(context: &mut Context) -> EvalResult {
     impl Drop for RestoreProfitGate {
         fn drop(&mut self) {
             neovm_eval::test_support::authority::force_profit_gate_for_test(true);
+            neovm_eval::test_support::authority::force_inline_insts_for_test(None);
         }
     }
     neovm_eval::test_support::authority::force_profit_gate_for_test(false);
+    // The witness needs the leaf native from its first call: compile in line.
+    neovm_eval::test_support::authority::force_inline_insts_for_test(Some(u64::MAX));
     let _restore = RestoreProfitGate;
     context.apply0(Value::symbol("f5-native-select-leaf"))
 }

@@ -19816,6 +19816,8 @@ fn jit_v3_fast_path_engages_and_tracks_redefinition() {
 #[test]
 fn a_spec_slot_drops_its_leaf_when_the_callee_slot_is_recycled() {
     crate::test_utils::init_test_tracing();
+    // This checks the compiled call, not when its leaf installs: compile in line.
+    neovm_eval::test_support::authority::force_inline_insts_for_test(Some(u64::MAX));
     neovm_eval::test_support::authority::force_profit_gate_for_test(false);
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
@@ -19930,6 +19932,8 @@ fn a_spec_slot_drops_its_leaf_when_the_callee_slot_is_recycled() {
 #[test]
 fn spec_call_fast_path_keeps_the_reference_protocol_on_its_exits() {
     crate::test_utils::init_test_tracing();
+    // This checks the compiled call, not when its leaf installs: compile in line.
+    neovm_eval::test_support::authority::force_inline_insts_for_test(Some(u64::MAX));
     neovm_eval::test_support::authority::force_profit_gate_for_test(false);
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
@@ -20236,6 +20240,8 @@ fn spec_call_fast_path_keeps_the_reference_protocol_on_its_exits() {
 #[test]
 fn optional_arity_callees_take_the_spec_fast_path() {
     crate::test_utils::init_test_tracing();
+    // This checks the compiled call, not when its leaf installs: compile in line.
+    neovm_eval::test_support::authority::force_inline_insts_for_test(Some(u64::MAX));
     neovm_eval::test_support::authority::force_profit_gate_for_test(false);
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
@@ -28491,6 +28497,8 @@ fn redefining_a_function_is_visible_to_the_next_interpreted_call() {
 #[test]
 fn a_speculated_call_caches_a_bit_op_inlining_callee_and_sees_its_redefinition() {
     crate::test_utils::init_test_tracing();
+    // This checks the compiled call, not when its leaf installs: compile in line.
+    neovm_eval::test_support::authority::force_inline_insts_for_test(Some(u64::MAX));
     neovm_eval::test_support::authority::force_profit_gate_for_test(false);
     neovm_eval::test_support::authority::force_inline_arith_for_test(true);
     use crate::emacs_core::bytecode::ByteCodeFunction;
@@ -28594,6 +28602,8 @@ fn a_speculated_call_caches_a_bit_op_inlining_callee_and_sees_its_redefinition()
 #[test]
 fn native_calls_marshal_optional_and_rest_arguments() {
     crate::test_utils::init_test_tracing();
+    // This checks the compiled call, not when its leaf installs: compile in line.
+    neovm_eval::test_support::authority::force_inline_insts_for_test(Some(u64::MAX));
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
     use crate::emacs_core::print::print_value;
@@ -29665,6 +29675,8 @@ fn issue554_formal_watchers_change_policy_before_the_next_formal() {
 #[test]
 fn jit_guarded_bcall_leaf_site_calls_through_the_function_cell() {
     crate::test_utils::init_test_tracing();
+    // This checks the compiled call, not when its leaf installs: compile in line.
+    neovm_eval::test_support::authority::force_inline_insts_for_test(Some(u64::MAX));
     neovm_eval::test_support::authority::force_profit_gate_for_test(false);
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
