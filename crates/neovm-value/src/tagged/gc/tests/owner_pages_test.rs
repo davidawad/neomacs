@@ -13,6 +13,7 @@ use super::owner_pages::{
 };
 use super::*;
 use crate::heap_types::LispString;
+use crate::tagged::collection_reads::ObservationWorld;
 use crate::value::{HashKey, HashTableTest, Value};
 use std::ptr::NonNull;
 use std::sync::{Barrier, Mutex};
@@ -198,13 +199,12 @@ fn detached_section<R: Send>(
                     // Leave the World's observation state under the stand-in
                     // Baton, as an ending Lisp thread does: dropped by this
                     // thread's thread-local destructor, its `Rc` would count
-                    // down beside the other owners' at their exits.
-                    let mut placeholder =
-                        crate::tagged::collection_reads::world_state_placeholder();
+                    // down beside the other owners' at their exits. Only the
+                    // Green runtime's carried set moves the carried pieces,
+                    // so this thread installs a fresh, unbound World instead.
                     {
                         let _attached = baton.lock().unwrap();
-                        crate::tagged::collection_reads::swap_world_state(&mut *placeholder);
-                        drop(placeholder);
+                        ObservationWorld::default().install(BarrierWindow::NONE);
                     }
                     result
                 })
