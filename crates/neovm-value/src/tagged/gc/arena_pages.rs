@@ -1412,8 +1412,18 @@ impl<T: PagedObject> ObjectArena<T> {
     #[cfg(feature = "shared-heap")]
     pub(super) fn adopt_page(&mut self, mut page: ObjectPage<T>) -> usize {
         debug_assert_eq!(page.free_head, PAGE_NONE);
-        for index in 0..page.next_index {
-            if !page.is_allocated(index) {
+        // A word of the bitmap at a time: a full page threads nothing and
+        // reads its bitmap only, not every slot's bit.
+        const BITS: usize = usize::BITS as usize;
+        for word_index in 0..page.next_index.div_ceil(BITS) {
+            let base = word_index * BITS;
+            let mut free = !page.alloc_bits[word_index];
+            if page.next_index - base < BITS {
+                free &= (1usize << (page.next_index - base)) - 1;
+            }
+            while free != 0 {
+                let index = base + free.trailing_zeros() as usize;
+                free &= free - 1;
                 // SAFETY: a never-handed slot of this page; only its trailing
                 // link word is written (allocated-bit-first).
                 unsafe { page.free_link_ptr(index).write(page.free_head) };

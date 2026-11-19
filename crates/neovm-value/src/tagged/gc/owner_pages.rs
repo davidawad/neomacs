@@ -1239,6 +1239,11 @@ impl TaggedHeap {
             + vectors.len()
             + bignums.len()
             + boxed.len();
+        // Room for every registration below at once, not a rehash at each
+        // growth of a set the stop holds the World for.
+        self.vector_object_addrs
+            .reserve(vectors.iter().map(|page| page.allocated).sum());
+        self.non_cons_object_addrs.reserve(boxed.len());
         for pending in blocks {
             self.adopt_owner_cons_block(pending);
         }

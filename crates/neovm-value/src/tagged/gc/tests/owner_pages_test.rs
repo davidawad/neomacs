@@ -673,3 +673,30 @@ fn the_in_stop_sweep_gives_each_owner_the_pages_it_carved() {
         state.free_swept_payloads();
     }
 }
+
+/// Adopting an owner page threads exactly its never-handed slots below the
+/// bump cursor onto the page's free list, descending, across bitmap words:
+/// here slots 0..150 were reserved and 3..70 and 100..129 handed out.
+#[test]
+fn adoption_threads_exactly_the_never_handed_slots() {
+    let mut page = ObjectPage::<FloatObj>::new();
+    page.next_index = 150;
+    page.set_allocated_range(3, 67);
+    page.set_allocated_range(100, 29);
+    let mut arena = ObjectArena::<FloatObj>::new(None);
+    let index = arena.adopt_page(page);
+    let page = &arena.pages[index];
+    let mut threaded = Vec::new();
+    let mut slot = page.free_head;
+    while slot != PAGE_NONE {
+        threaded.push(slot);
+        // SAFETY: a free slot's link word, written by the adoption.
+        slot = unsafe { page.free_link_ptr(slot).read() };
+    }
+    let expected: Vec<usize> = (0..150)
+        .rev()
+        .filter(|&slot| !(3..70).contains(&slot) && !(100..129).contains(&slot))
+        .collect();
+    assert_eq!(threaded, expected);
+    assert!(page.on_partial);
+}
