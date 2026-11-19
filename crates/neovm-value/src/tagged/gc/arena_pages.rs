@@ -400,6 +400,11 @@ pub(super) struct ObjectPage<T: PagedObject> {
     /// but it STAYS in the page-base registry so the ownership oracle keeps
     /// answering "owned" for its slots (see the C1 note in the module doc).
     pub(super) retired: bool,
+    /// The owner thread that carved the page, or [`OwnerKey::KEEPER`]: a
+    /// stop's in-stop sweep gives each owner's thread its own pages first,
+    /// so their dead payloads go back to the thread that allocated them.
+    #[cfg(feature = "shared-heap")]
+    pub(super) owner: OwnerKey,
     pub(super) _class: std::marker::PhantomData<*mut T>,
 }
 
@@ -456,6 +461,8 @@ impl<T: PagedObject> ObjectPage<T> {
             next_partial: PAGE_NONE,
             on_partial: false,
             retired: false,
+            #[cfg(feature = "shared-heap")]
+            owner: OwnerKey::KEEPER,
             _class: std::marker::PhantomData,
         }
     }
@@ -749,6 +756,8 @@ pub(super) struct ObjectArena<T: PagedObject> {
 /// is stopped ([`ObjectArena::page_runs`]).
 #[cfg(feature = "shared-heap")]
 use super::incremental::{SweptPayload, SweptPayloads};
+#[cfg(feature = "shared-heap")]
+use super::owner_pages::OwnerKey;
 
 #[cfg(feature = "shared-heap")]
 pub(super) struct PageRun<'a, T: PagedObject> {
@@ -773,6 +782,40 @@ pub(super) struct SweptRun {
     partial: Vec<usize>,
     /// The freed slots' addresses, when asked for.
     slots: Vec<usize>,
+}
+
+#[cfg(feature = "shared-heap")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the in-stop sweep shares by owner in the next commit"
+    )
+)]
+impl<'a, T: PagedObject> PageRun<'a, T> {
+    /// How many pages the run has.
+    pub(super) fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// The run's first LEN pages, and the rest as a run of its own when
+    /// any are left.
+    pub(super) fn split(self, len: usize) -> (Self, Option<Self>) {
+        if len >= self.pages.len() {
+            return (self, None);
+        }
+        let (head, tail) = self.pages.split_at_mut(len);
+        (
+            Self {
+                first: self.first,
+                pages: head,
+            },
+            Some(Self {
+                first: self.first + len,
+                pages: tail,
+            }),
+        )
+    }
 }
 
 #[cfg(feature = "shared-heap")]
@@ -1270,6 +1313,41 @@ impl<T: PagedObject> ObjectArena<T> {
                 pages,
             })
             .collect()
+    }
+
+    /// Split pages `start..end` into runs of consecutive pages one owner
+    /// carved, each with that owner, for [`PageRun::sweep`] on its thread.
+    #[cfg(feature = "shared-heap")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the in-stop sweep shares by owner in the next commit"
+        )
+    )]
+    pub(super) fn owner_runs(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Vec<(OwnerKey, PageRun<'_, T>)> {
+        let end = end.min(self.pages.len());
+        let mut runs = Vec::new();
+        if start >= end {
+            return runs;
+        }
+        let mut rest = &mut self.pages[start..end];
+        let mut first = start;
+        while let Some(owner) = rest.first().map(|page| page.owner) {
+            let len = rest
+                .iter()
+                .position(|page| page.owner != owner)
+                .unwrap_or(rest.len());
+            let (pages, tail) = rest.split_at_mut(len);
+            runs.push((owner, PageRun { first, pages }));
+            first += len;
+            rest = tail;
+        }
+        runs
     }
 
     /// Account the runs [`PageRun::sweep`] swept, in page order: put each

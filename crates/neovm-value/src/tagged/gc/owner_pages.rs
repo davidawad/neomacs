@@ -252,6 +252,13 @@ impl<T: PagedObject> PagePool<T> {
         used
     }
 
+    /// Every pending page was carved by OWNER.
+    fn mark_owner(&mut self, owner: OwnerKey) {
+        for pending in &mut self.pages {
+            pending.page.owner = owner;
+        }
+    }
+
     /// Take over every page and spare storage of OTHER, whose runs are all
     /// closed.
     fn absorb(&mut self, other: &mut Self) {
@@ -380,6 +387,14 @@ impl AllocatorCold {
 
     /// Take over an owner's pending state LOCAL, every run of which is
     /// closed: its blocks, pages, boxed objects and charges.
+    /// Every pending page of this owner's own state was carved by OWNER.
+    fn mark_owner(&mut self, owner: OwnerKey) {
+        self.floats.mark_owner(owner);
+        self.strings.mark_owner(owner);
+        self.vectors.mark_owner(owner);
+        self.bignums.mark_owner(owner);
+    }
+
     fn absorb(&mut self, local: &mut AllocatorCold) {
         debug_assert_eq!(local.open_runs, 0, "an owner hands over closed runs");
         debug_assert!(local.blocks.iter().all(|pending| pending.open_runs == 0));
@@ -1001,18 +1016,51 @@ impl OwnerAllocState {
     }
 }
 
+/// Which owner carved a page: the address of its [`OwnerAllocState`], or
+/// [`OwnerKey::KEEPER`] for the keeper's pages. Only ever compared; a later
+/// owner may get a retired one's address, which only gives it that page to
+/// sweep too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OwnerKey(usize);
+
+impl OwnerKey {
+    pub(super) const KEEPER: Self = Self(0);
+
+    fn of(state: *const OwnerAllocState) -> Self {
+        Self(state as usize)
+    }
+}
+
+/// The owner state this OS thread allocates for, installed or parked (a
+/// detached thread parked for a stop uninstalled its state,
+/// `crate::detached`); `None` on the keeper path.
+fn this_threads_owner() -> Option<std::ptr::NonNull<OwnerAllocState>> {
+    std::ptr::NonNull::new(installed_owner()).or_else(crate::detached::body_owner)
+}
+
+/// The key of the owner this OS thread allocates for (`KEEPER` on the
+/// keeper path): the pages a share of the in-stop sweep it takes first.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the in-stop sweep shares by owner in the next commit"
+    )
+)]
+pub(super) fn current_owner_key() -> OwnerKey {
+    this_threads_owner().map_or(OwnerKey::KEEPER, |owner| OwnerKey::of(owner.as_ptr()))
+}
+
 /// Run F with the swept payloads of the owner this OS thread allocates for,
-/// installed or parked (a detached thread parked for a stop uninstalled its
-/// state, `crate::detached`); `None` on the keeper path. A share of the
-/// in-stop sweep hands its dead payloads there.
+/// `None` on the keeper path. A share of the in-stop sweep hands its dead
+/// payloads there.
 pub(super) fn with_swept_payloads<R>(
     f: impl FnOnce(Option<&mut incremental::SweptPayloads>) -> R,
 ) -> R {
-    let owner = std::ptr::NonNull::new(installed_owner()).or_else(crate::detached::body_owner);
     // SAFETY: the state is this thread's own and only this thread touches
     // it; a share runs in a stop, never inside one of its allocations, so no
     // other borrow of it is live.
-    f(owner.map(|owner| unsafe { &mut (*owner.as_ptr()).swept }))
+    f(this_threads_owner().map(|owner| unsafe { &mut (*owner.as_ptr()).swept }))
 }
 
 /// This OS thread's installed owner state becomes STATE (null: none), for
@@ -1047,6 +1095,8 @@ pub(crate) fn close_owner_regions(state: &mut OwnerAllocState) {
     shared
         .refills
         .fetch_add(std::mem::take(&mut state.refills), Ordering::Relaxed);
+    let owner = OwnerKey::of(std::ptr::from_ref(state));
+    state.local.mark_owner(owner);
     let mut cold = shared.lock();
     cold.absorb(&mut state.local);
     shared.publish_pending(&cold);

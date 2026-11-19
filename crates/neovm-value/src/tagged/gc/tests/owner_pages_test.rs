@@ -8,7 +8,8 @@
 //! Baton (a mutex), then releases it and allocates while the keeper waits.
 
 use super::owner_pages::{
-    OwnerAllocState, OwnerPages, OwnerRunSizes, close_owner_regions, reopen_owner_regions,
+    OwnerAllocState, OwnerKey, OwnerPages, OwnerRunSizes, close_owner_regions, current_owner_key,
+    reopen_owner_regions,
 };
 use super::*;
 use crate::heap_types::LispString;
@@ -566,5 +567,55 @@ fn an_owners_refills_after_a_collection_reuse_the_swept_blocks_and_pages() {
         "the second round carved {} of {} blocks and pages the first had not: {unseen:x?}",
         unseen.len(),
         second.len()
+    );
+}
+
+/// An owner's close stamps every page it carved with the owner, and the
+/// arena's owner runs cut its pages where the owner changes: two owners'
+/// strings, adopted, come back as runs of one owner's pages each.
+#[test]
+fn a_close_stamps_an_owners_pages_and_owner_runs_cut_at_each_owner() {
+    crate::test_utils::init_test_tracing();
+    let mut heap = TestHeap::new();
+    heap.install();
+    let mut states = vec![heap.new_owner_alloc_state(), heap.new_owner_alloc_state()];
+    let keys = detached_section(&heap, &mut states, |tag| {
+        for i in 0..3 * ObjectPage::<StringObj>::SLOTS {
+            Value::string(format!("s{tag}-{i}"));
+        }
+        current_owner_key()
+    });
+    assert_ne!(keys[0], keys[1]);
+    assert!(!keys.contains(&OwnerKey::KEEPER));
+    heap.close_alloc_regions();
+    // The pages' owners, grouped where they change.
+    let mut expected: Vec<(OwnerKey, usize)> = Vec::new();
+    for page in &heap.string_arena.pages {
+        match expected.last_mut() {
+            Some((owner, len)) if *owner == page.owner => *len += 1,
+            _ => expected.push((page.owner, 1)),
+        }
+    }
+    assert!(
+        keys.iter()
+            .all(|key| expected.iter().any(|(owner, _)| owner == key))
+    );
+    let pages = heap.string_arena.pages.len();
+    let runs = heap.string_arena.owner_runs(0, pages);
+    let got: Vec<(OwnerKey, usize)> = runs
+        .iter()
+        .map(|(owner, run)| (*owner, run.len()))
+        .collect();
+    assert_eq!(got, expected);
+    let (owner, run) = runs
+        .into_iter()
+        .find(|(_, run)| run.len() > 1)
+        .expect("a run of pages");
+    let len = run.len();
+    let (head, tail) = run.split(1);
+    assert_eq!(
+        (head.len(), tail.map(|tail| tail.len())),
+        (1, Some(len - 1)),
+        "{owner:?}"
     );
 }
