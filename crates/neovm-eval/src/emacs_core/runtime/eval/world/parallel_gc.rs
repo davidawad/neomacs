@@ -557,6 +557,10 @@ impl Drop for ResumeOnDrop<'_> {
     }
 }
 
+/// Stops detached threads joined at a primitive's stop point, for tests.
+#[cfg(test)]
+pub(crate) static JOINED_IN_PRIMITIVES: AtomicU64 = AtomicU64::new(0);
+
 /// The roots only CTX's own thread knows: its private execution state and
 /// its thread-local roots (Green's parked census, without the World's).
 fn owner_image(ctx: &Context) -> Vec<usize> {
@@ -648,7 +652,7 @@ impl Context {
             return;
         };
         if lock.stop().stop_pending() {
-            self.parallel_park_for_stop(&lock);
+            self.parallel_park_for_stop(&lock, &[]);
         } else if lock.take_collection_due() {
             self.parallel_request_collection(&lock, force_complete);
         }
@@ -684,12 +688,33 @@ impl Context {
         neovm_value::detached::resume_detached(gate);
     }
 
-    /// Park this detached thread for the stop in progress: publish its roots,
-    /// close its allocation runs, and resume once the stop ends.
-    fn parallel_park_for_stop(&mut self, lock: &BatonLock) {
+    /// A stop point inside a primitive (`TextHost::join_world_stop`): a
+    /// detached thread parks for a requested stop with HELD, the values the
+    /// primitive holds, rooted beside its own. Without a request, or
+    /// attached, it returns at once.
+    pub(crate) fn parallel_join_stop_holding(&mut self, held: &[Value]) {
+        if !ASYNC_ATTENTION.is_raised(AsyncSource::StopRequest)
+            || !neovm_value::detached::is_detached()
+        {
+            return;
+        }
+        let Some(lock) = self.parallel_lock_shared() else {
+            return;
+        };
+        if lock.stop().stop_pending() {
+            #[cfg(test)]
+            JOINED_IN_PRIMITIVES.fetch_add(1, Ordering::Relaxed);
+            self.parallel_park_for_stop(&lock, held);
+        }
+    }
+
+    /// Park this detached thread for the stop in progress: publish its roots
+    /// and HELD, close its allocation runs, and resume once the stop ends.
+    fn parallel_park_for_stop(&mut self, lock: &BatonLock, held: &[Value]) {
         let stop = lock.stop();
         let seen = stop.counters().collections;
-        let image = owner_image(self);
+        let mut image = owner_image(self);
+        image.extend(held.iter().map(|value| value.bits()));
         let Some(gate) = neovm_value::detached::suspend_detached() else {
             return;
         };

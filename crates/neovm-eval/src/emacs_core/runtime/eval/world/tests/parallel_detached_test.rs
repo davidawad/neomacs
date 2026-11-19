@@ -463,6 +463,46 @@ fn a_detached_json_parse_string_attaches_a_bounded_number_of_times() {
     assert!(alloc <= 2, "{attaches:?}");
 }
 
+/// A collection main requests while threads parse joins them inside
+/// `json-parse-string`, at its member and element stop points, instead of
+/// waiting for every parse to return; the documents the threads finish
+/// across those stops are whole.
+#[test]
+fn a_detached_json_parse_joins_a_stop_at_its_stop_points() {
+    use super::parallel_gc::JOINED_IN_PRIMITIVES;
+    let mut ev = parallel();
+    set_json_document(&mut ev);
+    let joined = JOINED_IN_PRIMITIVES.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(let ((ts nil) (k 0) (n 0))
+               (while (< k 4)
+                 (setq ts (cons (make-thread
+                                 (lambda ()
+                                   (let ((i 0) (ok t))
+                                     (while (< i 10)
+                                       (let ((r (json-parse-string tpd-json :object-type 'hash-table)))
+                                         (if (and (= (length r) 1000)
+                                                  (= (gethash \"id\" (aref r 999)) 999)
+                                                  (= (gethash \"rank\" (gethash \"meta\" (aref r 20))) 3))
+                                             nil (setq ok nil)))
+                                       (setq i (1+ i)))
+                                     ok)))
+                                ts))
+                 (setq k (1+ k)))
+               (while (and (< n 200) (memq t (mapcar 'thread-live-p ts)))
+                 (garbage-collect)
+                 (setq n (1+ n)))
+               (mapcar 'thread-join ts))"
+        ),
+        "(t t t t)"
+    );
+    let joined = JOINED_IN_PRIMITIVES.load(std::sync::atomic::Ordering::Relaxed) - joined;
+    println!("stops joined inside json-parse-string: {joined}");
+    assert!(joined > 0, "main's collections waited for whole parses");
+}
+
 /// With `:object-type 'alist` the member names become symbols through the
 /// process-wide symbol registry, which is thread-safe and holds no World
 /// state: that needs no attach either, and the result is the serial parse's.

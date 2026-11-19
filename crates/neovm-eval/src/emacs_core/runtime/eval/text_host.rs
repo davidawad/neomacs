@@ -87,6 +87,13 @@ impl TextHost for Context {
             .is_some_and(|proc| !proc.encoding_state.requires_encoding())
     }
 
+    fn join_world_stop(&mut self, held: &[Value]) {
+        #[cfg(feature = "shared-heap")]
+        self.parallel_join_stop_holding(held);
+        #[cfg(not(feature = "shared-heap"))]
+        let _ = held;
+    }
+
     fn current_buffer_is_displayed(&self) -> bool {
         let Some(buffer_id) = self.edit.buffers.current_buffer_id() else {
             return false;
