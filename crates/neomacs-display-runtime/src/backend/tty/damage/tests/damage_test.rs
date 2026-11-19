@@ -1318,3 +1318,25 @@ fn rows_copied_to_shift_positions_keep_their_painters_by_appearance() {
         );
     }
 }
+
+/// A row signature is `row_hash` plus the default-blank test, from one pass.
+#[test]
+fn row_signature_matches_row_hash_and_default_blank_test() {
+    let mut grid = TtyGrid::new(8, 3);
+    grid.set(1, 2, 'x', CellAttrs::default(), false);
+    grid.set(2, 7, ' ', CellAttrs::default(), false);
+    grid.cells[2 * 8 + 7].set_blank_erase(BlankErase::Explicit);
+    for row in 0..3 {
+        let cells = grid.row(row);
+        let signature = RowSignature::of(cells);
+        assert_eq!(signature.hash, row_hash(cells), "row {row}");
+        assert_eq!(
+            signature.default_blank,
+            cells.iter().all(|cell| *cell == TtyCell::default()),
+            "row {row}"
+        );
+    }
+    assert!(RowSignature::of(grid.row(0)).default_blank);
+    assert!(!RowSignature::of(grid.row(1)).default_blank);
+    assert!(!RowSignature::of(grid.row(2)).default_blank);
+}

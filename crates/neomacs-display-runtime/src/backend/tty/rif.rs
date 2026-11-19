@@ -2969,34 +2969,7 @@ fn visible_cell_range(start: i64, extent: usize, limit: usize) -> std::ops::Rang
 fn row_hash(row: &[TtyCell]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
-    for c in row {
-        h.write_u32(c.ch() as u32);
-        c.attrs().fg.hash(&mut h);
-        c.attrs().bg.hash(&mut h);
-        h.write_u8(
-            (c.attrs().bold as u8)
-                | ((c.attrs().italic as u8) << 1)
-                | ((c.attrs().strikethrough as u8) << 2)
-                | ((c.attrs().inverse as u8) << 3)
-                | ((c.padding() as u8) << 4),
-        );
-        h.write_u8(match c.blank_erase() {
-            BlankErase::DefaultFace => 0,
-            BlankErase::Explicit => 1,
-        });
-        h.write_u8(match c.materialization() {
-            CellMaterialization::Erased => 0,
-            CellMaterialization::Written => 1,
-        });
-        h.write_u8(match c.terminal_advance() {
-            TerminalAdvance::OneColumn => 0,
-            TerminalAdvance::TerminalResolved => 1,
-        });
-        h.write_u8(c.attrs().underline);
-        if let Some(e) = c.extenders() {
-            h.write(e.as_bytes());
-        }
-    }
+    row.iter().for_each(|cell| cell.hash(&mut h));
     h.finish()
 }
 
@@ -3050,7 +3023,7 @@ fn detect_scroll(
     let default_blank_sentinel = |grid: &TtyGrid, r: usize| {
         let row = &grid.cells[r * w..(r + 1) * w];
         row.iter()
-            .all(|cell| cell == &TtyCell::default())
+            .all(TtyCell::is_default_blank)
             .then_some(DEFAULT_BLANK_SENTINEL | r as u64)
     };
     let old_hash: Vec<u64> = (0..h)

@@ -331,10 +331,19 @@ pub(super) struct RowSignature {
 }
 
 impl RowSignature {
+    /// One pass over the row: the same hash as `row_hash`, and whether every
+    /// cell is a default blank.
     fn of(row: &[TtyCell]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        let mut default_blank = true;
+        for cell in row {
+            cell.hash(&mut hasher);
+            default_blank &= cell.is_default_blank();
+        }
         Self {
-            hash: row_hash(row),
-            default_blank: row.iter().all(|cell| cell == &TtyCell::default()),
+            hash: hasher.finish(),
+            default_blank,
         }
     }
 

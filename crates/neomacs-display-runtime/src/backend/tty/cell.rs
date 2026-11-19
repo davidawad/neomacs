@@ -9,6 +9,7 @@
 use super::{BlankErase, CellAttrs, CellMaterialization, TerminalAdvance};
 use neomacs_display_protocol::TerminalColor;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 const COLOR_BITS: u32 = 25;
 const COLOR_MASK: u128 = (1 << COLOR_BITS) - 1;
@@ -33,6 +34,9 @@ const DAMAGE_CONTENT_MASK: u128 = CANONICAL_METADATA_MASK & !(1u128 << MATERIALI
 const PRESERVABLE_BLANK_MASK: u128 = DAMAGE_CONTENT_MASK & !(1u128 << TERMINAL_ADVANCE);
 const PAINTER_VISIBLE_MASK: u128 =
     ATTRS_MASK | (CHAR_MASK << CHAR) | (1u128 << PADDING) | (1u128 << EXTENDERS_PRESENT);
+// `TtyCell::default()`: a default-face space, erased, no extenders. Every
+// other field encodes as zero bits.
+const DEFAULT_BLANK_METADATA: u128 = (' ' as u128) << CHAR;
 
 /// Ephemeral named construction value. It is consumed once and never stored
 /// beside the canonical cell metadata. All fields preserve their independent
@@ -376,6 +380,13 @@ impl TtyCell {
             && (!self.bit(EXTENDERS_PRESENT) || self.extenders == other.extenders)
     }
 
+    /// Whether this cell equals [`TtyCell::default`], without building one.
+    /// The default carries no extenders, so the metadata decides alone.
+    #[inline]
+    pub fn is_default_blank(&self) -> bool {
+        self.metadata == DEFAULT_BLANK_METADATA
+    }
+
     #[inline]
     fn bit(&self, at: u32) -> bool {
         self.metadata & (1 << at) != 0
@@ -430,6 +441,20 @@ fn equal_present_extenders(left: &TtyCell, right: &TtyCell) -> bool {
 }
 
 impl Eq for TtyCell {}
+
+/// Hashes exactly what [`PartialEq`] compares: the canonical metadata, plus
+/// the extender bytes when present. Two words per cell instead of a decode of
+/// every field.
+impl Hash for TtyCell {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.metadata as u64);
+        state.write_u64((self.metadata >> 64) as u64);
+        if self.bit(EXTENDERS_PRESENT) {
+            self.extenders.hash(state);
+        }
+    }
+}
 
 impl fmt::Debug for TtyCell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

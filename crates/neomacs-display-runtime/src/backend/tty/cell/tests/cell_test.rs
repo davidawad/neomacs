@@ -191,8 +191,8 @@ fn independent_provenance_flags_and_grapheme_shapes_roundtrip() {
     }
 }
 
-#[test]
-fn physical_equality_matches_old_record_for_every_single_field_difference() {
+/// The baseline plus one record per single-field difference from it.
+fn single_field_variants() -> Vec<OldCell> {
     let base = baseline();
     let mut variants = vec![base.clone()];
     macro_rules! variant {
@@ -215,6 +215,13 @@ fn physical_equality_matches_old_record_for_every_single_field_difference() {
     variant!(extenders = Some(Box::from("")));
     variant!(extenders = Some(Box::from("\u{301}")));
     variant!(terminal_advance = TerminalAdvance::TerminalResolved);
+    variants
+}
+
+#[test]
+fn physical_equality_matches_old_record_for_every_single_field_difference() {
+    let base = baseline();
+    let variants = single_field_variants();
     for a in &variants {
         for b in &variants {
             assert_eq!(
@@ -230,6 +237,33 @@ fn physical_equality_matches_old_record_for_every_single_field_difference() {
     let mut b = base;
     b.extenders = Some(String::from("\u{301}").into_boxed_str());
     assert_eq!(a.pack(), b.pack());
+}
+
+#[test]
+fn hash_and_default_blank_agree_with_physical_equality() {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    let hash =
+        |cell: &TtyCell| BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(cell);
+    let variants: Vec<TtyCell> = single_field_variants().iter().map(OldCell::pack).collect();
+    for a in &variants {
+        assert_eq!(
+            a.is_default_blank(),
+            *a == TtyCell::default(),
+            "default-blank test differs from equality for {a:?}"
+        );
+        for b in &variants {
+            if a == b {
+                assert_eq!(hash(a), hash(b), "equal cells hash apart: {a:?}, {b:?}");
+            }
+        }
+    }
+    // Equal extender bytes in distinct allocations hash alike.
+    let mut a = baseline();
+    a.extenders = Some(Box::from("\u{301}"));
+    let mut b = baseline();
+    b.extenders = Some(String::from("\u{301}").into_boxed_str());
+    assert_eq!(hash(&a.pack()), hash(&b.pack()));
+    assert!(TtyCell::default().is_default_blank());
 }
 
 #[test]
