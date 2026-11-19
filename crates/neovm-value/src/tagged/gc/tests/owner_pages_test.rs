@@ -619,3 +619,57 @@ fn a_close_stamps_an_owners_pages_and_owner_runs_cut_at_each_owner() {
         "{owner:?}"
     );
 }
+
+/// A collection's in-stop sweep gives each owner's thread the pages that
+/// owner carved: four owners leave 3000, 6000, 9000 and 12000 dead strings
+/// and as many dead bignums, and each thread, taking a share with its own
+/// state installed, holds for after the stop the payloads of exactly what
+/// its owner allocated.
+#[test]
+fn the_in_stop_sweep_gives_each_owner_the_pages_it_carved() {
+    crate::test_utils::init_test_tracing();
+    let mut heap = TestHeap::new();
+    heap.install();
+    // SAFETY: serial fixture heap; no collector or compiled leaf runs.
+    unsafe { heap.set_generational_enabled(true) };
+    heap.partition_dump = false;
+    heap.dump_blackened = false;
+    heap.set_gc_threshold(usize::MAX);
+    let garbage = |tag: usize| (tag + 1) * 3_000;
+    let mut states: Vec<_> = (0..4).map(|_| heap.new_owner_alloc_state()).collect();
+    detached_section(&heap, &mut states, |tag| {
+        for i in 0..garbage(tag) {
+            Value::string(format!("garbage {tag}-{i}"));
+            // At least 2^64: a limb vector to free.
+            Value::make_integer(Integer::from(tag * 100_000 + i + 1) << 64_u64);
+        }
+    });
+    heap.close_alloc_regions();
+    heap.begin_minor_collection().unwrap();
+    heap.complete_minor_collection();
+    assert!(heap.sweep_in_progress());
+    heap.sweep_in_stop_on(std::num::NonZeroUsize::new(4).unwrap(), |parts, share| {
+        assert!(parts >= 4, "a share per owner, {parts} in all");
+        std::thread::scope(|threads| {
+            let mut states = states.iter_mut();
+            for _ in 0..parts {
+                let state = states.next();
+                threads.spawn(move || {
+                    let _installed = state.map(|state| state.install());
+                    share(0);
+                });
+            }
+        });
+    });
+    for (tag, state) in states.iter().enumerate() {
+        assert_eq!(
+            state.swept_payload_count(),
+            2 * garbage(tag),
+            "owner {tag}'s thread holds its own garbage's payloads"
+        );
+    }
+    heap.finish_incremental_sweep_now();
+    for state in &mut states {
+        state.free_swept_payloads();
+    }
+}
