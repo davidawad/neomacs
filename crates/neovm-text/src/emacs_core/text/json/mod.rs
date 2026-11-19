@@ -682,17 +682,6 @@ impl JsonError {
 // JSON Parser (JSON string → Lisp value)
 // ===========================================================================
 
-fn json_utf8_decode_error(start: usize, end: usize) -> Flow {
-    signal(
-        JsonError::Utf8Decode.symbol(),
-        vec![
-            Value::fixnum(start as i64),
-            Value::NIL,
-            Value::fixnum(end as i64),
-        ],
-    )
-}
-
 // Keep guarded mutation out of the inactive insertion clone.
 #[cold]
 #[inline(never)]
@@ -1017,36 +1006,63 @@ impl<'a> JsonParser<'a> {
                     self.advance();
                     return Err(self.signal_at_pos(JsonError::Parse));
                 }
-                Some(b) => {
-                    // A multi-byte lead: the run above stops at every byte
+                Some(lead) => {
+                    // A byte >= 0x80: the run above stops at every byte
                     // outside 0x20..0x7F, and the arms above take the rest.
-                    let start = self.pos;
-                    let seq_len = match b {
-                        0xC2..=0xDF => 2,
-                        0xE0..=0xEF => 3,
-                        0xF0..=0xF4 => 4,
-                        _ => {
-                            return Err(json_utf8_decode_error(
-                                start,
-                                (start + 2).min(self.input.len()),
-                            ));
-                        }
-                    };
-                    let end = (start + seq_len).min(self.input.len());
-                    let seq = &self.input[start..end];
-                    let is_one_char = std::str::from_utf8(seq).is_ok_and(|s| {
-                        let mut decoded = s.chars();
-                        decoded.next().is_some() && decoded.next().is_none()
-                    });
-                    if !is_one_char {
-                        return Err(json_utf8_decode_error(start, end));
-                    }
-                    self.byte_workspace.extend_from_slice(seq);
+                    self.advance();
+                    self.parse_utf8_char(lead)?;
                     chars += 1;
-                    self.pos = end;
                 }
             }
         }
+    }
+
+    /// Copy one UTF-8 character whose first byte `lead` (>= 0x80) has just
+    /// been consumed, validating it strictly, as the `c & 0x80` branch of
+    /// GNU `json_parse_string` does.
+    ///
+    /// Like GNU, this reads each further byte through the consuming reader,
+    /// so input that ends inside a character signals `json-end-of-file`,
+    /// and a malformed character signals `json-utf8-decode-error` at the
+    /// position just after the last byte read: a non-continuation byte where
+    /// one is required, an overlong form, a surrogate, or a code point above
+    /// U+10FFFF. The input is UTF-8 whether the Lisp string holding it is
+    /// unibyte or multibyte, so a raw-byte character's internal bytes are
+    /// malformed here too.
+    fn parse_utf8_char(&mut self, lead: u8) -> Result<(), Flow> {
+        let is_continuation = |b: u8| b & 0xC0 == 0x80;
+        let c1 = self.consume()?;
+        if !is_continuation(c1) || lead <= 0xC1 {
+            return Err(self.signal_at_pos(JsonError::Utf8Decode));
+        }
+        let (lead_bits, c1_bits) = (u32::from(lead), u32::from(c1 & 0x3F));
+        if lead <= 0xDF {
+            self.byte_workspace.extend_from_slice(&[lead, c1]);
+            return Ok(());
+        }
+        if lead <= 0xEF {
+            let c2 = self.consume()?;
+            let v = ((lead_bits & 0x0F) << 12) + (c1_bits << 6) + u32::from(c2 & 0x3F);
+            if !is_continuation(c2) || v < 0x800 || (0xD800..=0xDFFF).contains(&v) {
+                return Err(self.signal_at_pos(JsonError::Utf8Decode));
+            }
+            self.byte_workspace.extend_from_slice(&[lead, c1, c2]);
+            return Ok(());
+        }
+        if lead <= 0xF7 {
+            let c2 = self.consume()?;
+            let c3 = self.consume()?;
+            let v = ((lead_bits & 0x07) << 18)
+                + (c1_bits << 12)
+                + (u32::from(c2 & 0x3F) << 6)
+                + u32::from(c3 & 0x3F);
+            if !is_continuation(c2) || !is_continuation(c3) || !(0x10000..=0x10FFFF).contains(&v) {
+                return Err(self.signal_at_pos(JsonError::Utf8Decode));
+            }
+            self.byte_workspace.extend_from_slice(&[lead, c1, c2, c3]);
+            return Ok(());
+        }
+        Err(self.signal_at_pos(JsonError::Utf8Decode))
     }
 
     /// Append `c` to [`Self::byte_workspace`] in UTF-8, which is the Emacs

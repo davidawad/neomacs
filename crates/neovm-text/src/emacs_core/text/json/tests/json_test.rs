@@ -1416,3 +1416,49 @@ fn parse_hash_table_keys_are_the_decoded_names() {
     assert_eq!(get("x"), Some(4));
     assert_eq!(table.data.len(), 3);
 }
+
+/// UTF-8 inside a string is decoded the way GNU `json_parse_string` reads
+/// it: byte by byte, so a character cut off by the end of input is
+/// `json-end-of-file`, and a malformed one is `json-utf8-decode-error` with
+/// GNU's `(LINE nil POS)` data, POS just after the last byte read. The
+/// expected results are GNU 31.1's for the same unibyte inputs.
+#[test]
+fn parse_utf8_errors_report_gnu_condition_and_position() {
+    crate::test_utils::init_test_tracing();
+    let parse = |bytes: &[u8]| {
+        builtin_json_parse_string(vec![Value::heap_string(LispString::from_unibyte(
+            bytes.to_vec(),
+        ))])
+    };
+    for (input, text) in [
+        (&b"\"ok\xC3\xA9\""[..], "ok\u{e9}"),
+        (&b"\"\xF0\x9F\x98\x80\""[..], "\u{1F600}"),
+    ] {
+        let parsed = parse(input).expect("well-formed UTF-8 parses");
+        assert_eq!(parsed.as_utf8_str(), Some(text));
+    }
+    for (input, condition, pos) in [
+        (&b"\"\xC3\""[..], "json-utf8-decode-error", 3),
+        (&b"\"\xC3"[..], "json-end-of-file", 2),
+        (&b"\"\xC0\x80\""[..], "json-utf8-decode-error", 3),
+        (&b"\"\xED\xA0\x80\""[..], "json-utf8-decode-error", 4),
+        (&b"\"\xF4\x90\x80\x80\""[..], "json-utf8-decode-error", 5),
+        (&b"\"\xF8\x80\x80\""[..], "json-utf8-decode-error", 3),
+        (&b"\"\x80\""[..], "json-utf8-decode-error", 3),
+        (&b"\"\xE2\x82\""[..], "json-utf8-decode-error", 4),
+        (&b"\"\xF5\x80\x80\x80\""[..], "json-utf8-decode-error", 5),
+        (&b"\"abcdefgh\xFF\""[..], "json-utf8-decode-error", 11),
+    ] {
+        match parse(input).kinded() {
+            Err(FlowKind::Signal(sig)) => {
+                assert_eq!(sig.symbol_name(), condition, "{input:x?}");
+                assert_eq!(
+                    sig.data,
+                    vec![Value::fixnum(1), Value::NIL, Value::fixnum(pos)],
+                    "{input:x?}"
+                );
+            }
+            other => panic!("expected {condition} for {input:x?}, got {other:?}"),
+        }
+    }
+}
