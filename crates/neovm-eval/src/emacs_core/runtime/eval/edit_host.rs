@@ -131,6 +131,12 @@ impl EditHost for Context {
         &mut *self.bookmarks
     }
 
+    fn ensure_interned_global_ids(&mut self, ids: &[SymId]) {
+        for &id in ids {
+            self.obarray.ensure_interned_global_id(id);
+        }
+    }
+
     fn set_current_buffer_unrecorded(&mut self, id: BufferId) -> Result<(), Flow> {
         Context::set_current_buffer_unrecorded(self, id)
     }

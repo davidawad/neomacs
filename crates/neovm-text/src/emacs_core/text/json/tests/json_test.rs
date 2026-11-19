@@ -1537,3 +1537,30 @@ fn parse_object_keys_stay_interned_across_parses_and_bounds() {
         assert_eq!(first_key(r#"{"label":3}"#, object_type), symbol("label"));
     }
 }
+
+/// A parse reports each distinct alist or plist key symbol once, whether it
+/// interned it or found it cached, so the caller can make every one of them
+/// an obarray member; a hash-table parse makes string keys and reports none.
+#[test]
+fn parse_reports_each_key_symbol_once_per_parse() {
+    crate::test_utils::init_test_tracing();
+    let json = br#"[{"jk-a":1,"jk-b":{"jk-a":2}},{"jk-b":3,"jk-c":[{"jk-a":4}]}]"#;
+    let opts = |object_type| ParseOpts {
+        object_type,
+        ..ParseOpts::default()
+    };
+    for (object_type, prefix) in [(ObjectType::Plist, ":"), (ObjectType::Alist, "")] {
+        let expected: Vec<SymId> = ["jk-a", "jk-b", "jk-c"]
+            .iter()
+            .map(|name| intern(&format!("{prefix}{name}")))
+            .collect();
+        for _ in 0..2 {
+            let mut parser = JsonParser::new(json, false, opts(object_type));
+            parser.parse().expect("valid JSON parses");
+            assert_eq!(parser.key_ids, expected, "{object_type:?}");
+        }
+    }
+    let mut parser = JsonParser::new(json, false, opts(ObjectType::HashTable));
+    parser.parse().expect("valid JSON parses");
+    assert!(parser.key_ids.is_empty());
+}

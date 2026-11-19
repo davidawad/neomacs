@@ -221,6 +221,12 @@ pub trait EditHost {
     /// `WorldSlot` needs no accessor: only core code touches it.
     fn bookmarks(&mut self) -> &mut BookmarkManager;
 
+    /// The obarray half of GNU `intern` for symbols a primitive resolved by
+    /// name without one: make each canonical id in `ids` a member of the
+    /// initial obarray, as `intern` of its name would. A member stays one;
+    /// an uninterned (`make-symbol`) id is left alone.
+    fn ensure_interned_global_ids(&mut self, ids: &[SymId]);
+
     // --- current-buffer switches and GC inhibition: runtime state the
     // edit layer drives at GC-time compaction (GNU `compact_buffer`). ---
 

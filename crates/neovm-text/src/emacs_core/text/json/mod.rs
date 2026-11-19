@@ -739,6 +739,10 @@ struct JsonParser<'a> {
     /// Alist and plist key symbols, this thread's [`ObjectKeySymbols`] for
     /// the length of the parse.
     key_symbols: ObjectKeySymbols,
+    /// The distinct alist and plist key symbols of this parse, for the
+    /// caller to make obarray members: GNU interns every key into the
+    /// obarray (`intern_c_multibyte`), and the parser has none.
+    key_ids: Vec<SymId>,
 }
 
 impl Drop for JsonParser<'_> {
@@ -787,14 +791,29 @@ enum DecodedBytes {
 /// are not kept, and a map that reaches [`Self::MAX_ENTRIES`] starts over,
 /// so a document keyed by unique names (file URIs, ids) cannot grow it
 /// without limit.
+///
+/// Each parse also reports its distinct key symbols once (see
+/// [`JsonParser::key_ids`]), so the caller can make them members of its
+/// obarray, cached or not.
 #[derive(Debug, Default)]
 struct ObjectKeySymbols {
     /// The registry epoch the entries were made under.
     epoch: u64,
-    symbols: FxHashMap<Box<[u8]>, Value>,
-    keywords: FxHashMap<Box<[u8]>, Value>,
+    /// Counts the parses that took this cache; an entry remembers the last
+    /// one that reported it.
+    parse: u64,
+    symbols: FxHashMap<Box<[u8]>, KeySymbol>,
+    keywords: FxHashMap<Box<[u8]>, KeySymbol>,
     /// Whether this is the thread's cache, to be given back on drop.
     taken: bool,
+}
+
+/// One [`ObjectKeySymbols`] entry.
+#[derive(Clone, Copy, Debug)]
+struct KeySymbol {
+    id: SymId,
+    /// The [`ObjectKeySymbols::parse`] that last reported this symbol.
+    reported_in: u64,
 }
 
 thread_local! {
@@ -822,6 +841,7 @@ impl ObjectKeySymbols {
             cache.epoch = epoch;
         }
         cache.taken = true;
+        cache.parse = cache.parse.wrapping_add(1);
         cache
     }
 
@@ -834,36 +854,58 @@ impl ObjectKeySymbols {
     }
 
     /// The symbol (`keyword` false) or keyword for the key named `name`,
-    /// which is valid UTF-8.
-    fn symbol(&mut self, name: &[u8], keyword: bool) -> Value {
+    /// which is valid UTF-8, adding it to `reported` the first time this
+    /// parse meets it.
+    fn symbol(&mut self, name: &[u8], keyword: bool, reported: &mut Vec<SymId>) -> Value {
+        let parse = self.parse;
         let map = if keyword {
             &mut self.keywords
         } else {
             &mut self.symbols
         };
-        if let Some(&symbol) = map.get(name) {
-            return symbol;
-        }
-        let symbol = Self::intern_key(name, keyword);
-        if name.len() <= Self::MAX_NAME_BYTES {
-            if map.len() >= Self::MAX_ENTRIES {
-                map.clear();
+        let id = match map.get_mut(name) {
+            Some(entry) => {
+                if entry.reported_in != parse {
+                    entry.reported_in = parse;
+                    reported.push(entry.id);
+                }
+                entry.id
             }
-            map.insert(name.into(), symbol);
+            None => {
+                let id = Self::intern_key(name, keyword);
+                reported.push(id);
+                if name.len() <= Self::MAX_NAME_BYTES {
+                    if map.len() >= Self::MAX_ENTRIES {
+                        map.clear();
+                    }
+                    let entry = KeySymbol {
+                        id,
+                        reported_in: parse,
+                    };
+                    map.insert(name.into(), entry);
+                }
+                id
+            }
+        };
+        // A keyword is a symbol whose name starts with a colon; the two
+        // constructors make the same value.
+        if keyword {
+            Value::from_kw_id(id)
+        } else {
+            Value::from_sym_id(id)
         }
-        symbol
     }
 
     #[inline(never)]
-    fn intern_key(name: &[u8], keyword: bool) -> Value {
+    fn intern_key(name: &[u8], keyword: bool) -> SymId {
         let name = std::str::from_utf8(name).expect("the string decoder only accepts UTF-8");
         if keyword {
             let mut keyword = String::with_capacity(name.len() + 1);
             keyword.push(':');
             keyword.push_str(name);
-            Value::from_kw_id(intern(&keyword))
+            intern(&keyword)
         } else {
-            Value::from_sym_id(intern(name))
+            intern(name)
         }
     }
 }
@@ -884,6 +926,7 @@ impl<'a> JsonParser<'a> {
             object_workspace: Vec::new(),
             byte_workspace: Vec::new(),
             key_symbols,
+            key_ids: Vec::new(),
         }
     }
 
@@ -1593,7 +1636,7 @@ impl<'a> JsonParser<'a> {
             DecodedBytes::Workspace => self.byte_workspace.as_slice(),
         };
         let keyword = matches!(self.opts.object_type, ObjectType::Plist);
-        self.key_symbols.symbol(bytes, keyword)
+        self.key_symbols.symbol(bytes, keyword, &mut self.key_ids)
     }
     /// Parse an object as an alist `((KEY . VALUE) ...)` or a plist
     /// `(:KEY VALUE ...)`, mirroring GNU `json_parse_object`.  The list
@@ -1722,7 +1765,7 @@ fn json_serialize_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalResult
 /// - `:false-object VALUE` — Lisp value for JSON false (default: :false)
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn builtin_json_parse_string(args: Vec<Value>) -> EvalResult {
-    json_parse_string_with_symbols(args, SymbolMode::Bare)
+    json_parse_string_with_symbols(args, SymbolMode::Bare, |_| {})
 }
 
 #[doc(hidden)]
@@ -1730,10 +1773,18 @@ pub fn builtin_json_parse_string_in_state<H: TextHost>(
     host: &mut H,
     args: Vec<Value>,
 ) -> EvalResult {
-    json_parse_string_with_symbols(args, host.symbol_mode())
+    let mode = host.symbol_mode();
+    json_parse_string_with_symbols(args, mode, |ids| host.ensure_interned_global_ids(ids))
 }
 
-fn json_parse_string_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalResult {
+/// Parse `args` as `json-parse-string` does, handing `make_members` the key
+/// symbols of the parse (see [`JsonParser::key_ids`]) whether
+/// or not it succeeded.
+fn json_parse_string_with_symbols(
+    args: Vec<Value>,
+    mode: SymbolMode,
+    make_members: impl FnOnce(&[SymId]),
+) -> EvalResult {
     expect_min_args("json-parse-string", &args, 1)?;
     let input = match args[0].kind() {
         ValueKind::String => args[0]
@@ -1748,17 +1799,18 @@ fn json_parse_string_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalRes
     };
     let opts = parse_parse_kwargs(&args, 1, mode)?;
     let mut parser = JsonParser::new(input.as_bytes(), input.is_multibyte(), opts);
-    let result = parser.parse()?;
-
-    // Ensure there is no trailing non-whitespace, mirroring GNU's
-    // `json_skip_whitespace_if_possible (&p) >= 0` check.  The trailing char
-    // is consumed before signalling, so the reported position is just after
-    // it.
-    if parser.skip_ws_if_possible().is_some() {
-        return Err(parser.signal_at_pos(JsonError::TrailingContent));
-    }
-
-    Ok(result)
+    let result = parser.parse().and_then(|value| {
+        // Ensure there is no trailing non-whitespace, mirroring GNU's
+        // `json_skip_whitespace_if_possible (&p) >= 0` check.  The trailing
+        // char is consumed before signalling, so the reported position is
+        // just after it.
+        if parser.skip_ws_if_possible().is_some() {
+            return Err(parser.signal_at_pos(JsonError::TrailingContent));
+        }
+        Ok(value)
+    });
+    make_members(&parser.key_ids);
+    result
 }
 
 /// `(json-parse-buffer &rest ARGS)` — parse one JSON value from point.
@@ -1786,18 +1838,20 @@ pub fn builtin_json_parse_buffer<H: EditHost>(host: &mut H, args: Vec<Value>) ->
         let multibyte = buf.get_multibyte();
         let parse = |input: &[u8]| {
             let mut parser = JsonParser::new(input, multibyte, opts.clone());
-            parser.parse().map(|value| (value, parser.pos))
+            let parsed = parser.parse().map(|value| (value, parser.pos));
+            (parsed, std::mem::take(&mut parser.key_ids))
         };
         // Moving the gap out of the unread text is what GNU's searches do
         // too; a chunked text backend lends no window, and gets the copy.
         buf.try_make_emacs_byte_range_contiguous(unread);
-        let parsed = match buf.with_contiguous_emacs_byte_range(unread, parse) {
+        let (parsed, key_ids) = match buf.with_contiguous_emacs_byte_range(unread, parse) {
             Some(parsed) => parsed,
             None => parse(
                 buf.buffer_substring_lisp_string_no_properties_range(unread)
                     .as_bytes(),
             ),
         };
+        host.ensure_interned_global_ids(&key_ids);
         let (value, consumed) = parsed?;
         (value, point_base.add_len(EmacsByteLen::new(consumed)))
     };

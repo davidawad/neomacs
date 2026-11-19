@@ -275,6 +275,53 @@ fn json_parse_buffer_reads_text_on_both_sides_of_the_gap() {
     );
 }
 
+/// Object keys parsed as alist symbols or plist keywords are obarray
+/// members, as GNU's `intern_c_multibyte` leaves them: `intern-soft` finds
+/// them, and after `unintern` the next parse interns a fresh symbol. The
+/// expected results are GNU 31.1's.
+#[test]
+fn json_object_keys_are_obarray_members() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::test_utils::new_context();
+    let mut eval_str =
+        |form: &str| neovm_eval::emacs_core::print::format_eval_result(&eval.eval_str(form));
+    assert_eq!(
+        eval_str(
+            r#"(list (progn (json-parse-string "{\"jm-fresh-alist-key\":1}" :object-type 'alist)
+                            (intern-soft "jm-fresh-alist-key"))
+                     (progn (json-parse-string "{\"jm-fresh-plist-key\":1}" :object-type 'plist)
+                            (intern-soft ":jm-fresh-plist-key"))
+                     (progn (condition-case nil
+                                (json-parse-string "{\"jm-before-error\":1,}" :object-type 'alist)
+                              (json-parse-error nil))
+                            (intern-soft "jm-before-error"))
+                     (progn
+                       (erase-buffer)
+                       (insert "{\"jm-buffer-key\":1}")
+                       (goto-char (point-min))
+                       (json-parse-buffer :object-type 'alist)
+                       (intern-soft "jm-buffer-key")))"#
+        ),
+        "OK (jm-fresh-alist-key :jm-fresh-plist-key jm-before-error jm-buffer-key)"
+    );
+    assert_eq!(
+        eval_str(
+            r#"(let* ((parse (lambda (type)
+                               (let ((v (json-parse-string "{\"jm-key\":1}" :object-type type)))
+                                 (if (eq type 'alist) (car (car v)) (car v)))))
+                      (a (funcall parse 'alist))
+                      (ka (funcall parse 'plist)))
+                 (unintern "jm-key" obarray)
+                 (unintern ":jm-key" obarray)
+                 (let ((b (funcall parse 'alist))
+                       (kb (funcall parse 'plist)))
+                   (list (eq a b) (eq b (intern-soft "jm-key"))
+                         (eq ka kb) (eq kb (intern-soft ":jm-key")))))"#
+        ),
+        "OK (nil t nil t)"
+    );
+}
+
 #[test]
 fn json_insert_writes_at_point_and_advances() {
     crate::test_utils::init_test_tracing();
