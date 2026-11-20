@@ -34,7 +34,7 @@ pub(super) struct ObservedEnvelope {
     // Vector/Record eligibility is also cached at live publication. Native
     // slot stores use these bounds independently of observed Cons addresses.
     slot_addresses: Vec<usize>,
-    epoch: Option<u64>,
+    epoch: u64,
     // Global cleared-mark count acquired before the last full validation.
     validated_reclaimed: u64,
     dump: BarrierWindow,
@@ -78,6 +78,8 @@ const _: () = {
         single_cons: usize,
         #[cfg(any(test, feature = "test-support"))]
         geometry_rebuilds: usize,
+        #[cfg(any(test, feature = "test-support"))]
+        validated_identities: usize,
     }
     assert!(size_of::<ObservedEnvelope>() == size_of::<LegacyEnvelope>());
     assert!(align_of::<ObservedEnvelope>() == align_of::<LegacyEnvelope>());
@@ -98,7 +100,7 @@ impl ObservedEnvelope {
             owners: FxHashSet::default(),
             addresses: Vec::new(),
             slot_addresses: Vec::new(),
-            epoch: Some(collection_observation_epoch()),
+            epoch: collection_observation_epoch(),
             validated_reclaimed: reclaimed_collection_observation_count(),
             dump: BarrierWindow::NONE,
             full: EMPTY_BOUNDS,
@@ -120,7 +122,7 @@ impl ObservedEnvelope {
     /// observer never initializes this ledger merely to reject an empty gate.
     pub(super) fn refresh(&mut self, dump: BarrierWindow) -> bool {
         let epoch = collection_observation_epoch();
-        if self.epoch == Some(epoch) {
+        if self.epoch == epoch {
             if self.dump == dump {
                 return false;
             }
@@ -145,7 +147,7 @@ impl ObservedEnvelope {
         let reclaimed = reclaimed_collection_observation_count();
         let debt = reclaimed.wrapping_sub(self.validated_reclaimed);
         if debt.saturating_mul(PRUNE_DEBT_RATIO) < self.owners.len() as u64 {
-            self.epoch = Some(collection_observation_epoch());
+            self.epoch = collection_observation_epoch();
             if self.dump != dump {
                 self.rebuild(dump);
                 return true;
@@ -163,7 +165,7 @@ impl ObservedEnvelope {
         self.owners
             .retain(|&bits| collection_observed_metadata(bits));
         self.validated_reclaimed = reclaimed;
-        self.epoch = Some(epoch);
+        self.epoch = epoch;
         // Other heaps share the reclamation epoch. Keep the ordered buffers
         // and bounds when none of this ledger's identities died; an unrelated
         // sweep must not rebuild this ledger.
@@ -234,7 +236,7 @@ impl ObservedEnvelope {
     /// before reuse/resumption; this Acquire check rejects every such change.
     #[inline]
     pub(super) fn already_published(&self, bits: usize) -> bool {
-        self.epoch == Some(collection_observation_epoch())
+        self.epoch == collection_observation_epoch()
             && self.owners.contains(&bits)
             && collection_observed_metadata(bits)
     }
@@ -242,7 +244,7 @@ impl ObservedEnvelope {
     /// Compare with an epoch already acquired by the current pointer read.
     /// That read contains no callback or safepoint before its State borrow.
     pub(super) fn was_refreshed_at(&self, epoch: u64) -> bool {
-        self.epoch == Some(epoch)
+        self.epoch == epoch
     }
 
     pub(super) fn full_bounds(&self) -> (usize, usize) {
