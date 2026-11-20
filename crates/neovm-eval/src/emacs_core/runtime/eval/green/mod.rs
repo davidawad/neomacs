@@ -154,6 +154,8 @@ impl GreenRuntime {
 /// the existing ordinary thread implementation and never issues a Baton.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GreenAdmissionRefusal {
+    ThreadAffineHost,
+    GcInhibited,
     NativeReadinessUnavailable {
         cause: crate::host_effect::wake::NativeReadinessCause,
     },
@@ -204,6 +206,12 @@ pub(crate) enum SubrTables {
 impl Context {
     #[cold]
     pub(crate) fn green_admission_readiness(&self) -> Result<(), GreenAdmissionRefusal> {
+        if self.display_host.is_some() || self.input_rx.as_ref().is_some() {
+            return Err(GreenAdmissionRefusal::ThreadAffineHost);
+        }
+        if self.gc_inhibit_depth != 0 {
+            return Err(GreenAdmissionRefusal::GcInhibited);
+        }
         self.processes.green_native_readiness().map_err(|cause| {
             self.processes.observe_green_admission_refusal(|cause| {
                 let refusal = GreenAdmissionRefusal::NativeReadinessUnavailable { cause };

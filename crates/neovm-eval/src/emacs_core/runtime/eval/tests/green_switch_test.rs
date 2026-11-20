@@ -1760,6 +1760,87 @@ fn failed_native_registration_refuses_green_without_refusing_lisp_threads() {
 }
 
 #[test]
+fn attached_input_host_refuses_green_without_refusing_lisp_threads() {
+    let mut context = green();
+    let (_sender, receiver) = crossbeam_channel::unbounded();
+    context.attach_input_receiver(
+        crate::emacs_core::eval::host_input::HostInputReceiver::from_receiver(receiver),
+    );
+    assert_eq!(
+        context.green_admission_readiness(),
+        Err(super::GreenAdmissionRefusal::ThreadAffineHost)
+    );
+    assert!(!super::green_world(&context));
+    assert_eq!(
+        eval(
+            &mut context,
+            "(let ((worker (make-thread (lambda () 42)))) (list (threadp worker) (thread-join worker)))"
+        ),
+        "(t 42)"
+    );
+    assert!(!context.green_threads_running());
+    assert!(!context.threads_admitted());
+}
+
+struct AdmissionDisplayHost;
+
+impl crate::emacs_core::eval::DisplayHost for AdmissionDisplayHost {
+    fn realize_gui_frame(
+        &mut self,
+        _request: crate::emacs_core::eval::GuiFrameHostRequest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resize_gui_frame(
+        &mut self,
+        _request: crate::emacs_core::eval::GuiFrameHostRequest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn attached_display_host_refuses_green_without_refusing_lisp_threads() {
+    let mut context = green();
+    context.set_display_host(Box::new(AdmissionDisplayHost));
+    assert_eq!(
+        context.green_admission_readiness(),
+        Err(super::GreenAdmissionRefusal::ThreadAffineHost)
+    );
+    assert!(!super::green_world(&context));
+    assert_eq!(
+        eval(
+            &mut context,
+            "(let ((worker (make-thread (lambda () 42)))) (list (threadp worker) (thread-join worker)))"
+        ),
+        "(t 42)"
+    );
+    assert!(!context.green_threads_running());
+    assert!(!context.threads_admitted());
+}
+
+#[test]
+fn gc_inhibited_refuses_green_without_refusing_lisp_threads() {
+    let mut context = green();
+    context.set_gc_inhibit_depth_for_test(1);
+    assert_eq!(
+        context.green_admission_readiness(),
+        Err(super::GreenAdmissionRefusal::GcInhibited)
+    );
+    assert!(!super::green_world(&context));
+    assert_eq!(
+        eval(
+            &mut context,
+            "(let ((worker (make-thread (lambda () 42)))) (list (threadp worker) (thread-join worker)))"
+        ),
+        "(t 42)"
+    );
+    assert!(!context.green_threads_running());
+    assert!(!context.threads_admitted());
+}
+
+#[test]
 fn native_admission_refusal_trace_records_each_cause_once_and_no_healthy_event() {
     use crate::host_effect::wake::NativeReadinessCause;
     use std::sync::{Arc, Mutex};
