@@ -707,6 +707,13 @@ const TLS_CLASSIFICATION: &[(&str, &str, TlsClass)] = &[
         "LAST_KNOWN_COLUMN",
         TlsClass::MustReset,
     ),
+    // The cache stores candidate bytes and survivor indices only, then
+    // verifies that candidate text before reuse; it contains no Lisp Values.
+    (
+        "neovm-eval/src/emacs_core/runtime/eval/data/minibuffer_entry.rs",
+        "LAST_NARROWING",
+        TlsClass::CarrierIntrinsic,
+    ),
     (
         "neovm-value/src/symbol/leaf_activity.rs",
         "LEAF_ACTIVE",
