@@ -1680,7 +1680,9 @@ fn test_pattern_max_match_chars() {
 /// A short search leaves it unbuilt and still finds the match.
 #[test]
 fn prefilter_is_built_by_the_first_long_forward_search() {
-    let cp = regex_compile("unread-command-events", false, false).expect("compile");
+    // An empty group keeps this from taking the whole-literal path; this test
+    // specifically pins the lazy prefilter's long-span build policy.
+    let cp = regex_compile(r"\(\)unread-command-events", false, false).expect("compile");
     assert!(
         cp.prefilter.get().is_none(),
         "compiling builds no prefilter"

@@ -367,7 +367,7 @@ fn casefold_candidate_entries_drop_to_literal_hits() {
         });
         (found.map(|(pos, _)| pos), matcher_entry_count() - before)
     };
-    let cp = regex_compile("(defun x", false, true).expect("compile");
+    let cp = regex_compile(r"\(\)(defun x", false, true).expect("compile");
     build_search_optimizations(&cp);
     assert!(cp.literal_prefilter().is_some());
     assert_eq!(
@@ -376,7 +376,7 @@ fn casefold_candidate_entries_drop_to_literal_hits() {
         "prefilter: the two `(defun` spellings"
     );
 
-    let mut memchr_only = regex_compile("(defun x", false, true).expect("compile");
+    let mut memchr_only = regex_compile(r"\(\)(defun x", false, true).expect("compile");
     memchr_only.prefilter = std::cell::OnceCell::from(None);
     build_search_optimizations(&memchr_only);
     assert_eq!(

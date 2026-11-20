@@ -9020,6 +9020,8 @@ fn apply_fusion(bytecode: &mut [u8], p: usize, run: &FusibleRun) {
 #[cfg_attr(feature = "test-support", visibility::make(pub))]
 pub(crate) fn recompute_fastmap(pattern: &mut CompiledPattern, syntax: &dyn SyntaxLookup) {
     compile_fastmap(pattern, syntax);
+    pattern.prefilter.take();
+    pattern.whole_literal = whole_literal::WholeLiteral::derive(pattern);
 }
 
 /// Translated from GNU regex-emacs.c `re_compile_fastmap` /
