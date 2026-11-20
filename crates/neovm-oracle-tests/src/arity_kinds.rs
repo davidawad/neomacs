@@ -158,12 +158,17 @@ fn arity_byte_code_across_jit_tiers_too_few_and_too_many() {
                  (condition-case e (arity-kind-hot 1 2 3) (error e))))",
         &[
             &[("NEOVM_JIT", "0")],
-            &[],
-            &[("NEOVM_JIT", "1"), ("NEOVM_JIT_THRESHOLD", "1")],
+            &[("NEOVM_JIT_BG", "sync")],
+            &[
+                ("NEOVM_JIT", "1"),
+                ("NEOVM_JIT_THRESHOLD", "1"),
+                ("NEOVM_JIT_BG", "sync"),
+            ],
             &[
                 ("NEOVM_JIT", "1"),
                 ("NEOVM_JIT_THRESHOLD", "1"),
                 ("NEOVM_JIT_FORCE_DEOPT", "1"),
+                ("NEOVM_JIT_BG", "sync"),
             ],
         ],
         expect,
