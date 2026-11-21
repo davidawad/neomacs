@@ -7009,7 +7009,10 @@ impl Context {
     pub fn assign_setq_dynamic_by_id(&mut self, sym_id: SymId, value: Value) -> EvalResult {
         // A Parallel thread's dynamic `setq` writes shared state: attached.
         #[cfg(feature = "shared-heap")]
-        if neovm_value::detached::is_detached() {
+        if neovm_value::detached::is_detached()
+            && !(self.has_owner_dynamic_binding_by_id(sym_id)
+                && !self.watchers.has_watchers(sym_id))
+        {
             return self.with_parallel_attach(neovm_value::detached::AttachReason::Class, |ctx| {
                 ctx.assign_setq_dynamic_by_id(sym_id, value)
             });
@@ -7114,6 +7117,21 @@ impl Context {
                 .iter()
                 .rev()
                 .any(|entry| matches!(entry, SpecBinding::Let { sym_id: s, .. } if *s == sym_id))
+    }
+
+    /// Whether SYM_ID has an owner-slab dynamic binding on this specpdl.
+    /// Such a `setq` stays on the owner slab; a watched binding keeps the
+    /// ordinary attached writer path so its callback runs with the Baton.
+    #[inline]
+    fn has_owner_dynamic_binding_by_id(&self, sym_id: SymId) -> bool {
+        self.specpdl.iter().rev().any(|entry| {
+            matches!(
+                entry,
+                SpecBinding::NativeUnwind {
+                    action: NativeUnwindAction::OwnerBinding(binding)
+                } if binding.symbol() == sym_id
+            )
+        })
     }
 
     #[doc(hidden)]

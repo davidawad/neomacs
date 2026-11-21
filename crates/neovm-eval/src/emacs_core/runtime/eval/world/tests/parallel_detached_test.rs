@@ -173,20 +173,24 @@ const DOTIMES: &str = "(defalias 'tpd-dotimes
 /// `tpd-interp-loop` for ITERATIONS: one `let` of a lexical local per
 /// iteration (the `dotimes` expansion), `setq` of lexical locals and
 /// fixnum arithmetic. Returns the growth of the attach counters.
-fn interpreted_loop_attaches(ev: &mut Context, iterations: i64) -> ParallelStats {
+fn interpreted_loop_attaches(
+    ev: &mut Context,
+    function: &str,
+    iterations: i64,
+    expected: i64,
+) -> ParallelStats {
     // The lock exists once the first thread started the Parallel runtime.
     let before = ev.parallel_lock().map(BatonLock::stats).unwrap_or_default();
-    let serial = numeric_loop(iterations);
     assert_eq!(
         eval(
             ev,
             &format!(
-                "(let ((a (make-thread (lambda () (tpd-interp-loop {iterations}))))
-                       (b (make-thread (lambda () (tpd-interp-loop {iterations})))))
+                "(let ((a (make-thread (lambda () ({function} {iterations}))))
+                       (b (make-thread (lambda () ({function} {iterations})))))
                    (list (thread-join a) (thread-join b)))"
             )
         ),
-        format!("({serial} {serial})")
+        format!("({expected} {expected})")
     );
     let after = stats(ev);
     ParallelStats {
@@ -216,8 +220,8 @@ fn an_interpreted_dotimes_loop_attaches_a_constant_number_of_times() {
                      (setq s (logand (+ s (* i i)) #xffffff)))
                    s)))",
     );
-    let small = interpreted_loop_attaches(&mut ev, 1_000);
-    let large = interpreted_loop_attaches(&mut ev, 10_000);
+    let small = interpreted_loop_attaches(&mut ev, "tpd-interp-loop", 1_000, numeric_loop(1_000));
+    let large = interpreted_loop_attaches(&mut ev, "tpd-interp-loop", 10_000, numeric_loop(10_000));
     println!("attaches for 2 x 1000 iterations: {small:?}");
     println!("attaches for 2 x 10000 iterations: {large:?}");
     // Thread start, join and end attach a fixed number of times; one
@@ -233,6 +237,50 @@ fn an_interpreted_dotimes_loop_attaches_a_constant_number_of_times() {
     assert!(
         work(&large) <= work(&small) + 16,
         "attaches grow with the iteration count: {small:?} then {large:?}"
+    );
+}
+
+/// Dynamic binding uses symbol cells instead of lexical environment conses,
+/// but a worker's private bindings must remain detached as it reads and sets
+/// them in the same interpreted loop.
+#[test]
+fn an_interpreted_dynamic_dotimes_loop_attaches_a_constant_number_of_times() {
+    let mut ev = parallel();
+    ev.set_lexical_binding(false);
+    assert_eq!(eval(&mut ev, DOTIMES), "tpd-dotimes");
+    eval(
+        &mut ev,
+        "(fset 'tpd-dynamic-loop
+               (lambda (n)
+                 (let ((s 0))
+                   (tpd-dotimes (i n)
+                     (setq s (+ s (logand i 7))))
+                   s)))",
+    );
+    let small = interpreted_loop_attaches(&mut ev, "tpd-dynamic-loop", 1_000, 3_500);
+    let large = interpreted_loop_attaches(&mut ev, "tpd-dynamic-loop", 100_000, 350_000);
+    println!("dynamic attaches for 2 x 1000 iterations: {small:?}");
+    println!("dynamic attaches for 2 x 100000 iterations: {large:?}");
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(let ((a (make-thread (lambda () (tpd-dynamic-loop 10000))))
+                   (b (make-thread (lambda () (tpd-dynamic-loop 10000)))))
+               (list (thread-join a) (thread-join b)))"
+        ),
+        "(35000 35000)"
+    );
+    assert!(
+        large.attach_count < 64,
+        "dynamic bindings attach per iteration: {large:?}"
+    );
+    assert!(
+        large.attach_count <= small.attach_count + 16,
+        "dynamic binding attachments grow with iterations: {small:?} then {large:?}"
+    );
+    assert!(
+        large.detached_ns > small.detached_ns.saturating_mul(4),
+        "dynamic loop work stayed attached instead of scaling in detached time: {small:?} then {large:?}"
     );
 }
 

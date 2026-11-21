@@ -524,7 +524,36 @@ impl Context {
             lock.count_attach(AttachReason::Class);
             self.parallel_seat_baton(lock.attach().into_baton());
             lock.body_attached();
+            if self.project_plain_dynamic_binding(sym) {
+                // A newly encountered plain variable can be made owner-local
+                // while the Baton protects the obarray redirect. Future
+                // reads and bindings then use this owner's slab and the
+                // worker can stay detached for the binding's whole extent.
+                self.parallel_unpin_after_unbind();
+            }
         }
+    }
+
+    /// Project a bindable plain cell the first time a detached worker binds
+    /// it. Symbols excluded from admission, such as constants, keep the
+    /// attached shared-cell behavior.
+    fn project_plain_dynamic_binding(&mut self, sym: SymId) -> bool {
+        if let Some(symbol) = self.obarray.get_by_id(sym) {
+            if symbol.trapped_write() == neovm_value::symbol::SymbolTrappedWrite::NoWrite
+                || !matches!(
+                    symbol.value_cell(),
+                    neovm_value::symbol::ValueCell::Plain(_)
+                )
+            {
+                return false;
+            }
+        }
+
+        if self.reserve_thread_projections(1).is_err() {
+            return false;
+        }
+        self.project_admitted_cells(&[(sym, neovm_value::symbol::AdmissionPlanCell::Owned)]);
+        true
     }
 
     /// The bindings unwound: a thread pinned below them detaches again.
