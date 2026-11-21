@@ -689,7 +689,13 @@ impl Context {
             ParkRequest::Ordinary(wait) => {
                 #[cfg(feature = "shared-heap")]
                 let outcome = match parallel.as_deref() {
-                    Some(lock) => control.transfer_parallel(lock, key, wait, baton),
+                    Some(lock) => control.transfer_parallel(
+                        lock,
+                        key,
+                        wait,
+                        baton,
+                        self.display_host.is_some() || self.input_rx.as_ref().is_some(),
+                    ),
                     None => control.transfer(key, wait, baton, receiver.as_channel()),
                 };
                 #[cfg(not(feature = "shared-heap"))]

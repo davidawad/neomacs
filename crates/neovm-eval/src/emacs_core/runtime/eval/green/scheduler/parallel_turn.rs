@@ -38,6 +38,7 @@ impl Control {
         me: ThreadKey,
         wait: Wait,
         baton: Baton,
+        service_host_events: bool,
     ) -> Result<Wake, Handoff> {
         if matches!(wait, Wait::HostRequest(_)) {
             let invariant = Self::verify_invariants(&self.state());
@@ -95,7 +96,7 @@ impl Control {
             lock.yield_baton(baton, peer_runnable)
         } else {
             lock.detach(baton);
-            self.await_parallel_wake(me);
+            self.await_parallel_wake(me, service_host_events);
             lock.attach().into_baton()
         };
         self.parallel_resumed(me);
@@ -104,7 +105,7 @@ impl Control {
 
     /// Block, detached, until ME's wait is over: another thread woke it, or
     /// its `Select` deadline passed or its selector reported activity.
-    fn await_parallel_wake(&self, me: ThreadKey) {
+    fn await_parallel_wake(&self, me: ThreadKey, service_host_events: bool) {
         let select = self.select.get().and_then(Option::as_ref).copied();
         let mut state = self.state();
         loop {
@@ -129,7 +130,7 @@ impl Control {
                     })
                 }
                 Some(Wait::Join(_) | Wait::Mutex(_) | Wait::Condition(_))
-                    if me == ThreadKey::Main => Some(OWNER_SERVICE_POLL),
+                    if me == ThreadKey::Main && service_host_events => Some(OWNER_SERVICE_POLL),
                 Some(Wait::Join(_) | Wait::Mutex(_) | Wait::Condition(_)) => None,
                 // Only this owner ends or removes its own record, and host
                 // waits never detach.
@@ -143,6 +144,7 @@ impl Control {
                     state = next;
                     if result.timed_out()
                         && me == ThreadKey::Main
+                        && service_host_events
                         && matches!(waiting, Some(Wait::Join(_) | Wait::Mutex(_) | Wait::Condition(_)))
                         && state.waits.get(&me).copied() == waiting
                     {
