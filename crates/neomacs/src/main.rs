@@ -6111,7 +6111,7 @@ fn bootstrap_gui_startup_terminal(eval: &mut Context) -> FrameId {
 
 fn configure_gnu_startup_state(eval: &mut Context, frame_id: FrameId, startup: &StartupOptions) {
     #[cfg(feature = "shared-heap")]
-    eval.eval_str("(provide 'neomacs-shared-heap)")
+    eval.eval_str("(provide (intern \"neomacs-shared-heap\"))")
         .expect("the shared-heap feature is advertised after host startup");
     // Doom and similar configs deliberately raise `gc-cons-threshold` during
     // startup. Keep the measured arena-fragmentation ceiling active through
