@@ -217,6 +217,62 @@ fn eval_with_gui_frame(src: &str) -> Vec<String> {
     )
 }
 
+#[test]
+fn recenter_negative_argument_is_noop_when_window_has_no_text_rows() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new(crate::test_utils::unit_runtime());
+    ev.set_variable("noninteractive", Value::NIL);
+    let buffer = ev.edit.buffers.create_buffer("*recenter-empty-window*");
+    ev.edit.buffers.set_current(buffer);
+    ev.edit
+        .buffers
+        .get_mut(buffer)
+        .expect("recenter buffer")
+        .insert("one\ntwo\nthree\n");
+    let frame_id = ev
+        .frame_manager_mut()
+        .create_frame("recenter-empty-window", 800, 600, buffer);
+    let window_id = ev
+        .frame_manager()
+        .get(frame_id)
+        .expect("frame")
+        .selected_window;
+    {
+        let frame = ev.frame_manager_mut().get_mut(frame_id).expect("frame");
+        frame.initial = false;
+        frame.set_window_system(Some(Value::symbol("neo")));
+        frame
+            .root_window_mut()
+            .set_bounds(crate::window::Rect::new(0.0, 0.0, 800.0, 0.0));
+    }
+    ev.install_window_layout_query(|_eval, _frame_id, _window_id, _scope| {
+        crate::window::WindowLayoutQueryOutcome::Ready(crate::window::WindowLayoutQuery::new(
+            LispCharPos1::new(1),
+            Some(crate::window::WindowDisplaySnapshot::default()),
+        ))
+    })
+    .expect("install the empty-row layout query");
+
+    let start_before = ev
+        .frame_manager()
+        .get(frame_id)
+        .and_then(|frame| frame.find_window(window_id))
+        .and_then(crate::window::Window::window_start)
+        .expect("selected leaf window");
+    super::builtin_recenter(&mut ev, vec![Value::fixnum(-1)])
+        .expect("recenter with no text rows is a no-op");
+    let start_after = ev
+        .frame_manager()
+        .get(frame_id)
+        .and_then(|frame| frame.find_window(window_id))
+        .and_then(crate::window::Window::window_start)
+        .expect("selected leaf window");
+    assert_eq!(
+        start_after, start_before,
+        "recenter must preserve window-start"
+    );
+}
+
 fn publish_selected_gui_window_regions(
     ev: &mut Context,
     fid: crate::window::FrameId,

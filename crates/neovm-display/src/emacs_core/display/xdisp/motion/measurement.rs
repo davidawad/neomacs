@@ -174,7 +174,12 @@ pub(super) fn resolve(
         // geometrically only when the measured rows prove the region too short.
         let rows = snapshot_text_rows(&snapshot);
         if rows.is_empty() {
-            return Err(failed("Display motion measurement has no source rows"));
+            // A window with no text rows has nowhere to move the point. GNU's
+            // vertical-motion leaves it at its origin in this case.
+            return Ok(Some(MeasuredMotion {
+                target: request.origin,
+                moved: 0,
+            }));
         }
         let incomplete_eob_tail = request.rows > 0
             && request.goal_column.is_none()

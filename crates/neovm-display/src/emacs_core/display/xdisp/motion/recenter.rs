@@ -146,7 +146,8 @@ fn measure(
         let accessible = source.accessible_char_region();
         let rows = snapshot_text_rows(&snapshot);
         if rows.is_empty() {
-            return Err(failure("Recenter measurement has no source rows"));
+            // GNU recenter is a no-op when the window has no text rows.
+            return Ok(Some(RecenterTarget::Keep));
         }
         if let Some(anchor) = rows
             .iter()

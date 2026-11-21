@@ -53,6 +53,13 @@ pub(crate) fn backward_extent(
             })?
             .accessible_char_region();
         let rows = snapshot_text_rows(&snapshot);
+        if rows.is_empty() {
+            return Ok(Some(BackwardPixelExtent {
+                start: origin,
+                width: 0,
+                height: 0,
+            }));
+        }
         // A continuation boundary can also be the preceding row's end. The
         // row starting at the anchor owns its y, not the preceding row.
         let anchor = rows
@@ -81,9 +88,7 @@ pub(crate) fn backward_extent(
                 start,
                 count,
             );
-        } else if rows.is_empty()
-            || rows.last().and_then(|row| row.end_buffer_pos) == Some(accessible.end_lisp())
-        {
+        } else if rows.last().and_then(|row| row.end_buffer_pos) == Some(accessible.end_lisp()) {
             return Err(signal(
                 LispCondition::Error,
                 vec![Value::string(
