@@ -215,7 +215,7 @@ impl CarrierPool {
     /// An exited carrier must not remain in either count. After a round of
     /// joins the only residents are the idle carriers, at most
     /// [`MAX_IDLE_CARRIERS`], plus any job still in flight.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn counts_for_test(&self) -> (usize, usize) {
         let inner = self.shared.lock();
         let handles = inner
