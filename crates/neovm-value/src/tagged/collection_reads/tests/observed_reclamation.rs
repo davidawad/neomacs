@@ -11,6 +11,16 @@ use crate::tagged::gc::{
 };
 use crate::tagged::value::TaggedValue;
 
+impl super::ObservedEnvelope {
+    pub(crate) fn validated_identities_for_test(&self) -> usize {
+        self.validated_identities
+    }
+
+    pub(crate) fn owner_count_for_test(&self) -> usize {
+        self.owners.len()
+    }
+}
+
 struct ObservedMode;
 
 impl Drop for ObservedMode {

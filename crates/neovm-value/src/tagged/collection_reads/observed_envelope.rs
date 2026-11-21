@@ -256,16 +256,6 @@ impl ObservedEnvelope {
         self.geometry_rebuilds
     }
 
-    #[cfg(test)]
-    pub(super) fn validated_identities_for_test(&self) -> usize {
-        self.validated_identities
-    }
-
-    #[cfg(test)]
-    pub(super) fn owner_count_for_test(&self) -> usize {
-        self.owners.len()
-    }
-
     pub(super) fn ranges(&self) -> [BarrierWindow; 2] {
         [
             BarrierWindow::span(self.below.0, self.below.1),
