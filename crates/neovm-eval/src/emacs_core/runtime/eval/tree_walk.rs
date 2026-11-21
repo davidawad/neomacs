@@ -427,6 +427,8 @@ impl Context {
                             call.function,
                             first_arg,
                             nargs,
+                            func.as_subr_id()
+                                .or_else(|| original_fun.as_bare_symbol_id()),
                         );
                     }
                     EvalDispatch::Call(CallTarget::Bytecode) => {

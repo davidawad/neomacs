@@ -206,9 +206,6 @@ pub(crate) enum SubrTables {
 impl Context {
     #[cold]
     pub(crate) fn green_admission_readiness(&self) -> Result<(), GreenAdmissionRefusal> {
-        if self.display_host.is_some() || self.input_rx.as_ref().is_some() {
-            return Err(GreenAdmissionRefusal::ThreadAffineHost);
-        }
         if self.gc_inhibit_depth != 0 {
             return Err(GreenAdmissionRefusal::GcInhibited);
         }
@@ -224,17 +221,13 @@ impl Context {
 
     /// Start this World's Green runtime from its first owner: admit
     /// threads, capture the bootstrap further owners are built from, and
-    /// issue the World's Baton to this thread. Refused unless the World is
-    /// Green, no display or input host is attached and
-    /// collection is not inhibited.
+    /// issue the World's Baton to this thread. Host-affine calls are guarded
+    /// at Lisp primitive dispatch; collection must not be inhibited.
     #[cold]
     #[inline(never)]
     pub(crate) fn start_green_runtime(&mut self) -> Result<super::world::Baton, GreenStartError> {
         if !self.threading_mode().uses_owner_threads() {
             return Err(GreenStartError::NotGreen);
-        }
-        if self.display_host.is_some() || self.input_rx.as_ref().is_some() {
-            return Err(GreenStartError::ThreadAffineHost);
         }
         if self.gc_inhibit_depth != 0 {
             return Err(GreenStartError::GcInhibited);

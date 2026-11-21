@@ -38,6 +38,37 @@ fn parallel() -> Context {
     world(ThreadingMode::Parallel)
 }
 
+struct ThreadAffineTestHost;
+
+impl crate::emacs_core::eval::DisplayHost for ThreadAffineTestHost {
+    fn realize_gui_frame(
+        &mut self,
+        _request: crate::emacs_core::eval::GuiFrameHostRequest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resize_gui_frame(
+        &mut self,
+        _request: crate::emacs_core::eval::GuiFrameHostRequest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn hosted_parallel_world_admits_pure_threads_and_rejects_worker_redisplay() {
+    let mut ev = parallel();
+    ev.set_display_host(Box::new(ThreadAffineTestHost));
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(list (thread-join (make-thread (lambda () (+ 20 22))))\n                 (thread-join (make-thread (lambda ()\n                                            (condition-case data\n                                                (redisplay)\n                                              (thread-affine-host-call data))))))"
+        ),
+        "(42 (thread-affine-host-call redisplay))"
+    );
+}
+
 #[test]
 fn attach_releases_the_baton_during_unwind() {
     let lock = Arc::new(lock());

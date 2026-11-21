@@ -469,7 +469,12 @@ impl Context {
             };
             self.bc_buf.push(value);
         }
-        match self.dispatch_subr_fn_from_bc_stack(call.function, first_arg, nargs) {
+        match self.dispatch_subr_fn_from_bc_stack(
+            call.function,
+            first_arg,
+            nargs,
+            func.as_subr_id(),
+        ) {
             Ok(value) => {
                 // `retire_cons_frame`'s trivial arm for an EVALD
                 // operand-stack span.
@@ -683,7 +688,12 @@ impl Context {
                     let (first_arg, nargs) =
                         self.ti_call_args_onto_stack(act, func, original_args, args)?;
                     self.set_backtrace_args_evalled_bc_span(outer_bt_count, first_arg, nargs);
-                    self.dispatch_subr_fn_from_bc_stack(call.function, first_arg, nargs)
+                    self.dispatch_subr_fn_from_bc_stack(
+                        call.function,
+                        first_arg,
+                        nargs,
+                        func.as_subr_id(),
+                    )
                 }
                 EvalDispatch::Call(CallTarget::Bytecode)
                 | EvalDispatch::Call(CallTarget::InterpretedClosure) => {

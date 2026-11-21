@@ -1760,17 +1760,16 @@ fn failed_native_registration_refuses_green_without_refusing_lisp_threads() {
 }
 
 #[test]
-fn attached_input_host_refuses_green_without_refusing_lisp_threads() {
+fn attached_input_host_is_not_a_thread_affinity_refusal() {
     let mut context = green();
     let (_sender, receiver) = crossbeam_channel::unbounded();
     context.attach_input_receiver(
         crate::emacs_core::eval::host_input::HostInputReceiver::from_receiver(receiver),
     );
-    assert_eq!(
+    assert_ne!(
         context.green_admission_readiness(),
         Err(super::GreenAdmissionRefusal::ThreadAffineHost)
     );
-    assert!(!super::green_world(&context));
     assert_eq!(
         eval(
             &mut context,
@@ -1778,8 +1777,6 @@ fn attached_input_host_refuses_green_without_refusing_lisp_threads() {
         ),
         "(t 42)"
     );
-    assert!(!context.green_threads_running());
-    assert!(!context.threads_admitted());
 }
 
 struct AdmissionDisplayHost;
@@ -1801,14 +1798,13 @@ impl crate::emacs_core::eval::DisplayHost for AdmissionDisplayHost {
 }
 
 #[test]
-fn attached_display_host_refuses_green_without_refusing_lisp_threads() {
+fn attached_display_host_is_not_a_thread_affinity_refusal() {
     let mut context = green();
     context.set_display_host(Box::new(AdmissionDisplayHost));
-    assert_eq!(
+    assert_ne!(
         context.green_admission_readiness(),
         Err(super::GreenAdmissionRefusal::ThreadAffineHost)
     );
-    assert!(!super::green_world(&context));
     assert_eq!(
         eval(
             &mut context,
@@ -1816,8 +1812,6 @@ fn attached_display_host_refuses_green_without_refusing_lisp_threads() {
         ),
         "(t 42)"
     );
-    assert!(!context.green_threads_running());
-    assert!(!context.threads_admitted());
 }
 
 #[test]

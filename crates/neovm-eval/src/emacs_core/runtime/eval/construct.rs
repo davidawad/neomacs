@@ -1613,6 +1613,23 @@ impl Context {
 
         // Initialize the standard error hierarchy (error, user-error, etc.)
         neovm_value::errors::init_standard_errors(obarray);
+        obarray
+            .put_property(
+                "thread-affine-host-call",
+                "error-conditions",
+                Value::list(vec![
+                    Value::symbol("thread-affine-host-call"),
+                    Value::symbol("error"),
+                ]),
+            )
+            .expect("thread-affine-host-call condition plist should be valid during init");
+        obarray
+            .put_property(
+                "thread-affine-host-call",
+                "error-message",
+                Value::string("Host-affine call from a worker thread"),
+            )
+            .expect("thread-affine-host-call message plist should be valid during init");
 
         // Initialize indentation variables (tab-width, indent-tabs-mode, etc.)
         neovm_edit::emacs_core::indent::init_indent_vars(obarray);

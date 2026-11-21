@@ -3798,7 +3798,18 @@ impl Context {
         function: crate::emacs_core::eval::subr_abi::SubrFn,
         args_start: usize,
         nargs: usize,
+        sym_id: Option<SymId>,
     ) -> EvalResult {
+        if self.threading_mode() == super::admission::ThreadingMode::Parallel
+            && self.threads.current_thread_id() != 0
+            && sym_id.is_some_and(is_host_affine_primitive)
+        {
+            let sym_id = sym_id.expect("the host-affine predicate requires a symbol id");
+            return Err(signal(
+                "thread-affine-host-call",
+                vec![Value::from_sym_id(sym_id)],
+            ));
+        }
         // A Parallel World's detached thread attaches for a World-class
         // primitive (`world::parallel_classify`).
         #[cfg(feature = "shared-heap")]
@@ -3807,7 +3818,7 @@ impl Context {
             &self.bc_buf[args_start..args_start + nargs],
         ) {
             return self.with_parallel_attach(reason, |ctx| {
-                ctx.dispatch_subr_fn_from_bc_stack(function, args_start, nargs)
+                ctx.dispatch_subr_fn_from_bc_stack(function, args_start, nargs, sym_id)
             });
         }
         match function {
@@ -4071,6 +4082,15 @@ impl Context {
         args: &[Value],
         entry: SubrEntry,
     ) -> EvalResult {
+        if self.threading_mode() == super::admission::ThreadingMode::Parallel
+            && self.threads.current_thread_id() != 0
+            && is_host_affine_primitive(sym_id)
+        {
+            return Err(signal(
+                "thread-affine-host-call",
+                vec![Value::from_sym_id(sym_id)],
+            ));
+        }
         if entry.dispatch_kind == SubrDispatchKind::SpecialForm {
             return Err(signal(LispCondition::InvalidFunction, vec![function]));
         }
@@ -4697,6 +4717,35 @@ impl Context {
     pub fn bind_lexical_value_rooted(&mut self, sym: SymId, value: Value) {
         bind_lexical_value_rooted_in_specpdl(&mut self.lexenv, &mut self.specpdl, sym, value);
     }
+}
+
+/// Lisp entry points that can consult or mutate state owned by the editor's
+/// display/input thread. Parallel worker owners may run pure Lisp, but these
+/// calls must be rejected before their native implementation can inspect a
+/// worker-local frame table or invoke a host callback.
+fn is_host_affine_primitive(sym_id: SymId) -> bool {
+    let name = neovm_value::intern::resolve_sym(sym_id);
+    name == "redisplay"
+        || name.starts_with("redisplay-")
+        || name.starts_with("frame-")
+        || name.starts_with("window-")
+        || name.starts_with("process-")
+        || matches!(
+            name,
+            "selected-frame"
+                | "selected-window"
+                | "next-event"
+                | "read-event"
+                | "read-char"
+                | "read-key-sequence"
+                | "read-key-sequence-vector"
+                | "discard-input"
+                | "input-pending-p"
+                | "sit-for"
+                | "sleep-for"
+                | "accept-process-output"
+                | "force-window-update"
+        )
 }
 
 /// Formal binding owns its policy source so dynamic binding and the next
