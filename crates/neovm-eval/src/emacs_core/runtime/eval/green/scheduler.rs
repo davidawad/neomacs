@@ -1136,6 +1136,7 @@ struct ControlState {
     senders: BTreeMap<ThreadKey, mpsc::SyncSender<Wake>>,
     waits: WaitMap,
     ready: ReadyQueue,
+    owner_service_wakes: BTreeSet<ThreadKey>,
     closing: bool,
     physical: BTreeMap<ThreadKey, OwnerLocation>,
     services: BTreeMap<HostRequestKey, ServiceMetadata>,
@@ -1286,6 +1287,13 @@ impl std::fmt::Debug for Control {
 }
 
 impl Control {
+    /// Consume a synthetic owner wake published by the parallel wait loop.
+    /// The wake only gives Main a chance to run its event service; it does not
+    /// satisfy the Lisp wait predicate (join, mutex, or condition).
+    pub(crate) fn take_owner_service_wake(&self, key: ThreadKey) -> bool {
+        self.state().owner_service_wakes.remove(&key)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_main_native_event_for_test(&self, event: MainNativeWaitEvent) {
         self.main_native_events.lock().unwrap().push(event);

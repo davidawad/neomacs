@@ -47,6 +47,10 @@ pub(crate) use parallel_thread::PANIC_NEXT_BODY;
 pub(crate) static SELECT_PARKS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+static OWNER_SERVICE_WAKES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// A failed GNU binding exchange, kept as allocation-free metadata until delivery.
 #[derive(Clone, Copy, Debug)]
 enum BindingResumeError {
@@ -868,7 +872,46 @@ impl Context {
             return Ok(());
         };
         self.green_park(wait)?;
+        self.green_service_owner_wait()?;
         self.green_raise_pending_signal(key)
+    }
+
+    /// Run one ready owner event-service turn after a synthetic parallel wait
+    /// wake. Worker owners never call the host event loop.
+    pub(crate) fn green_service_owner_wait(&mut self) -> Result<bool, Flow> {
+        let Some(key) = self.green_key() else {
+            return Ok(false);
+        };
+        let control = self
+            .green_seat()
+            .map(|seat| std::sync::Arc::clone(&seat.control));
+        let Some(control) = control else {
+            return Ok(false);
+        };
+        let synthetic_wake = control.take_owner_service_wake(key);
+        #[cfg(test)]
+        if synthetic_wake {
+            OWNER_SERVICE_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if key == ThreadKey::Main
+            && (self.display_host.is_some() || self.input_rx.as_ref().is_some())
+        {
+            // The eval crate's unit runtime deliberately has no core timer,
+            // input, or redisplay implementation. Core integration tests and
+            // production builds install these hooks; the eval unit test only
+            // verifies that the hosted Main owner receives periodic turns.
+            #[cfg(not(test))]
+            crate::emacs_core::eval::hooks_proof::wait::service_read_char_preliminary_redisplay(
+                self,
+                crate::emacs_core::eval::keyboard::IdleTransitionPolicy::Preserve,
+            )?;
+        }
+        Ok(synthetic_wake)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn green_owner_service_wakes_for_test(&self) -> usize {
+        OWNER_SERVICE_WAKES.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Preserve GNU's first failed rebind until the safe resume signal point.

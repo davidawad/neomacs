@@ -70,6 +70,25 @@ fn hosted_parallel_world_admits_pure_threads_and_rejects_worker_redisplay() {
 }
 
 #[test]
+fn hosted_parallel_owner_wait_runs_owner_service_turns() {
+    let mut ev = parallel();
+    let (_sender, receiver) = crossbeam_channel::unbounded();
+    ev.attach_input_receiver(
+        crate::emacs_core::eval::host_input::HostInputReceiver::from_receiver(receiver),
+    );
+    let worker_body = format!("(progn {} 42)", "(thread-yield) ".repeat(20_000));
+    let source = format!("(thread-join (make-thread (lambda () {worker_body})))");
+    assert_eq!(
+        eval(&mut ev, &source),
+        "42"
+    );
+    assert!(
+        ev.green_owner_service_wakes_for_test() > 0,
+        "owner should run event-service turns while joining workers"
+    );
+}
+
+#[test]
 fn attach_releases_the_baton_during_unwind() {
     let lock = Arc::new(lock());
     let worker_lock = Arc::clone(&lock);

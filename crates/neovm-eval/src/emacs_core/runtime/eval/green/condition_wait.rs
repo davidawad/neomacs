@@ -162,9 +162,14 @@ pub(super) fn wait(context: &mut Context, condition: CondVarHandle) -> EvalResul
         .pending_thread_signal(owner.key.id())
         .is_none()
     {
-        owner.context.green_park(Wait::Condition(ConditionId::new(
-            waiting.condition.native_key(),
-        )))?;
+        loop {
+            owner.context.green_park(Wait::Condition(ConditionId::new(
+                waiting.condition.native_key(),
+            )))?;
+            if !owner.context.green_service_owner_wait()? {
+                break;
+            }
+        }
     }
     owner.start_reacquiring()?;
     loop {
@@ -175,9 +180,12 @@ pub(super) fn wait(context: &mut Context, condition: CondVarHandle) -> EvalResul
             .mutex_relock_after_wait(waiting.mutex, waiting.depth)
         {
             MutexAcquisition::Acquired => break,
-            MutexAcquisition::Blocked => owner
-                .context
-                .green_park(Wait::Mutex(MutexId::new(waiting.mutex.native_key())))?,
+            MutexAcquisition::Blocked => {
+                owner
+                    .context
+                    .green_park(Wait::Mutex(MutexId::new(waiting.mutex.native_key())))?;
+                owner.context.green_service_owner_wait()?;
+            }
             MutexAcquisition::DepthExhausted => return Err(super::api::mutex_depth_exhausted()),
         }
     }

@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 /// idle scheduler blocks in the selector instead; here several owners wait
 /// at once, each detached on its own OS thread.
 const SELECT_POLL: Duration = Duration::from_millis(5);
+/// Let the Main owner service timers and host events while blocked on
+/// another parallel Lisp thread.
+const OWNER_SERVICE_POLL: Duration = Duration::from_millis(10);
 
 impl Control {
     /// Whether a thread other than ME can run now or at a deadline (Green's
@@ -107,7 +110,8 @@ impl Control {
         loop {
             let now = Instant::now();
             Self::expire_deadlines(&mut state, now);
-            let timeout = match state.waits.get(&me).copied() {
+            let waiting = state.waits.get(&me).copied();
+            let timeout = match waiting {
                 Some(Wait::Runnable) => return,
                 Some(Wait::Select { wait_end }) => {
                     if let Some(select) = select
@@ -124,6 +128,8 @@ impl Control {
                         left
                     })
                 }
+                Some(Wait::Join(_) | Wait::Mutex(_) | Wait::Condition(_))
+                    if me == ThreadKey::Main => Some(OWNER_SERVICE_POLL),
                 Some(Wait::Join(_) | Wait::Mutex(_) | Wait::Condition(_)) => None,
                 // Only this owner ends or removes its own record, and host
                 // waits never detach.
@@ -131,10 +137,20 @@ impl Control {
             };
             state = match timeout {
                 Some(timeout) => {
-                    self.metadata_changed
+                    let (next, result) = self.metadata_changed
                         .wait_timeout(state, timeout)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0
+                        .unwrap_or_else(PoisonError::into_inner);
+                    state = next;
+                    if result.timed_out()
+                        && me == ThreadKey::Main
+                        && matches!(waiting, Some(Wait::Join(_) | Wait::Mutex(_) | Wait::Condition(_)))
+                        && state.waits.get(&me).copied() == waiting
+                    {
+                        state.owner_service_wakes.insert(me);
+                        Self::wake_locked(&mut state, me);
+                        self.metadata_changed.notify_all();
+                    }
+                    state
                 }
                 None => self
                     .metadata_changed
