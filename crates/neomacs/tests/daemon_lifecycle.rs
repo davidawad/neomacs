@@ -1254,7 +1254,7 @@ fn optional_aot_persistence_does_not_block_daemon_terminal_and_process_cleanup()
     signal_terminal_cleanup(true);
 }
 
-const HOT_AOT_LEAF: &str = "(progn (defalias 'daemon-aot-leaf (byte-compile (lambda (x) (+ x 1)))) (unless (byte-code-function-p (symbol-function 'daemon-aot-leaf)) (error \"not bytecode\")) (dotimes (i 3000) (daemon-aot-leaf i)) (unless (= (daemon-aot-leaf 41) 42) (error \"wrong result\")))";
+const HOT_AOT_LEAF: &str = "(progn (defalias 'daemon-aot-leaf (byte-compile (lambda (x) (+ x 1)))) (unless (byte-code-function-p (symbol-function 'daemon-aot-leaf)) (error \"not bytecode\")) (dotimes (i 3000) (daemon-aot-leaf i)) (sleep-for 0.05) (unless (= (daemon-aot-leaf 41) 42) (error \"wrong result\")))";
 
 fn configure_blocking_aot(fixture: &Fixture, command: &mut Command) {
     fs::create_dir(fixture.path("bin")).unwrap();
@@ -1274,6 +1274,9 @@ fn configure_blocking_aot(fixture: &Fixture, command: &mut Command) {
     fs::set_permissions(compiler, fs::Permissions::from_mode(0o700)).unwrap();
     command
         .env("NEOVM_AOT_PGO", "1")
+        // Drive a JIT tier-up deterministically so this fixture always
+        // reaches the blocking compiler it is meant to hold open.
+        .env("NEOVM_JIT_THRESHOLD", "1")
         .env("NEOVM_AOT_DIR", fixture.path("aot"))
         .env(
             "PATH",
@@ -1283,6 +1286,9 @@ fn configure_blocking_aot(fixture: &Fixture, command: &mut Command) {
                 std::env::var("PATH").unwrap()
             ),
         );
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        command.env("NEOVM_JIT_BG", "on");
+    }
 }
 
 fn signal_terminal_cleanup(pgo: bool) {
