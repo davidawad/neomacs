@@ -87,6 +87,11 @@ impl TextHost for Context {
             .is_some_and(|proc| !proc.encoding_state.requires_encoding())
     }
 
+    #[inline]
+    fn parallel_stop_points_enabled(&self) -> bool {
+        self.threading_mode() == super::admission::ThreadingMode::Parallel
+    }
+
     fn join_world_stop(&mut self, held: &[Value]) {
         #[cfg(feature = "shared-heap")]
         self.parallel_join_stop_holding(held);

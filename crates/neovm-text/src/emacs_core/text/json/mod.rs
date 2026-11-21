@@ -765,6 +765,18 @@ fn insert_json_hash_member_concurrent(
     });
 }
 
+#[cold]
+#[inline(never)]
+fn build_json_hash_table(hash_keys: Vec<HashKey>, members: &[Value]) -> Value {
+    let table_value = Value::hash_table(HashTableTest::Equal);
+    for (hash_key, member) in hash_keys.into_iter().zip(members.chunks_exact(2)) {
+        let _ = table_value.with_hash_table_mut(|table| {
+            table.insert(hash_key, member[0], member[1]);
+        });
+    }
+    table_value
+}
+
 /// Parser state: a cursor over the input bytes, plus the scratch space one
 /// parse reuses for every container and string in the document.
 ///
@@ -773,7 +785,7 @@ fn insert_json_hash_member_concurrent(
 /// small containers, and allocating a fresh buffer for each one -- a `Vec`
 /// per array or object, a `String` per string, then a copy of each into the
 /// heap object -- costs more than the parse itself.
-struct JsonParser<'a> {
+struct JsonParser<'a, 'stop> {
     input: &'a [u8],
     input_multibyte: bool,
     pos: usize,
@@ -796,9 +808,13 @@ struct JsonParser<'a> {
     /// caller to make obarray members: GNU interns every key into the
     /// obarray (`intern_c_multibyte`), and the parser has none.
     key_ids: Vec<SymId>,
+    /// Values held only by parser state while a parallel collection stop is
+    /// offered. Root arguments occupy the prefix; open containers follow.
+    held: Vec<Value>,
+    stop: Option<&'stop mut dyn FnMut(&[Value])>,
 }
 
-impl Drop for JsonParser<'_> {
+impl Drop for JsonParser<'_, '_> {
     fn drop(&mut self) {
         std::mem::take(&mut self.key_symbols).give_back();
     }
@@ -963,7 +979,7 @@ impl ObjectKeySymbols {
     }
 }
 
-impl<'a> JsonParser<'a> {
+impl<'a, 'stop> JsonParser<'a, 'stop> {
     fn new(input: &'a [u8], input_multibyte: bool, opts: ParseOpts) -> Self {
         // A hash-table parse makes string keys and needs no symbols.
         let key_symbols = match opts.object_type {
@@ -980,6 +996,21 @@ impl<'a> JsonParser<'a> {
             byte_workspace: Vec::new(),
             key_symbols,
             key_ids: Vec::new(),
+            held: Vec::new(),
+            stop: None,
+        }
+    }
+
+    fn with_stop_points(mut self, roots: &[Value], stop: &'stop mut dyn FnMut(&[Value])) -> Self {
+        self.held.extend_from_slice(roots);
+        self.stop = Some(stop);
+        self
+    }
+
+    #[inline]
+    fn stop_point(&mut self) {
+        if let Some(stop) = self.stop.as_deref_mut() {
+            stop(&self.held);
         }
     }
 
@@ -1532,6 +1563,7 @@ impl<'a> JsonParser<'a> {
     fn parse_array(&mut self) -> Result<Value, Flow> {
         let mut c = self.skip_ws_consume()?;
         let first = self.object_workspace.len();
+        let held_first = self.held.len();
 
         if c != b']' {
             // GNU only counts nesting depth for non-empty containers.
@@ -1539,6 +1571,10 @@ impl<'a> JsonParser<'a> {
             loop {
                 let val = self.parse_value(c)?;
                 self.object_workspace.push(val);
+                if self.stop.is_some() {
+                    self.held.push(val);
+                    self.stop_point();
+                }
 
                 c = self.skip_ws_consume()?;
                 if c == b']' {
@@ -1558,6 +1594,7 @@ impl<'a> JsonParser<'a> {
             ArrayType::List => Value::list_from_slice(items),
         };
         self.object_workspace.truncate(first);
+        self.held.truncate(held_first);
         Ok(array)
     }
 
@@ -1607,6 +1644,9 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_object_hash_table(&mut self, mut c: u8) -> Result<Value, Flow> {
+        if self.stop.is_some() {
+            return self.parse_object_hash_table_with_stop_points(c);
+        }
         if neovm_value::tagged::gc::concurrent_hash_mutation_active() {
             return self.parse_object_hash_table_concurrent(c);
         }
@@ -1652,24 +1692,27 @@ impl<'a> JsonParser<'a> {
         Ok(ht)
     }
 
-    #[cold]
-    #[inline(never)]
-    fn parse_object_hash_table_concurrent(&mut self, mut c: u8) -> Result<Value, Flow> {
-        // The same parser mode-stability contract applies to this active
-        // clone. Each insertion keeps the normal snapshot/mutation lease.
-        #[cfg(any(test, debug_assertions, feature = "test-support"))]
-        let _guard = neovm_value::tagged::mutate::HeapMutClosureGuard::enter();
-        let ht = Value::hash_table(HashTableTest::Equal);
+    /// In a Parallel World, defer hash-table construction until each object's
+    /// stop points have completed. The open members stay in `held`, so the
+    /// collector can trace them without exposing a table being mutated under
+    /// the inactive heap-mutation guard.
+    fn parse_object_hash_table_with_stop_points(&mut self, mut c: u8) -> Result<Value, Flow> {
         if c == b'}' {
-            return Ok(ht);
+            return Ok(Value::hash_table(HashTableTest::Equal));
         }
         self.enter_nesting()?;
+        let object_first = self.object_workspace.len();
+        let held_first = self.held.len();
+        let mut hash_keys = Vec::new();
 
         loop {
             let name = self.parse_object_key(c)?;
             let (key_val, hash_key) = self.member_hash_key(name);
             let val = self.parse_object_member_value()?;
-            insert_json_hash_member_concurrent(ht, hash_key, key_val, val);
+            self.object_workspace.extend([key_val, val]);
+            self.held.extend([key_val, val]);
+            hash_keys.push(hash_key);
+            self.stop_point();
 
             c = self.skip_ws_consume()?;
             if c == b'}' {
@@ -1682,6 +1725,49 @@ impl<'a> JsonParser<'a> {
             c = self.skip_ws_consume()?;
         }
 
+        let members = &self.object_workspace[object_first..];
+        let table = build_json_hash_table(hash_keys, members);
+        self.object_workspace.truncate(object_first);
+        self.held.truncate(held_first);
+        Ok(table)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn parse_object_hash_table_concurrent(&mut self, mut c: u8) -> Result<Value, Flow> {
+        // The same parser mode-stability contract applies to this active
+        // clone. Each insertion keeps the normal snapshot/mutation lease.
+        #[cfg(any(test, debug_assertions, feature = "test-support"))]
+        let _guard = neovm_value::tagged::mutate::HeapMutClosureGuard::enter();
+        let ht = Value::hash_table(HashTableTest::Equal);
+        if c == b'}' {
+            return Ok(ht);
+        }
+        self.enter_nesting()?;
+        let held_first = self.held.len();
+        if self.stop.is_some() {
+            self.held.push(ht);
+        }
+
+        loop {
+            let name = self.parse_object_key(c)?;
+            let (key_val, hash_key) = self.member_hash_key(name);
+            let val = self.parse_object_member_value()?;
+            insert_json_hash_member_concurrent(ht, hash_key, key_val, val);
+            self.stop_point();
+
+            c = self.skip_ws_consume()?;
+            if c == b'}' {
+                self.leave_nesting();
+                break;
+            }
+            if c != b',' {
+                return Err(self.signal_at_pos(JsonError::Parse));
+            }
+            c = self.skip_ws_consume()?;
+        }
+
+        self.held.truncate(held_first);
         Ok(ht)
     }
 
@@ -1830,7 +1916,7 @@ fn json_serialize_with_symbols(args: Vec<Value>, mode: SymbolMode) -> EvalResult
 /// - `:false-object VALUE` — Lisp value for JSON false (default: :false)
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn builtin_json_parse_string(args: Vec<Value>) -> EvalResult {
-    json_parse_string_with_symbols(args, SymbolMode::Bare, |_| {})
+    json_parse_string_with_symbols(args, SymbolMode::Bare, false, None).0
 }
 
 #[doc(hidden)]
@@ -1839,7 +1925,11 @@ pub fn builtin_json_parse_string_in_state<H: TextHost>(
     args: Vec<Value>,
 ) -> EvalResult {
     let mode = host.symbol_mode();
-    json_parse_string_with_symbols(args, mode, |ids| host.ensure_interned_global_ids(ids))
+    let stop_points = host.parallel_stop_points_enabled();
+    let mut stop = |held: &[Value]| host.join_world_stop(held);
+    let (result, ids) = json_parse_string_with_symbols(args, mode, stop_points, Some(&mut stop));
+    host.ensure_interned_global_ids(&ids);
+    result
 }
 
 /// Parse `args` as `json-parse-string` does, handing `make_members` the key
@@ -1848,22 +1938,37 @@ pub fn builtin_json_parse_string_in_state<H: TextHost>(
 fn json_parse_string_with_symbols(
     args: Vec<Value>,
     mode: SymbolMode,
-    make_members: impl FnOnce(&[SymId]),
-) -> EvalResult {
-    expect_min_args("json-parse-string", &args, 1)?;
+    stop_points: bool,
+    stop: Option<&mut dyn FnMut(&[Value])>,
+) -> (EvalResult, Vec<SymId>) {
+    if let Err(error) = expect_min_args("json-parse-string", &args, 1) {
+        return (Err(error), Vec::new());
+    }
     let input = match args[0].kind() {
         ValueKind::String => args[0]
             .as_lisp_string()
             .expect("string object must carry LispString payload"),
         _ => {
-            return Err(signal(
-                LispCondition::WrongTypeArgument,
-                vec![Value::symbol("stringp"), args[0]],
-            ));
+            return (
+                Err(signal(
+                    LispCondition::WrongTypeArgument,
+                    vec![Value::symbol("stringp"), args[0]],
+                )),
+                Vec::new(),
+            );
         }
     };
-    let opts = parse_parse_kwargs(&args, 1, mode)?;
+    let opts = match parse_parse_kwargs(&args, 1, mode) {
+        Ok(opts) => opts,
+        Err(error) => return (Err(error), Vec::new()),
+    };
     let mut parser = JsonParser::new(input.as_bytes(), input.is_multibyte(), opts);
+    if parser.opts.object_type == ObjectType::HashTable
+        && stop_points
+        && let Some(stop) = stop
+    {
+        parser = parser.with_stop_points(&args, stop);
+    }
     let result = parser.parse().and_then(|value| {
         // Ensure there is no trailing non-whitespace, mirroring GNU's
         // `json_skip_whitespace_if_possible (&p) >= 0` check.  The trailing
@@ -1874,8 +1979,7 @@ fn json_parse_string_with_symbols(
         }
         Ok(value)
     });
-    make_members(&parser.key_ids);
-    result
+    (result, std::mem::take(&mut parser.key_ids))
 }
 
 /// `(json-parse-buffer &rest ARGS)` — parse one JSON value from point.

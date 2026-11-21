@@ -105,6 +105,13 @@ pub trait TextHost: EditHost {
     /// pure read (T5.3).
     fn current_buffer_is_displayed(&self) -> bool;
 
+    /// Whether a long text primitive should expose rooted stop points in the
+    /// current runtime. Implementations return true only for the parallel
+    /// owner-thread runtime; serial callers keep the existing fast path.
+    fn parallel_stop_points_enabled(&self) -> bool {
+        false
+    }
+
     /// A stop point of a long primitive (`json-parse-string`'s members and
     /// elements): a Parallel World's detached thread joins a requested
     /// stop-the-world collection here with HELD, every value the primitive
