@@ -26,6 +26,14 @@ impl Context {
         self.green_seat().is_some()
     }
 
+    /// Whether this context is running inside a shared-heap parallel owner.
+    /// Those owners block in their select wait directly; they must not use
+    /// the legacy thread-blocked continuation used by the native backend.
+    #[cfg(feature = "shared-heap")]
+    pub(crate) fn parallel_threads_running(&self) -> bool {
+        self.parallel_lock().is_some()
+    }
+
     /// The running thread's id in the World's `ThreadManager`.
     pub(crate) fn green_current_id(&mut self) -> u64 {
         self.green_key().map_or(0, ThreadKey::id)

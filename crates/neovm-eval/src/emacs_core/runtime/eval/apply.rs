@@ -4742,7 +4742,6 @@ fn is_host_affine_primitive(sym_id: SymId) -> bool {
                 | "discard-input"
                 | "input-pending-p"
                 | "sit-for"
-                | "sleep-for"
                 | "accept-process-output"
                 | "force-window-update"
         )

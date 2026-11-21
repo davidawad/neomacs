@@ -291,7 +291,19 @@ pub fn builtin_sleep_for(
 
     let total_secs = secs + millis / 1000.0;
     if total_secs > 0.0 {
-        if eval.threads().current_thread_id() != 0 && !eval.green_threads_running() {
+        if eval.threads().current_thread_id() != 0
+            && !eval.green_threads_running()
+            && {
+                #[cfg(feature = "shared-heap")]
+                {
+                    !eval.parallel_threads_running()
+                }
+                #[cfg(not(feature = "shared-heap"))]
+                {
+                    true
+                }
+            }
+        {
             // The worker is already running because its caller released the
             // global lock (`thread_select`, src/thread.c:613-643). Parking
             // returns that OS thread for the deadline. `thread-signal` does
