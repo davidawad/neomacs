@@ -188,6 +188,15 @@ fn failed_read_is_retryable_and_cache_is_bounded() {
         .get_with(font.path(), 0, |path| {
             let data = std::fs::read(path)?;
             std::fs::write(path, sfnt(0, b"calt"))?;
+            // The cache compares ctime/mtime before and after the read.  Some
+            // filesystems expose timestamp updates at coarser than nanosecond
+            // resolution, so make the replacement's mtime observably distinct
+            // instead of making this race depend on the scheduler's timing.
+            let changed_time = std::fs::metadata(path)?.modified()?
+                + std::time::Duration::from_secs(2);
+            std::fs::File::open(path)?.set_times(
+                std::fs::FileTimes::new().set_modified(changed_time),
+            )?;
             Ok(data)
         })
         .unwrap();
