@@ -157,6 +157,36 @@ fn two_detached_numeric_loops_match_the_serial_result_without_attaching() {
     );
 }
 
+/// Symbols interned after a Green run still get GNU's keyword self-value on
+/// both the owner and a later worker. A prior parallel run must not leave a
+/// stale per-thread keyword classification behind.
+#[test]
+fn keywords_interned_after_parallel_run_are_self_evaluating_on_owner_and_worker() {
+    let mut ev = parallel();
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(let ((workers (mapcar (lambda (_) (make-thread (lambda () 1))) '(1 2 3 4 5 6 7 8))))\n             (mapcar #'thread-join workers))"
+        ),
+        "(1 1 1 1 1 1 1 1)"
+    );
+
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(funcall (lambda () (list :a 1 :dot-nntc4-61-owner-keyword 2)))"
+        ),
+        "(:a 1 :dot-nntc4-61-owner-keyword 2)"
+    );
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(thread-join (make-thread (lambda () (funcall (lambda () (list :dot-nntc4-61-worker-keyword))))))"
+        ),
+        "(:dot-nntc4-61-worker-keyword)"
+    );
+}
+
 /// GNU `dotimes` (subr.el), as a macro built without backquote: the
 /// unit Context loads no Lisp files.
 const DOTIMES: &str = "(defalias 'tpd-dotimes
