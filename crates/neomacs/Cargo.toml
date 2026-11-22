@@ -157,6 +157,10 @@ workspace = true
 name = "neomacs_integration"
 path = "tests/neomacs_integration.rs"
 
+[[test]]
+name = "keyword_after_parallel_run"
+path = "tests/keyword_after_parallel_run.rs"
+
 # CI selects this target with --test, so it stays separate.
 [[test]]
 name = "daemon_lifecycle"

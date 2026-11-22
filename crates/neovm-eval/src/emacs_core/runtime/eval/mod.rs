@@ -5819,6 +5819,13 @@ impl Context {
 
     #[doc(hidden)]
     pub(crate) fn find_symbol_value_by_id(&self, sym_id: SymId) -> Result<SymbolValueLookup, Flow> {
+        // Keywords are self-valued constants even when a symbol slab's
+        // value cell was allocated by a worker before the owner interned it.
+        // Consult keyword identity before the plain-cell fast path so an
+        // uninitialized or stale slab cell cannot report a fresh keyword void.
+        if is_keyword_id(sym_id) {
+            return Ok(SymbolValueLookup::Bound(Value::from_kw_id(sym_id)));
+        }
         // Fast path — GNU `find_symbol_value`'s SYMBOL_PLAINVAL leaf: an
         // ordinary global with a bound plain cell answers from one slot
         // read. Aliases, localized/forwarded symbols, unbound cells (where
@@ -5877,10 +5884,6 @@ impl Context {
 
         // GNU keywords are self-valued constants installed by `intern_sym`;
         // keep lexenv lookup first, then use the same self-value directly.
-        if is_keyword_id(sym_id) {
-            return Ok(SymbolValueLookup::Bound(Value::from_kw_id(sym_id)));
-        }
-
         let resolved = super::builtins::resolve_variable_alias_id(self, sym_id)?;
 
         if resolved != sym_id && is_keyword_id(resolved) {

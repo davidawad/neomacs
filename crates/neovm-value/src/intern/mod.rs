@@ -1112,6 +1112,11 @@ impl SymbolRegistry {
         if canonical {
             self.canonical_by_name.insert(name, id);
         }
+        // Per-thread caches are indexed by SymId and may already contain a
+        // negative entry for this not-yet-published ID. Publish invalidation
+        // after all registry fields are installed and before releasing the
+        // registry write lock, so an Acquire reader cannot keep that miss.
+        symbol_registry_epoch().fetch_add(1, Ordering::AcqRel);
         id
     }
 
@@ -1618,13 +1623,14 @@ fn global_symbol_registry() -> &'static RwLock<SymbolRegistry> {
     GLOBAL_SYMBOL_REGISTRY.get_or_init(|| RwLock::new(SymbolRegistry::new()))
 }
 
-/// The epoch positive canonical-name caches validate against. Removing a
-/// canonical mapping publishes invalidation under the registry write guard;
-/// readers load it with Acquire. Fresh intern/dump insertions preserve existing
-/// mappings, and these caches never retain misses, so fresh insertions need no
-/// bump on the serial path. Sealed C5 publication additionally advances once
-/// per winning fresh registry ID, under its retained registry write guard;
-/// existing-name hits and World-only membership/growth do not advance it.
+/// The epoch per-thread symbol caches validate against. New symbol IDs and
+/// removed canonical mappings publish invalidation under the registry write
+/// guard; readers load it with Acquire. Dense per-ID caches can observe a
+/// not-yet-published ID as a negative lookup, so every new ID must invalidate
+/// those entries before the registry writer unlocks. Sealed C5 publication
+/// additionally advances once per winning fresh registry ID under its
+/// retained registry write guard; existing-name hits and World-only
+/// membership/growth do not advance it.
 /// The public dump-restore seam conservatively republishes invalidation
 /// under the same write guard, including a partially failed restore.
 /// Caches outside this module, including `TaggedValue::subr_from_sym_id`'s memo,
@@ -1875,6 +1881,11 @@ pub fn is_canonical_id(id: SymId) -> bool {
 #[inline]
 #[doc(hidden)]
 pub fn is_keyword_id(id: SymId) -> bool {
+    // The per-thread `SYMBOL_CACHE` is indexed by SymId, but entries become
+    // stale when parallel fresh-symbol publication advances the registry
+    // epoch. Validate the same epoch used by the other cache readers before
+    // accepting a cached keyword classification.
+    ensure_thread_local_cache_epoch_current();
     if let Some(is_keyword) = thread_local_keyword(id) {
         return is_keyword;
     }
