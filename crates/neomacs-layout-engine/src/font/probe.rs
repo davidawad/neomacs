@@ -709,11 +709,12 @@ const OTF_CAPABILITY_CACHE_CAP: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OtfFileIdentity {
     len: u64,
-    modified: std::time::SystemTime,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    modified: (i64, i64),
     #[cfg(unix)]
     changed: (i64, i64),
 }
@@ -737,9 +738,9 @@ impl OtfFileIdentity {
             }
             Some(Self {
                 len: metadata.len(),
-                modified: metadata.modified().ok()?,
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
                 changed: (metadata.ctime(), metadata.ctime_nsec()),
             })
         }

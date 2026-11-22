@@ -1112,11 +1112,6 @@ impl SymbolRegistry {
         if canonical {
             self.canonical_by_name.insert(name, id);
         }
-        // Per-thread caches are indexed by SymId and may already contain a
-        // negative entry for this not-yet-published ID. Publish invalidation
-        // after all registry fields are installed and before releasing the
-        // registry write lock, so an Acquire reader cannot keep that miss.
-        symbol_registry_epoch().fetch_add(1, Ordering::AcqRel);
         id
     }
 
@@ -1623,14 +1618,11 @@ fn global_symbol_registry() -> &'static RwLock<SymbolRegistry> {
     GLOBAL_SYMBOL_REGISTRY.get_or_init(|| RwLock::new(SymbolRegistry::new()))
 }
 
-/// The epoch per-thread symbol caches validate against. New symbol IDs and
-/// removed canonical mappings publish invalidation under the registry write
-/// guard; readers load it with Acquire. Dense per-ID caches can observe a
-/// not-yet-published ID as a negative lookup, so every new ID must invalidate
-/// those entries before the registry writer unlocks. Sealed C5 publication
-/// additionally advances once per winning fresh registry ID under its
-/// retained registry write guard; existing-name hits and World-only
-/// membership/growth do not advance it.
+/// The epoch per-thread symbol caches validate against. Removing canonical
+/// mappings and dump restoration publish invalidation under the registry
+/// write guard; readers load it with Acquire. Fresh symbol IDs are append-only
+/// and have no previously valid cache entries, so publishing them does not
+/// invalidate every thread's positive name cache.
 /// The public dump-restore seam conservatively republishes invalidation
 /// under the same write guard, including a partially failed restore.
 /// Caches outside this module, including `TaggedValue::subr_from_sym_id`'s memo,
