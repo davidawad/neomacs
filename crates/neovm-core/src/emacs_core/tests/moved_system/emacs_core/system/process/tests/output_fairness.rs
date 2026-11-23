@@ -79,6 +79,21 @@ fn ready_process(eval: &mut Context, name: &str, chunks: usize) -> (ProcessId, A
     (id, reads)
 }
 
+/// A pipe reader for process ID, registered with the wait poller as
+/// `spawn_child_pipe` and `make-pipe-process` register theirs: a poll pass
+/// reads only what the poller reports.
+fn registered_pipe_reader(
+    eval: &mut Context,
+    id: ProcessId,
+    reader: os_pipe::PipeReader,
+) -> ChildOutputReader {
+    let reader = ChildOutputReader::Shared(reader);
+    if let Some(poller) = eval.processes().wait_backend.poller() {
+        ProcessManager::register_child_stdout_with_poller(poller, &reader, id);
+    }
+    reader
+}
+
 #[test]
 fn continuous_output_yields_before_exhaustion_and_preserves_remaining_bytes() {
     for targeted in [false, true] {
@@ -145,19 +160,21 @@ fn accept_process_output_drains_a_ready_burst_in_one_call() {
         eval.sync_process_read_config_from_visible_variables();
         let (hot, _) = ready_process(&mut eval, "accept-burst", 0);
         let (peer, _) = ready_process(&mut eval, "accept-peer", 0);
-        // Real, already-written pipes participate in production live-source
-        // discovery. Keep the writers open so EOF/final drain cannot hide an
+        // Real, already-written pipes, registered with the poller as every
+        // production child pipe is, participate in live-source discovery.
+        // Keep the writers open so EOF/final drain cannot hide an
         // incomplete readiness drain. Each read is capped at one byte.
         let mut writers = Vec::new();
         for (id, bytes) in [(hot, 128), (peer, 3)] {
             let (reader, mut writer) = os_pipe::pipe().unwrap();
             sys::set_fd_nonblocking(reader.as_raw_fd()).unwrap();
             writer.write_all(&vec![b'x'; bytes]).unwrap();
+            let reader = registered_pipe_reader(&mut eval, id, reader);
             let process = eval.processes_mut().get_mut(id).unwrap();
             process.kind = ProcessKind::Pipe;
             process.childp = Value::NIL;
             process.live_io.pty_reader = None;
-            process.live_io.child_stdout = Some(ChildOutputReader::Shared(reader));
+            process.live_io.child_stdout = Some(reader);
             writers.push(writer);
         }
         eval.set_variable("accept-burst-process", Value::make_process(hot));
@@ -230,11 +247,12 @@ fn completed_accept_yields_after_a_bounded_minimum_drain() {
         "pipe holds {written} bytes, too little to observe the follow-up bound"
     );
     {
+        let reader = registered_pipe_reader(&mut eval, hot, reader);
         let process = eval.processes_mut().get_mut(hot).unwrap();
         process.kind = ProcessKind::Pipe;
         process.childp = Value::NIL;
         process.live_io.pty_reader = None;
-        process.live_io.child_stdout = Some(ChildOutputReader::Shared(reader));
+        process.live_io.child_stdout = Some(reader);
     }
     eval.set_variable("bounded-drain-process", Value::make_process(hot));
     eval.eval_str("(set-process-sentinel bounded-drain-process (lambda (_p _event) nil))")

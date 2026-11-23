@@ -3101,6 +3101,12 @@ pub(crate) fn builtin_make_pipe_process_impl(
         )
     })?;
     let pipe_reader = ChildOutputReader::Shared(pipe_reader);
+    // GNU `Fmake_pipe_process` (src/process.c:2467); reads rely on it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = super::sys::set_fd_nonblocking(pipe_reader.as_raw_fd());
+    }
 
     let id = processes.create_process_with_kind_lisp(
         name,

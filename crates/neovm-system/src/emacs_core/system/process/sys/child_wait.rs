@@ -54,6 +54,41 @@ pub(crate) fn poll_child_status(pid: u32) -> ChildWait {
     ChildWait::Error
 }
 
+/// Whether any child of this process has a change `waitpid` would report:
+/// an exit, a death by signal, a stop, or a continue.  `WNOWAIT` leaves the
+/// report in place, so this reaps nothing and takes no report from whichever
+/// owner (the process table, `call-process`, a library) waits for that pid.
+/// An error other than `ECHILD` answers `true`: a failed query costs a probe,
+/// never a missed status.
+pub(crate) fn any_child_status_reportable() -> bool {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `waitid` writes only through `info`, which points to zeroed
+        // writable storage of the right type.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_ALL,
+                0,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: zero is a valid `siginfo_t`, and a successful `waitid`
+            // either filled it or left `si_pid` zero (no child to report).
+            let info = unsafe { info.assume_init() };
+            // SAFETY: `waitid` reports through the `SIGCHLD` layout of the
+            // union, which is the one `si_pid` reads.
+            return unsafe { info.si_pid() } != 0;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ECHILD) => return false,
+            _ => return true,
+        }
+    }
+}
+
 /// Classify a raw `waitpid`/`wait` status word (exposed for status-decode
 /// tests; `poll_child_status` is the normal entry point).
 #[cfg_attr(feature = "test-support", visibility::make(pub))]

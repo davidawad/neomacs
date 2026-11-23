@@ -565,6 +565,22 @@ pub(super) fn collect_deferred_child_status_changes() {
     collect_deferred_children(DeferredReapSweep::WaitSafePoint);
 }
 
+/// GNU's `update_tick != process_tick` for child status.  GNU walks the
+/// alist only after a `SIGCHLD`; the kernel keeps that fact without a
+/// handler, since a child report stays until its owner's `waitpid` consumes
+/// it.  `false` means every `child_status_changed` probe would answer "no
+/// change"; someone else's report only makes this `true`.
+#[cfg(unix)]
+pub(super) fn child_status_may_have_changed() -> bool {
+    super::sys::any_child_status_reportable()
+}
+
+/// Without `waitid` every probe stays: `true`.
+#[cfg(not(unix))]
+pub(super) fn child_status_may_have_changed() -> bool {
+    true
+}
+
 fn collect_deferred_children(sweep: DeferredReapSweep) {
     match sweep {
         DeferredReapSweep::WaitSafePoint if !HAS_SAFE_POINT_FALLBACK.load(Ordering::Acquire) => {

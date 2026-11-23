@@ -477,8 +477,11 @@ pub use neovm_eval::emacs_core::eval::data::process_state::UnrecordedStatusRead;
 /// able to say how often it ran -- and `tracing` cannot answer it, because a
 /// release `--batch` run emits no `debug` records at all.
 ///
-/// The walk is unconditional since ledger 208, so `walks` is a rate rather
-/// than an arming count; `stamped` is what it found.  The third number lives
+/// The walk is called unconditionally since ledger 208, so `walks` is a rate
+/// rather than an arming count.  It counts calls, including those that end
+/// before any probe because the kernel has no child report pending
+/// (`reap::child_status_may_have_changed`); `stamped` is what the probes
+/// found.  The third number lives
 /// next door -- [`STATUS_NOTIFY_VISITED`] -- and the difference `visited -
 /// stamped` is exactly the work the old visit set (the walk's own return
 /// value) could not have done.

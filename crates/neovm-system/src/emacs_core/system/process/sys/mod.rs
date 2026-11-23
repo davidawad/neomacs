@@ -102,6 +102,8 @@ pub mod child_wait;
 #[cfg_attr(feature = "test-support", visibility::make(pub))]
 pub(crate) use child_wait::ChildWait;
 #[cfg(unix)]
+pub(crate) use child_wait::any_child_status_reportable;
+#[cfg(unix)]
 pub(crate) use child_wait::poll_child_status;
 // The raw-status decode entry point is currently only exercised by status-decode
 // tests; production reaps through `poll_child_status`.

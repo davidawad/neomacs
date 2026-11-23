@@ -5079,6 +5079,13 @@ impl SystemProcessExt for ProcessManager {
             Some(reader) => Some(ChildOutputReader::Shared(reader)),
             None => child.stdout.take().map(ChildOutputReader::Stdout),
         };
+        // Once, where the descriptor is made (GNU `create_process`,
+        // src/process.c:2250); every read relies on it.
+        #[cfg(unix)]
+        if let Some(stdout) = &stdout {
+            use std::os::unix::io::AsRawFd;
+            let _ = sys::set_fd_nonblocking(stdout.as_raw_fd());
+        }
 
         // Register stdout with the poller where the platform exposes child
         // pipe descriptors as pollable sources.
@@ -5463,18 +5470,11 @@ impl SystemProcessExt for ProcessManager {
         };
         let read_len = process_read_buffer_len(proc);
 
+        // Non-blocking since it was made (`spawn_child_pipe`,
+        // `make-pipe-process`), so a read is one syscall.
         let Some(stdout) = proc.live_io.child_stdout.as_mut() else {
             return ProcessBytesRead::NoSource;
         };
-
-        // Use non-blocking read via set_nonblocking on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = stdout.as_raw_fd();
-            // Set non-blocking
-            let _ = sys::set_fd_nonblocking(fd);
-        }
 
         let mut buf = vec![0u8; read_len];
         let full_read_len = buf.len();
@@ -7383,6 +7383,11 @@ impl SystemProcessExt for ProcessManager {
     /// independently; it is matched so that a future reader does not have to
     /// wonder.
     ///
+    /// GNU runs the walk only when `SIGCHLD` arrived.  This port asks the
+    /// kernel the same question first (`reap::child_status_may_have_changed`,
+    /// one `waitid (WNOWAIT)`), so a pass with no child state change probes
+    /// no child, however many are alive.
+    ///
     /// `check_child_status_change` is GNU's per-process body: the
     /// `child_status_changed` probe (:7742), the `delete_read_fd` on a
     /// terminal status (:7760, spelled here as unregistering the child's
@@ -7407,6 +7412,11 @@ impl SystemProcessExt for ProcessManager {
         let _ = site;
         super::reap::collect_deferred_child_status_changes();
         STATUS_NOTIFY_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // GNU walks after a SIGCHLD; the kernel's pending report is the same
+        // fact, and without one every probe below would answer "no change".
+        if !super::reap::child_status_may_have_changed() {
+            return 0;
+        }
         let mut population: Vec<SweepableChild> = self
             .processes
             .iter()
@@ -7569,6 +7579,52 @@ pub(crate) enum AsyncCallbackKind {
     /// command loop instead of being reported here. Keeping the catch is a
     /// known, deliberate divergence rather than part of this fix.
     ServerLog,
+}
+
+/// GNU `wait_reading_process_output` reads a channel only when `pselect`
+/// reported it (`FD_ISSET (channel, &Available)`, src/process.c:5993), and
+/// asks `pselect` even when the wait time is zero.  Ask the poller the same
+/// with a zero timeout and keep, out of CANDIDATES, the processes it reported
+/// (readable output, end of file, a pidfd exit, an async DNS answer) and those
+/// readiness cannot speak for: a pending status notification, and TLS, whose
+/// decrypted plaintext stays buffered where the poller cannot see it (GNU's
+/// `tls_available`, :5743-5769).  When the kernel has a child report pending,
+/// every candidate stays, so the status probes run as before.
+///
+/// GNU clears the adaptive read skip of every process it leaves out of the
+/// mask (:5701-5703); the processes left out here are cleared the same way,
+/// or the skip would shorten every later block.  Child pipes on Windows are
+/// not registered with the poller, so there, and without a poller, every
+/// candidate is visited.
+fn poll_pass_process_ids(
+    processes: &mut ProcessManager,
+    candidates: Vec<ProcessId>,
+    target_process: Option<ProcessId>,
+) -> Vec<ProcessId> {
+    if cfg!(not(unix)) || candidates.is_empty() {
+        return candidates;
+    }
+    let Some(events) = processes
+        .wait_for_backend_events(Duration::ZERO, ProcessWaitBackendInterest::ProcessesOnly)
+    else {
+        return candidates;
+    };
+    if events.has_notification_wakeup() || super::reap::child_status_may_have_changed() {
+        return candidates;
+    }
+    let ready = events.ready_processes_ref();
+    let (visit, skipped): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|id| {
+        ready.contains(id)
+            || processes.get(*id).is_some_and(|process| {
+                process.status_notify_pending || process.live_io.tls_stream.is_some()
+            })
+    });
+    if target_process.is_none() {
+        for id in skipped {
+            processes.clear_adaptive_read_skip_if_needed(id);
+        }
+    }
+    visit
 }
 
 impl AsyncCallbackKind {
@@ -8637,6 +8693,7 @@ impl ProcessContextExt for neovm_eval::emacs_core::eval::Context {
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let target_process = request.target_process();
         let proc_ids = request.live_processes(self.processes().live_process_ids());
+        let proc_ids = poll_pass_process_ids(self.processes_mut(), proc_ids, target_process);
         self.service_process_output_for_ids(
             proc_ids,
             target_process,
@@ -8886,8 +8943,19 @@ impl ProcessContextExt for neovm_eval::emacs_core::eval::Context {
 
         let mut outcome = ProcessOutputServiceOutcome::default();
         let mut split_stderr_owners_with_output = Vec::new();
+        // One kernel query (`reap::child_status_may_have_changed`) stands for
+        // the `waitpid` of every process serviced without running Lisp.  A
+        // filter, sentinel or log function can run for as long as it likes,
+        // and a child that changes meanwhile must still be probed in this
+        // pass, so the answer is dropped after any process whose service may
+        // have run one, and the next probe asks again.
+        let mut child_status_query: Option<bool> = None;
+        let mut reuse_child_status_query = false;
 
         for pid in proc_ids {
+            if !std::mem::take(&mut reuse_child_status_query) {
+                child_status_query = None;
+            }
             match pass {
                 ProcessOutputServicePass::Readiness => {
                     // GNU clears Available after a successful read: a filter can
@@ -9006,6 +9074,8 @@ impl ProcessContextExt for neovm_eval::emacs_core::eval::Context {
                 .is_some_and(process_defers_status_poll_while_readable_pty);
             if !defer_status_poll_for_readable_pty
                 && (publish_status_before_readable_output || !has_readable_process_io)
+                && *child_status_query
+                    .get_or_insert_with(super::reap::child_status_may_have_changed)
                 && self.processes_mut().check_child_status_change(pid)
             {
                 if self
@@ -9075,6 +9145,7 @@ impl ProcessContextExt for neovm_eval::emacs_core::eval::Context {
             self.sync_process_read_config_from_visible_variables();
             let (processes, buffers) = self.processes_and_buffers_mut();
             let accepted = processes.accept_network_server_connections(buffers, pid)?;
+            let accepted_none = accepted.is_empty();
             for event in &accepted {
                 self.setup_process_output_descriptor(event.client_id)?;
             }
@@ -9143,6 +9214,15 @@ impl ProcessContextExt for neovm_eval::emacs_core::eval::Context {
                 let sink = self.process_output_sink(pid);
                 self.read_process_output_recording_coding(pid, sink)?
             };
+            // An end of file runs Lisp too: its last block is decoded through
+            // `:post-read-conversion`, so an answer taken before it is stale.
+            let read_ran_no_lisp = matches!(
+                read_result,
+                ProcessOutputRead::WouldBlock | ProcessOutputRead::NoSource
+            );
+            if !read_ran_no_lisp {
+                child_status_query = None;
+            }
             let mut saw_output = false;
             let mut saw_pty_eof = false;
             let mut handled_terminal_eof = false;
@@ -9358,6 +9438,8 @@ impl ProcessContextExt for neovm_eval::emacs_core::eval::Context {
             // ordering only when bytes are actually pending, not for no-output
             // exits such as `sh -c "exit 7"`.
             if (!publish_status_before_readable_output || has_readable_process_io)
+                && *child_status_query
+                    .get_or_insert_with(super::reap::child_status_may_have_changed)
                 && self.processes_mut().check_child_status_change(pid)
             {
                 if self
@@ -9382,7 +9464,11 @@ impl ProcessContextExt for neovm_eval::emacs_core::eval::Context {
                 // per-process settlement that the visit set cannot see.
                 outcome
                     .absorb(self.notify_processes_with_unnotified_status_change(target_process)?);
+                continue;
             }
+            // No connection accepted, no filter, no notification: nothing
+            // since the query ran Lisp, so the next process may reuse it.
+            reuse_child_status_query = accepted_none && read_ran_no_lisp;
         }
 
         Ok(outcome)

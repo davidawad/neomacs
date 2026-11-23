@@ -80,6 +80,10 @@ mod process_tests_gnu_local_service_oracle_rs;
 mod process_tests_gnu_pty_exit_oracle_rs;
 
 #[cfg(unix)]
+#[path = "emacs_core/system/process/tests/idle_children.rs"]
+mod process_tests_idle_children_rs;
+
+#[cfg(unix)]
 #[path = "emacs_core/system/process/tests/native_deferred_reap_fixture_test.rs"]
 mod process_tests_native_deferred_reap_fixture_test_rs;
 
