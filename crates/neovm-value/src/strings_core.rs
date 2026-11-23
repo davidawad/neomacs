@@ -32,7 +32,7 @@ use crate::value::text_props::{
 };
 use crate::value::{
     Value, ValueKind, VecLikeType, get_string_text_properties_table_for_value,
-    set_string_text_properties_table_for_value,
+    set_string_text_properties_table_for_value, string_has_text_properties_for_value,
 };
 
 /// Iterate Emacs character codes from a `LispString`.
@@ -506,17 +506,33 @@ fn concat_multibyte_result(
 #[inline]
 pub fn concat_impl(args: &[Value]) -> EvalResult {
     if args.iter().all(|arg| arg.is_string()) {
-        let dest_multibyte = args.iter().any(|arg| {
-            arg.as_lisp_string()
-                .is_some_and(|string| string.is_multibyte())
-        });
-        let mut combined = Vec::new();
-        let mut string_sources: Vec<(Value, usize)> = Vec::new();
+        // GNU `concat_to_string': a sizing pass, then one copy into a buffer of
+        // the right size.  Properties are merged only when some argument has
+        // any, so the common plain-string call allocates the result and nothing
+        // else.
+        let mut dest_multibyte = false;
+        let mut total_bytes = 0usize;
+        let mut any_properties = false;
+        for arg in args {
+            if let Some(string) = arg.as_lisp_string() {
+                dest_multibyte |= string.is_multibyte();
+                total_bytes = total_bytes.saturating_add(string.sbytes());
+            }
+            any_properties |= string_has_text_properties_for_value(*arg);
+        }
+        let mut combined = Vec::with_capacity(total_bytes);
+        let mut string_sources: Vec<(Value, usize)> = if any_properties {
+            Vec::with_capacity(args.len())
+        } else {
+            Vec::new()
+        };
         let mut result_chars = 0usize;
         let mut count_kind = crate::heap_types::StringCharacterCountKind::Computed;
         for arg in args {
             if let Some(string) = arg.as_lisp_string() {
-                string_sources.push((*arg, result_chars));
+                if any_properties {
+                    string_sources.push((*arg, result_chars));
+                }
                 result_chars = checked_concat_chars(result_chars, string.schars())?;
                 if string.character_count_kind()
                     == crate::heap_types::StringCharacterCountKind::Supplied
@@ -533,7 +549,9 @@ pub fn concat_impl(args: &[Value]) -> EvalResult {
             crate::heap_types::LispString::from_unibyte(combined)
         });
 
-        if let Some(combined_table) = concatenated_string_text_properties(&string_sources) {
+        if any_properties
+            && let Some(combined_table) = concatenated_string_text_properties(&string_sources)
+        {
             set_string_text_properties_table_for_value(new_val, combined_table);
         }
         return Ok(new_val);

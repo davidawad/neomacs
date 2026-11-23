@@ -608,7 +608,9 @@ pub fn builtin_mapconcat(eval: &mut super::eval::Context, args: Vec<Value>) -> E
         }
     };
 
-    let mut concat_args = Vec::with_capacity(len * 2 - 1);
+    // Separators interleaved with the mapped values: inline for the common
+    // short list (`string-join` of a few tags) instead of a heap vector.
+    let mut concat_args: SmallVec<[Value; 16]> = SmallVec::with_capacity(len * 2 - 1);
     for index in 0..len {
         if index > 0 {
             concat_args.push(separator);
@@ -620,7 +622,7 @@ pub fn builtin_mapconcat(eval: &mut super::eval::Context, args: Vec<Value>) -> E
         });
     }
 
-    let result = builtin_concat(concat_args);
+    let result = super::strings::builtin_concat_slice(&concat_args);
     eval.restore_vm_roots(roots);
     result
 }

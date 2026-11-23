@@ -148,6 +148,70 @@ fn substring_of_a_propertized_string_tiles_the_overlapping_runs() {
 }
 
 #[test]
+fn concat_and_mapconcat_of_plain_and_propertized_strings_agree_with_the_generic_path() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = eval_with_text("");
+    // The all-strings fast path of `concat` against the generic path (a list of
+    // characters takes it): same text, same multibyteness; the property runs of
+    // the propertized cases are compared with `equal-including-properties` and
+    // the text of the generic result is rebuilt from `substring`s.
+    let result = eval
+        .eval_str(
+            r#"(let* ((unibyte (string-to-unibyte "ab"))
+                      (plain (list "x" "" "yz" unibyte "\u00e9t\u00e9" "w"))
+                      (fancy (list "x" (propertize "yz" 'face 'bold) ""
+                                   (propertize "\u00e9" 'k 1 'face 'italic) "q"
+                                   (propertize "w" 'face 'bold)))
+                      (sep (propertize "," 'sep t))
+                      (generic (lambda (strings)
+                                 ;; Same pieces, joined through `substring' of a
+                                 ;; list-argument concat: one char list, then the
+                                 ;; properties re-applied run by run.
+                                 (let ((out (apply #'concat (mapcar (lambda (s) (append s nil))
+                                                                    strings)))
+                                       (pos 0))
+                                   (mapc (lambda (s)
+                                           (let ((i 0) (n (length s)))
+                                             (while (< i n)
+                                               (let ((next (or (next-property-change i s) n)))
+                                                 (set-text-properties
+                                                  (+ pos i) (+ pos next)
+                                                  (text-properties-at i s) out)
+                                                 (setq i next))))
+                                           (setq pos (+ pos (length s))))
+                                         strings)
+                                   out)))
+                      (fast-plain (apply #'concat plain))
+                      (fast-fancy (apply #'concat fancy)))
+                 (list (equal-including-properties fast-plain (funcall generic plain))
+                       (equal-including-properties fast-fancy (funcall generic fancy))
+                       (multibyte-string-p fast-plain)
+                       (multibyte-string-p (concat "a" unibyte))
+                       (list (concat) (concat "") (concat nil "k" nil) (concat "a" "b" "c"))
+                       (equal-including-properties
+                        (mapconcat #'identity fancy sep)
+                        (apply #'concat
+                               (cdr (apply #'append
+                                           (mapcar (lambda (s) (list sep s)) fancy)))))
+                       (mapconcat #'identity (list unibyte unibyte) "-")
+                       (multibyte-string-p (mapconcat #'identity (list unibyte unibyte) "-"))
+                       (mapconcat #'upcase (list "ab" "cd" "ef") "")
+                       (mapconcat #'identity nil "-")))"#,
+        )
+        .expect("concat and mapconcat");
+
+    let text = format!("{result}");
+    assert!(
+        text.starts_with("(t t t nil (\"\" \"\" \"k\" \"abc\") "),
+        "concat results: {text}"
+    );
+    assert!(
+        text.ends_with(" t \"ab-ab\" nil \"ABCDEF\" \"\")"),
+        "mapconcat results: {text}"
+    );
+}
+
+#[test]
 fn get_text_property_out_of_range_signal_uses_gnu_point_range_payload() {
     crate::test_utils::init_test_tracing();
     let mut eval = eval_with_text("hello");
