@@ -1977,18 +1977,7 @@ impl TaggedHeap {
         // like the list survivors' — `live_bytes` drives the adaptive pacer
         // (`effective_gc_threshold_bytes`), so an undercount here means
         // overtriggering.
-        let (page_live_bytes, _page_freed) = self.sweep_arena_pages_ranges(ArenaSweepRanges {
-            float: PageRange::all(self.float_arena.pages.len()),
-            string: PageRange::all(self.string_arena.pages.len()),
-            vector: PageRange::all(self.vector_arena.pages.len()),
-            bytecode: PageRange::all(self.bytecode_arena.pages.len()),
-            lambda: PageRange::all(self.lambda_arena.pages.len()),
-            macro_: PageRange::all(self.macro_arena.pages.len()),
-            record: PageRange::all(self.record_arena.pages.len()),
-            symbol_with_pos: PageRange::all(self.symbol_with_pos_arena.pages.len()),
-            marker: PageRange::all(self.marker_arena.pages.len()),
-            bignum: PageRange::all(self.bignum_arena.pages.len()),
-        });
+        let (page_live_bytes, _page_freed) = self.sweep_arena_pages_eager();
         // `sweep_cons` above already released the blocks with no survivors,
         // in its own pass, the way GNU's `sweep_conses` does.
         let _released_object_pages = self.release_empty_object_pages();
@@ -2216,3 +2205,28 @@ mod generation_tests;
 #[cfg(test)]
 #[path = "tests/permanent_box_chain_test.rs"]
 mod permanent_box_chain_tests;
+
+/// Without the shared heap there is one thread: the eager sweeps are serial.
+#[cfg(not(feature = "shared-heap"))]
+impl TaggedHeap {
+    /// Sweep every object arena's pages, on this thread.
+    pub(super) fn sweep_arena_pages_eager(&mut self) -> (usize, usize) {
+        self.sweep_arena_pages_ranges(ArenaSweepRanges {
+            float: PageRange::all(self.float_arena.pages.len()),
+            string: PageRange::all(self.string_arena.pages.len()),
+            vector: PageRange::all(self.vector_arena.pages.len()),
+            bytecode: PageRange::all(self.bytecode_arena.pages.len()),
+            lambda: PageRange::all(self.lambda_arena.pages.len()),
+            macro_: PageRange::all(self.macro_arena.pages.len()),
+            record: PageRange::all(self.record_arena.pages.len()),
+            symbol_with_pos: PageRange::all(self.symbol_with_pos_arena.pages.len()),
+            marker: PageRange::all(self.marker_arena.pages.len()),
+            bignum: PageRange::all(self.bignum_arena.pages.len()),
+        })
+    }
+
+    /// No cons block is swept ahead of the serial pass.
+    pub(super) fn presweep_cons_blocks(&mut self, _order: &[usize], _generational: bool) -> Option<Vec<PreSwept>> {
+        None
+    }
+}

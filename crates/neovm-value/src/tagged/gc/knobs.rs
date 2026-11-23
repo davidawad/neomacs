@@ -15,6 +15,7 @@
 //! | `NEOVM_GC_MAJOR_GROWTH_PERCENT` | `15` | major growth limit, with an 8 MiB floor; generational only |
 //! | `NEOVM_GC_MAJOR_MAX_MINORS` | `64` | maximum completed minors between majors; generational only |
 //! | `NEOVM_GC_STRESS_MAJOR_EVERY` | `8` | stressed cycle stride, normalized to at least one; generational only |
+//! | `NEOVM_GC_SWEEP_THREADS` | cores, at most 8 | threads of an explicit collection's stopped-world sweep; `0` or `1` sweeps on the caller alone (`parallel_sweep.rs`) |
 //! | `NEOVM_GC_VEC_SCAN=defer` | `snapshot` | MEASUREMENT ONLY (falsifier F-G (c), P3.2 F1b): no Tier-B vector snapshot and no vector claims, so page vectors defer to the stop-the-world termination and are traced by reachability |
 //!
 //! A heap reads the knobs once, in `TaggedHeap::new`. Legacy test overrides
@@ -68,6 +69,7 @@ thread_local! {
     static VEC_SCAN_OVERRIDE: std::cell::Cell<Option<VecScanMode>> = const { std::cell::Cell::new(None) };
     static CONCURRENT_CLAIMS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static CARD_TAG_FILTER_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static SWEEP_THREADS_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// `NEOVM_GC_CENSUS` / `NEOVM_GC_CENSUS_REMSET`.
@@ -88,6 +90,42 @@ pub(crate) fn census_mode() -> CensusMode {
             CensusMode::Off
         }
     })
+}
+
+/// `NEOVM_GC_SWEEP_THREADS`: the most threads an eager sweep uses.
+#[cfg(feature = "shared-heap")]
+pub(crate) fn sweep_threads() -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(threads) = SWEEP_THREADS_OVERRIDE.with(|c| c.get()) {
+        return threads;
+    }
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        const MOST: usize = 8;
+        match std::env::var("NEOVM_GC_SWEEP_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            Some(threads) => {
+                note_knob("NEOVM_GC_SWEEP_THREADS", &threads.to_string());
+                threads.min(MOST)
+            }
+            None => std::thread::available_parallelism().map_or(1, |cores| cores.get().min(MOST)),
+        }
+    })
+}
+
+/// Run F with the eager sweep limited to THREADS on this thread.
+#[cfg(all(feature = "shared-heap", any(test, feature = "test-support")))]
+pub(crate) fn with_sweep_threads_for_test<R>(threads: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SWEEP_THREADS_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(SWEEP_THREADS_OVERRIDE.with(|c| c.replace(Some(threads))));
+    f()
 }
 
 /// `NEOVM_GC_CHUNK_MAP`.

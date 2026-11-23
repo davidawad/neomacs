@@ -1586,6 +1586,11 @@ impl TaggedHeap {
                 .withhold(self.cons_blocks.iter().map(ConsBlockBase::of));
         }
         let verify_generational = GENERATIONAL && self.generational.verify;
+        // Every block is visited, in index order: sweep them on threads first
+        // when there are enough, and let the pass below only publish.
+        let order: Vec<usize> = (0..self.cons_blocks.len()).collect();
+        let presweeps = self.presweep_cons_blocks(&order, GENERATIONAL);
+        let mut visited = 0usize;
 
         // Like GNU's `sweep_conses`, decide each block's fate in this pass.
         // Its private free list is published only for a retained block; an
@@ -1613,12 +1618,19 @@ impl TaggedHeap {
                 // Decide each block in place; an empty one leaves the vector
                 // with its storage, for `recycle_released`.
                 let mut keep = |block: &mut ConsBlock| {
-                    let mut head = std::ptr::null_mut();
-                    let live = if GENERATIONAL {
-                        block.sweep_generational(&mut head)
-                    } else {
-                        block.sweep(&mut head)
+                    let (head, live) = match &presweeps {
+                        Some(presweeps) => (presweeps[visited].head, presweeps[visited].live),
+                        None => {
+                            let mut head = std::ptr::null_mut();
+                            let live = if GENERATIONAL {
+                                block.sweep_generational(&mut head)
+                            } else {
+                                block.sweep(&mut head)
+                            };
+                            (head, live)
+                        }
                     };
+                    visited += 1;
                     if live == 0 {
                         if GENERATIONAL {
                             // SAFETY: exact rebuilt list in retained owned storage;
@@ -3127,6 +3139,18 @@ impl TaggedHeap {
     }
 }
 
+/// Cons cells a pre-sweep thread rebuilt the dead list of, for the serial
+/// pass to publish (`parallel_sweep.rs`).
+#[derive(Clone, Copy)]
+pub(super) struct PreSwept {
+    pub(super) head: *mut ConsCell,
+    pub(super) live: usize,
+}
+
+// SAFETY: `head` names dead cells of one block, which no thread uses until the
+// requester publishes the list after the pre-sweep threads have joined.
+unsafe impl Send for PreSwept {}
+
 /// One share of [`TaggedHeap::sweep_in_stop_on`]: runs of pages of each
 /// class, and some of the dead boxes.
 #[cfg(feature = "shared-heap")]
@@ -3529,6 +3553,20 @@ impl SweptPayload for VectorObj {
                 .push(std::mem::replace(data, LispValueVec::owned(Vec::new())));
         }
     }
+}
+
+/// A record's payload is the slot vector its drop in place frees, on any
+/// thread, as a vector's does.
+#[cfg(feature = "shared-heap")]
+impl SweptPayload for RecordObj {
+    unsafe fn hand_over(_slot: *mut Self, _payloads: &mut SweptPayloads) {}
+}
+
+/// A closure's payload is its slot vector and the parsed parameter lists,
+/// plain allocator memory that its drop in place frees on any thread.
+#[cfg(feature = "shared-heap")]
+impl SweptPayload for LambdaObj {
+    unsafe fn hand_over(_slot: *mut Self, _payloads: &mut SweptPayloads) {}
 }
 
 #[cfg(feature = "shared-heap")]

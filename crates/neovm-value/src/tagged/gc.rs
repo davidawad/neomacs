@@ -2597,6 +2597,8 @@ mod record_arena_tests;
 /// matters) VERIFY_PARTITION.
 mod allocation;
 #[cfg(feature = "shared-heap")]
+mod parallel_sweep;
+#[cfg(feature = "shared-heap")]
 #[cfg_attr(
     not(test),
     allow(
@@ -2920,6 +2922,10 @@ mod marker_arena_tests;
 #[cfg(all(test, feature = "shared-heap"))]
 #[path = "gc/tests/sweep_in_stop_test.rs"]
 mod sweep_in_stop_tests;
+/// An explicit collection's sweep on threads leaves what the serial sweep leaves.
+#[cfg(all(test, feature = "shared-heap"))]
+#[path = "gc/tests/parallel_sweep_test.rs"]
+mod parallel_sweep_tests;
 /// Record and closure slot stores are atomic: race-free against an atomic
 /// reader, same semantics, same barrier through a concurrent mark.
 #[cfg(test)]
