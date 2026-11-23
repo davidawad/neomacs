@@ -210,6 +210,8 @@ cached_symbol_id!(cond_shape_symbol, "cond");
 
 struct FactsBuilder {
     facts: ClosureFacts,
+    /// A `_` variable is used (see [`FactsRefusal::UnderscoreUse`]).
+    underscore_use: bool,
     index: FxHashMap<SymId, usize>,
     steps: usize,
 }
@@ -242,7 +244,7 @@ impl FactsBuilder {
             }
         }
         if occurrence != Occurrence::Binder && resolve_sym(id).starts_with('_') {
-            return Err(FactsRefusal::UnderscoreUse);
+            self.underscore_use = true;
         }
         Ok(())
     }
@@ -271,7 +273,19 @@ impl FactsBuilder {
 impl ClosureFacts {
     #[doc(hidden)]
     pub fn of(args: Value, body: Value) -> Result<Self, FactsRefusal> {
+        match Self::of_lenient(args, body)? {
+            (_, true) => Err(FactsRefusal::UnderscoreUse),
+            (facts, false) => Ok(facts),
+        }
+    }
+
+    /// [`Self::of`] that reports a used `_` variable instead of refusing: a
+    /// macro's source may spell one (`pcase`'s `_` pattern, `dotimes`'s
+    /// ignored counter) that its expansion no longer holds.
+    #[doc(hidden)]
+    pub fn of_lenient(args: Value, body: Value) -> Result<(Self, bool), FactsRefusal> {
         let mut b = FactsBuilder {
+            underscore_use: false,
             facts: ClosureFacts::default(),
             index: FxHashMap::default(),
             steps: 0,
@@ -408,7 +422,7 @@ impl ClosureFacts {
                 }
             }
         }
-        Ok(b.facts)
+        Ok((b.facts, b.underscore_use))
     }
 }
 

@@ -468,13 +468,25 @@ fn stats_classify_eligibility() {
         &mut eval,
         "(put 'cm-cm2 'compiler-macro (lambda (form &rest _) form))",
     );
+    // An alias chain longer than the memo follows: `macrop` cannot resolve it.
+    eval_ok(
+        &mut eval,
+        "(dotimes (i 105)
+           (defalias (intern (format \"cm-chain-%d\" i))
+                     (intern (format \"cm-chain-%d\" (1+ i)))))",
+    );
     for (form, event) in [
         (
             "(let ((a 1)) (lambda () (list a)))",
             CconvMemoEvent::Eligible,
         ),
+        // A macro head is eligible now: the memo keeps the expansion.
         (
             "(let ((a 1)) (lambda () (when a 1)))",
+            CconvMemoEvent::Eligible,
+        ),
+        (
+            "(let ((a 1)) (lambda () (cm-chain-0 a)))",
             CconvMemoEvent::RefuseMacroHead,
         ),
         (
@@ -487,6 +499,10 @@ fn stats_classify_eligibility() {
         ),
         (
             "(let ((a 1)) (lambda () (interactive) a))",
+            CconvMemoEvent::Eligible,
+        ),
+        (
+            "(let ((a 1)) (lambda () (list 'interactive a)))",
             CconvMemoEvent::RefuseInteractive,
         ),
     ] {
@@ -849,18 +865,21 @@ fn facts_changes_between_creations_miss() {
     assert_eq!(after_defvar, printed(&mut off, "(cm-facts)"));
 
     // A head that becomes a macro, a compiler macro, or an autoloaded macro.
-    for (change, undo) in [
+    for (change, undo, refused_now) in [
         (
             "(defmacro cm-f2 (&rest args) `(list ,@args))",
             "(fmakunbound 'cm-f2)",
+            0,
         ),
         (
             "(put 'cm-f2 'compiler-macro (lambda (form &rest _) form))",
             "(put 'cm-f2 'compiler-macro nil)",
+            1,
         ),
         (
             "(autoload 'cm-f2 \"cm-nowhere\" nil nil 'macro)",
             "(fmakunbound 'cm-f2)",
+            0,
         ),
     ] {
         printed(&mut eval, "(cm-facts)");
@@ -877,7 +896,7 @@ fn facts_changes_between_creations_miss() {
         assert_eq!(
             count(&eval, CconvMemoEvent::RefuseMacroHead)
                 + count(&eval, CconvMemoEvent::RefuseCompilerMacroHead),
-            refused + 1,
+            refused + refused_now,
             "{change}"
         );
         eval_ok(&mut eval, undo);
@@ -974,6 +993,187 @@ fn unmemoizable_and_mutated_bodies() {
         "{}",
         on.cconv_memo_report()
     );
+}
+
+/// Evaluate every form in both contexts.
+fn define_in_both(off: &mut Context, on: &mut Context, forms: &[&str]) {
+    for form in forms {
+        eval_ok(off, form);
+        eval_ok(on, form);
+    }
+}
+
+/// Opportunity 2: a body with macro heads is served from the recorded
+/// expansion, and the served closures behave and print as the Lisp's.
+#[test]
+fn macro_bodies_are_served_from_the_recorded_expansion() {
+    crate::test_utils::init_test_tracing();
+    let mut off = startup(CconvMemoMode::Off);
+    let mut on = startup(CconvMemoMode::On);
+    define_in_both(
+        &mut off,
+        &mut on,
+        &["(defun cm-mac (v)
+               (let ((a v) (b 2))
+                 (lambda (x)
+                   (when (> x 0) (push x a))
+                   (unless a (setq b 1))
+                   (list a b))))"],
+    );
+    let probe = "(let ((f (cm-mac 5))) (list (funcall f 3) (funcall f 4) (funcall f -1)))";
+    let expected = printed(&mut off, probe);
+    for _ in 0..4 {
+        assert_eq!(printed(&mut on, probe), expected);
+    }
+    assert_eq!(
+        printed(&mut on, "(cm-mac 5)"),
+        printed(&mut off, "(cm-mac 5)")
+    );
+    assert!(
+        count(&on, CconvMemoEvent::ServedExpanded) >= 2,
+        "{}",
+        on.cconv_memo_report()
+    );
+    assert_eq!(count(&on, CconvMemoEvent::RefuseMacroHead), 0);
+    // The expansion is shared, as a .elc's constant vector is.
+    assert_eq!(
+        printed(
+            &mut on,
+            "(let ((f1 (cm-mac 1)) (f2 (cm-mac 2)))
+               (list (equal (aref f1 1) (aref f2 1)) (eq (aref f1 1) (aref f2 1))))"
+        ),
+        "(t t)"
+    );
+}
+
+/// A macro redefined between two creations is expanded afresh (V8), and an
+/// outer `macroexp--dynvars` bypasses the recorded expansion (V10).
+#[test]
+fn a_recorded_expansion_follows_macro_redefinition_and_dynvars() {
+    crate::test_utils::init_test_tracing();
+    let mut off = startup(CconvMemoMode::Off);
+    let mut on = startup(CconvMemoMode::On);
+    define_in_both(
+        &mut off,
+        &mut on,
+        &[
+            "(defmacro cm-m2 (x) `(list ,x 1))",
+            "(defun cm-use2 (v) (let ((a v)) (lambda () (cm-m2 a))))",
+        ],
+    );
+    let probe = "(funcall (cm-use2 3))";
+    for _ in 0..4 {
+        assert_eq!(printed(&mut on, probe), printed(&mut off, probe));
+    }
+    assert!(count(&on, CconvMemoEvent::ServedExpanded) >= 1);
+
+    let stale = count(&on, CconvMemoEvent::MissEpoch);
+    define_in_both(&mut off, &mut on, &["(defmacro cm-m2 (x) `(list ,x 2))"]);
+    assert_eq!(printed(&mut on, probe), "(3 2)");
+    assert_eq!(printed(&mut on, probe), printed(&mut off, probe));
+    assert_eq!(count(&on, CconvMemoEvent::MissEpoch), stale + 1);
+
+    // Recorded again at the new epoch, served again.
+    for _ in 0..3 {
+        printed(&mut on, probe);
+    }
+    let served = count(&on, CconvMemoEvent::ServedExpanded);
+    printed(&mut on, probe);
+    assert_eq!(count(&on, CconvMemoEvent::ServedExpanded), served + 1);
+
+    let dynvars = "(let ((macroexp--dynvars '(cm-dv))) (funcall (cm-use2 3)))";
+    let stale = count(&on, CconvMemoEvent::MissEpoch);
+    assert_eq!(printed(&mut on, dynvars), printed(&mut off, dynvars));
+    assert_eq!(count(&on, CconvMemoEvent::MissEpoch), stale + 1);
+}
+
+/// Interactive lambdas are served: the interactive form is part of the key,
+/// and one that reads a captured variable keeps it in the environment.
+#[test]
+fn interactive_lambdas_are_served() {
+    crate::test_utils::init_test_tracing();
+    let mut off = startup(CconvMemoMode::Off);
+    let mut on = startup(CconvMemoMode::On);
+    define_in_both(
+        &mut off,
+        &mut on,
+        &[
+            "(defun cm-int (v) (let ((a v)) (lambda (n) (interactive \"p\") (list a n))))",
+            "(defun cm-int2 (v) (let ((a v)) (lambda (n) (interactive (list (+ a 1))) (list a n))))",
+            "(defun cm-int3 (v) (let ((a v)) (lambda (n) (interactive \"p\") (when n (list a n)))))",
+        ],
+    );
+    let probe = "(list (call-interactively (cm-int 7))
+                       (call-interactively (cm-int2 7))
+                       (call-interactively (cm-int3 7))
+                       (aref (cm-int2 7) 2)
+                       (interactive-form (cm-int2 7)))";
+    let expected = printed(&mut off, probe);
+    for _ in 0..4 {
+        assert_eq!(printed(&mut on, probe), expected);
+    }
+    assert_eq!(count(&on, CconvMemoEvent::RefuseInteractive), 0);
+    assert!(
+        count(&on, CconvMemoEvent::Served) >= 6,
+        "{}",
+        on.cconv_memo_report()
+    );
+    assert!(count(&on, CconvMemoEvent::ServedExpanded) >= 2);
+}
+
+/// A body whose expansion calls `gensym` is recorded and served; the
+/// expansion shares its gensyms.
+#[test]
+fn expansions_that_gensym_are_recorded_and_served() {
+    crate::test_utils::init_test_tracing();
+    let mut off = startup(CconvMemoMode::Off);
+    let mut on = startup(CconvMemoMode::On);
+    define_in_both(
+        &mut off,
+        &mut on,
+        &[
+            "(defmacro cm-gs (e) (let ((g (gensym \"cm\"))) `(let ((,g ,e)) (list ,g ,g))))",
+            "(defun cm-use-gs (v) (let ((a v)) (lambda () (cm-gs a))))",
+        ],
+    );
+    let probe = "(funcall (cm-use-gs 4))";
+    for _ in 0..5 {
+        assert_eq!(printed(&mut on, probe), printed(&mut off, probe));
+    }
+    assert!(
+        count(&on, CconvMemoEvent::ServedExpanded) >= 2,
+        "{}",
+        on.cconv_memo_report()
+    );
+    assert_eq!(count(&on, CconvMemoEvent::RunEffect), 0);
+}
+
+/// `verify` compares every served expansion with the Lisp's (a mismatch
+/// panics under strict).
+#[test]
+fn verify_mode_matches_macro_and_interactive_bodies() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = startup(CconvMemoMode::Verify);
+    set_cconv_memo_strict_for_test(&mut eval, true);
+    for form in [
+        "(defmacro cm-vg (e) (let ((g (gensym \"cv\"))) `(let ((,g ,e)) (list ,g ,g))))",
+        "(defun cm-v1 (v) (let ((a v) (l nil)) (lambda (x) (when x (push x l)) (dolist (e l) (setq a e)) (cm-vg a))))",
+        "(defun cm-v2 (v) (let ((a v)) (lambda (n) (interactive (list (when a a))) (unless n (setq a 1)) (list a n))))",
+    ] {
+        eval_ok(&mut eval, form);
+    }
+    for _ in 0..4 {
+        eval_ok(
+            &mut eval,
+            "(list (funcall (cm-v1 3) 2) (call-interactively (cm-v2 5)))",
+        );
+    }
+    assert!(
+        count(&eval, CconvMemoEvent::VerifyMatch) >= 4,
+        "{}",
+        eval.cconv_memo_report()
+    );
+    assert_eq!(count(&eval, CconvMemoEvent::VerifyMismatch), 0);
 }
 
 /// T0.12: verify detects a wrong analysis (injected), counts it, and

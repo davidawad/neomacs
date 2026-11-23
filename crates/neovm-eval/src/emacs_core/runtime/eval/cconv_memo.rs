@@ -15,15 +15,14 @@
 //!
 //! A trimming call is *eligible* when the memo could serve it: the trusted
 //! set stands (`cconv_trust`), a well-formed environment, a source whose
-//! [`ClosureShape`] and [`ClosureFacts`] exist, no interactive form, and
-//! every head [`HeadVerdict::Plain`] -- no macro, autoloaded macro or
-//! compiler macro, as `macroexpand-1` (macroexp.el:225-247) and
+//! [`ClosureShape`] and [`ClosureFacts`] exist, and no compiler-macro or
+//! unresolvable head, as `macroexpand-1` (macroexp.el:225-247) and
 //! `function-get` (subr.el:4836-4854) would see it.
 //!
 //! The first eligible call on a body is *recorded*: the real Lisp runs, and
 //! its result is kept only if it signalled nothing, moved no
-//! [`EffectSnapshot`] counter, left the trusted set standing and returned an
-//! identity closure (args and body `eq` to the inputs) whose environment is
+//! [`EffectSnapshot`] counter (but `gensym-counter`), left the trusted set
+//! standing and returned a closure with `eq` args whose environment is
 //! `(assq V ENV)` cells for some lexical variables V followed by some bare
 //! symbols, or cconv's `(t)` constant.  The entry keeps that *analysis* --
 //! the ordered captured variables and dynamic symbols -- never a closure,
@@ -59,6 +58,38 @@
 //! `maybe_gc` point -- eval.c:2602, eval.c:3206, bytecode.c -- allocation
 //! trips a collection, inside a cconv run or, when the memo spares that
 //! allocation, somewhere after it).
+//!
+//! # Macro heads, rewritten bodies and interactive forms
+//!
+//! cconv.el:954-972 hands the closure the *macroexpanded* body, so a source
+//! with a macro head used to be refused (22 us per creation against 1 us for
+//! a hit).  A call whose heads include macros is now recorded too, and the
+//! entry keeps the body the real run returned (`expanded`, a GC root).  A
+//! hit builds the closure over that body, as a `.elc` shares one constant
+//! vector between its closures; two closures made from one source are
+//! `equal` in body, and `eq` once recorded.  The entry adds to V1-V7:
+//!
+//! - V8: no function cell has been written since the recording, so no function
+//!   cell (macro, alias, autoload) changed (`function_cell_clock`);
+//! - V9: the interactive form is the recorded one (`eq`, and the same
+//!   tokens): cconv.el:951 expands it with the body, so a captured variable
+//!   it reads stays in the environment;
+//! - V10: `macroexp--dynvars` is the recorded list (`eq`; cconv.el:957-960
+//!   adds it to the expansion's environment, and a file that `defvar`s
+//!   leaves it set for the rest of the file);
+//! - V5 also covers the expansion: every symbol of the expanded body keeps
+//!   its recorded specialness and every head is still plain, so a compiler
+//!   macro `put` on a head of the expansion misses.
+//!
+//! A source macro head is not checked against [`HeadVerdict::Plain`] (V8
+//! covers it); compiler-macro and unresolvable heads still refuse.  The
+//! effect check ignores `gensym-counter`: a macro that gensyms leaves its
+//! gensyms in the shared expansion, and a served creation does not advance
+//! the counter, exactly as a `.elc` does not.  `cconv--interactive-form-funs`
+//! (cconv.el:776) is keyed by a transient form and read only by the
+//! compiler, so the memo does not reproduce its write.  What a macro reads
+//! other than function cells and symbol plists when it expands is frozen at
+//! the recording, as in a `.elc`.
 //!
 //! # Knob
 //!
@@ -105,11 +136,11 @@
 //! verify mismatch names the fields that moved (and the function cells
 //! written, and the collections completed, during the run).
 
-use super::cconv_shape::{ClosureFacts, ClosureShape, EnvSummary, FactsRefusal};
+use super::cconv_shape::{ClosureFacts, ClosureShape, EnvSummary};
 use super::cconv_trust::TrustedSet;
 use super::*;
 use neovm_value::symbol::FunctionEpochBump;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use strum::{EnumCount, IntoEnumIterator};
 
 // ---------------------------------------------------------------------------
@@ -295,6 +326,13 @@ pub(crate) enum CconvMemoEvent {
     /// A collection completed during an observed run: its finalizers and
     /// `post-gc-hook` ran when the run ended.
     GcHooksDeferred,
+    /// `on`: the hit handed back a recorded macroexpanded body.
+    ServedExpanded,
+    /// A recorded macroexpansion is out of date: a function cell moved since
+    /// it was recorded, or `macroexp--dynvars` is another list (V8, V10).
+    MissEpoch,
+    /// The entry was recorded for another interactive form (V9).
+    MissIform,
 }
 
 impl CconvMemoEvent {
@@ -336,6 +374,9 @@ impl CconvMemoEvent {
         Self::RecordRefused,
         Self::Cleared,
         Self::GcHooksDeferred,
+        Self::ServedExpanded,
+        Self::MissEpoch,
+        Self::MissIform,
     ];
 }
 
@@ -413,6 +454,30 @@ pub(crate) struct EffectSnapshot {
 }
 
 impl EffectSnapshot {
+    /// Whether AFTER differs from this snapshot in anything but
+    /// `gensym-counter`: a macro that calls `gensym` moves the counter, and a
+    /// served expansion shares its gensyms as a `.elc` does.
+    #[doc(hidden)]
+    pub fn moved_beyond_gensym(&self, after: &EffectSnapshot) -> bool {
+        let EffectSnapshot {
+            loads,
+            outputs,
+            next_buffer_id,
+            buffer_ticks,
+            gensym_counter: _,
+            function_epoch,
+            obarray_len,
+            match_data,
+        } = self;
+        *loads != after.loads
+            || *outputs != after.outputs
+            || *next_buffer_id != after.next_buffer_id
+            || *buffer_ticks != after.buffer_ticks
+            || *function_epoch != after.function_epoch
+            || *obarray_len != after.obarray_len
+            || *match_data != after.match_data
+    }
+
     /// The fields that differ in AFTER, as `name: before -> after`, for a
     /// verify mismatch report.
     #[doc(hidden)]
@@ -605,6 +670,17 @@ impl CconvMemo {
     #[doc(hidden)]
     pub fn trace_roots(&self, visit: &mut dyn FnMut(Value)) {
         self.trusted.trace_roots(visit);
+        for entry in self.entries.values().flatten() {
+            if let Some(expanded) = entry.expanded {
+                visit(expanded);
+            }
+            if !entry.iform.is_nil() {
+                visit(entry.iform);
+            }
+            if !entry.dynvars.is_nil() {
+                visit(entry.dynvars);
+            }
+        }
     }
 
     #[doc(hidden)]
@@ -625,6 +701,9 @@ struct MemoFact {
     id: SymId,
     head: bool,
     special: bool,
+    /// A macro head of the source: its definition is guarded by the function
+    /// epoch (V8), not by a [`HeadVerdict::Plain`] check.
+    macro_head: bool,
 }
 
 /// One recorded analysis (see the module docs).
@@ -640,18 +719,43 @@ struct MemoEntry {
     dynv: Box<[SymId]>,
     /// Depth the real run may use beyond the current depth (V7).
     depth_budget: usize,
+    /// The body `macroexpand-all` returned when it is not the source body
+    /// (cconv.el:966-971); a hit builds the closure over it.  Traced as a
+    /// root.
+    expanded: Option<Value>,
+    /// The interactive form the run saw (V9), `nil` for none.  Traced as a
+    /// root, so its address stays this one's.
+    iform: Value,
+    /// The tokens of `iform` when it is not `nil`.
+    iform_shape: Option<ClosureShape>,
+    /// The value of `macroexp--dynvars` the expansion was recorded under
+    /// (V10), traced as a root so its address stays this one's.
+    dynvars: Value,
+    /// [`function_cell_clock`] when the expansion was recorded (V8).
+    function_epoch: u64,
 }
 
 /// A validated entry's analysis, copied out of the map.
 struct MemoHit {
     lexv: SmallVec<[SymId; 8]>,
     dynv: SmallVec<[SymId; 4]>,
+    expanded: Option<Value>,
 }
 
 /// What a recording run can be kept as.
 struct Analysis {
     shape: ClosureShape,
     facts: Box<[MemoFact]>,
+    iform_shape: Option<ClosureShape>,
+    /// Some head is a macro: the expansion rewrites the body.
+    macro_heads: bool,
+}
+
+/// What a recording run's closure tells the memo.
+struct DerivedResult {
+    lexv: Box<[SymId]>,
+    dynv: Box<[SymId]>,
+    expanded: Option<Value>,
 }
 
 /// A Lisp run between two [`EffectSnapshot`]s ([`Context::cconv_observe_lisp`]).
@@ -676,9 +780,28 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// Function-cell writes in this process: the `function_epoch` moves that
+/// can change what a macro or an alias means, not the ones that rewrite a
+/// subr in place, toggle compiler overrides or admit a thread.  Shared by
+/// every [`Context`] (another context's write only misses an entry).
+static FUNCTION_CELL_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// The clock V8 validates a recorded expansion against.
+fn function_cell_clock() -> u64 {
+    FUNCTION_CELL_WRITES.load(Ordering::Acquire)
+}
+
 /// A function-cell write or other `function_epoch` move (the obarray calls
 /// this for every one); logged only while a verify run is observed.
 pub(crate) fn note_function_epoch_move(why: FunctionEpochBump, sym: Option<SymId>) {
+    if !matches!(
+        why,
+        FunctionEpochBump::SubrRewrite
+            | FunctionEpochBump::CompilerOverrides
+            | FunctionEpochBump::ThreadAdmission
+    ) {
+        FUNCTION_CELL_WRITES.fetch_add(1, Ordering::Release);
+    }
     OBSERVED_FUNCTION_WRITES.with(|log| {
         if let Some(log) = log.borrow_mut().as_mut()
             && log.len() < OBSERVED_WRITE_LOG_CAP
@@ -748,6 +871,7 @@ cached_symbol_id!(
     macroexp_inhibit_compiler_macros_symbol,
     "macroexp-inhibit-compiler-macros"
 );
+cached_symbol_id!(macroexp_dynvars_symbol, "macroexp--dynvars");
 cached_symbol_id!(gensym_counter_symbol, "gensym-counter");
 cached_symbol_id!(compiler_macro_symbol, "compiler-macro");
 cached_symbol_id!(autoload_cell_symbol, "autoload");
@@ -809,10 +933,47 @@ fn env_assq(env: Value, var: SymId) -> Option<Value> {
     None
 }
 
+/// Whether two closure bodies are the same source or expansions of one
+/// another: `eq`, or `equal` with the symbols two expansions of one macro
+/// gensym (`cv0`, `cv1`) paired one to one by name stem.
+fn bodies_agree(memo: Value, lisp: Value) -> bool {
+    fn stem(id: SymId) -> String {
+        resolve_sym(id)
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .to_owned()
+    }
+    let mut paired: FxHashMap<SymId, SymId> = FxHashMap::default();
+    let mut paired_back: FxHashMap<SymId, SymId> = FxHashMap::default();
+    let mut pending = vec![(memo, lisp)];
+    while let Some((a, b)) = pending.pop() {
+        if a == b {
+            continue;
+        }
+        if a.is_cons() && b.is_cons() {
+            pending.push((a.cons_cdr(), b.cons_cdr()));
+            pending.push((a.cons_car(), b.cons_car()));
+            continue;
+        }
+        match (a.as_bare_symbol_id(), b.as_bare_symbol_id()) {
+            (Some(x), Some(y)) => {
+                if stem(x) != stem(y)
+                    || *paired.entry(x).or_insert(y) != y
+                    || *paired_back.entry(y).or_insert(x) != x
+                {
+                    return false;
+                }
+            }
+            (None, None) if neovm_value::value::equal_value(&a, &b, 0) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Whether two closures are the same object element by element, with
 /// their environment spines compared by their elements (both are fresh).
 fn closures_agree(memo: Value, lisp: Value) -> bool {
-    use neovm_value::tagged::header::CLOSURE_CONSTANTS;
+    use neovm_value::tagged::header::{CLOSURE_CODE, CLOSURE_CONSTANTS};
     if memo.veclike_type() != lisp.veclike_type() {
         return false;
     }
@@ -823,6 +984,12 @@ fn closures_agree(memo: Value, lisp: Value) -> bool {
         return false;
     }
     for (index, (a, b)) in memo_slots.iter().zip(lisp_slots.iter()).enumerate() {
+        if index == CLOSURE_CODE {
+            if !bodies_agree(*a, *b) {
+                return false;
+            }
+            continue;
+        }
         if index != CLOSURE_CONSTANTS {
             if a != b {
                 return false;
@@ -1017,45 +1184,90 @@ impl Context {
     }
 
     /// The memo's view of a trimming call's source: its shape and facts,
-    /// or the first refusal.
+    /// or the first refusal.  A macro head no longer refuses: the entry
+    /// keeps the expansion and the function epoch guards it (V8).
     #[doc(hidden)]
     pub fn cconv_analyze_source(
         &self,
         params: Value,
         body: Value,
+        iform: Value,
     ) -> Result<Analysis, CconvMemoEvent> {
         let shape = ClosureShape::of(params, body).map_err(|_| CconvMemoEvent::RefuseShape)?;
         if shape.mentions_interactive {
             return Err(CconvMemoEvent::RefuseInteractive);
         }
-        let roles = match ClosureFacts::of(params, body) {
-            Ok(facts) => facts.symbols,
-            Err(FactsRefusal::TooLarge) => return Err(CconvMemoEvent::RefuseShape),
-            Err(FactsRefusal::UnderscoreUse) => return Err(CconvMemoEvent::RefuseUnderscore),
+        let iform_shape = if iform.is_nil() {
+            None
+        } else {
+            Some(ClosureShape::of(Value::NIL, iform).map_err(|_| CconvMemoEvent::RefuseShape)?)
         };
+        let (facts, mut underscore_use) =
+            ClosureFacts::of_lenient(params, body).map_err(|_| CconvMemoEvent::RefuseShape)?;
+        let mut roles = facts.symbols;
+        if !iform.is_nil() {
+            let (facts, used) = ClosureFacts::of_lenient(Value::NIL, iform)
+                .map_err(|_| CconvMemoEvent::RefuseShape)?;
+            roles.extend(facts.symbols);
+            underscore_use |= used;
+        }
         let mut facts = Vec::with_capacity(roles.len());
+        let mut macro_heads = false;
         for role in roles {
+            let mut macro_head = false;
             if role.head {
                 match self.cconv_head_verdict(role.id) {
                     HeadVerdict::Plain => {}
                     HeadVerdict::CompilerMacro => {
                         return Err(CconvMemoEvent::RefuseCompilerMacroHead);
                     }
-                    HeadVerdict::Macro | HeadVerdict::AutoloadMacro | HeadVerdict::Unresolvable => {
-                        return Err(CconvMemoEvent::RefuseMacroHead);
+                    HeadVerdict::Macro | HeadVerdict::AutoloadMacro => {
+                        macro_head = true;
+                        macro_heads = true;
                     }
+                    HeadVerdict::Unresolvable => return Err(CconvMemoEvent::RefuseMacroHead),
                 }
             }
             facts.push(MemoFact {
                 id: role.id,
                 head: role.head,
                 special: self.obarray.is_special_id(role.id),
+                macro_head,
             });
+        }
+        // Without a macro to consume it, a used `_` variable stays in the
+        // analysed form; with one, the expansion is checked when recorded.
+        if underscore_use && !macro_heads {
+            return Err(CconvMemoEvent::RefuseUnderscore);
         }
         Ok(Analysis {
             shape,
             facts: facts.into_boxed_slice(),
+            iform_shape,
+            macro_heads,
         })
+    }
+
+    /// The facts of a recorded expansion: every symbol of the expanded body
+    /// must still have its recorded specialness, and every head must still
+    /// be plain (a compiler macro put on one later would rewrite the
+    /// expansion).  `None` if the expansion cannot be memoized.
+    #[doc(hidden)]
+    pub fn cconv_expansion_facts(&self, params: Value, expanded: Value) -> Option<Vec<MemoFact>> {
+        let roles = ClosureFacts::of(params, expanded).ok()?.symbols;
+        let mut facts = Vec::with_capacity(roles.len());
+        for role in roles {
+            if role.head && self.cconv_head_verdict(role.id) != HeadVerdict::Plain {
+                return None;
+            }
+            facts.push(MemoFact {
+                id: role.id,
+                head: role.head,
+                special: self.obarray.is_special_id(role.id),
+                macro_head: false,
+            });
+        }
+        Some(facts)
     }
 
     /// Why the memo must not run now, if it must not.
@@ -1090,6 +1302,18 @@ impl Context {
             .is_some_and(|value| !value.is_nil())
     }
 
+    /// The visible value of `macroexp--dynvars`: loading a file leaves the
+    /// variables its `defvar`s declared in it (the same list object until
+    /// the next one), and cconv.el:957-960 appends it to the expansion's
+    /// environment.
+    #[doc(hidden)]
+    pub fn cconv_dynvars_value(&self) -> Value {
+        self.visible_runtime_variable_value_by_id(macroexp_dynvars_symbol())
+            .ok()
+            .flatten()
+            .unwrap_or(Value::NIL)
+    }
+
     /// The tightest `max-lisp-eval-depth` in force (global, buffer-local,
     /// cached), so V7 errs on the side of running the Lisp.
     #[doc(hidden)]
@@ -1121,6 +1345,7 @@ impl Context {
         &self,
         params: Value,
         body: Value,
+        iform: Value,
         env: &EnvSummary,
         lexical_binding: bool,
     ) -> Result<MemoHit, CconvMemoEvent> {
@@ -1136,12 +1361,28 @@ impl Context {
         if !entry.shape.matches(params, body) {
             return Err(CconvMemoEvent::MissShape);
         }
+        if entry.iform != iform
+            || entry
+                .iform_shape
+                .as_ref()
+                .is_some_and(|shape| !shape.matches(Value::NIL, iform))
+        {
+            return Err(CconvMemoEvent::MissIform);
+        }
         for fact in entry.facts.iter() {
-            if (fact.head && self.cconv_head_verdict(fact.id) != HeadVerdict::Plain)
+            if (fact.head
+                && !fact.macro_head
+                && self.cconv_head_verdict(fact.id) != HeadVerdict::Plain)
                 || self.obarray.is_special_id(fact.id) != fact.special
             {
                 return Err(CconvMemoEvent::MissFacts);
             }
+        }
+        if entry.expanded.is_some()
+            && (function_cell_clock() != entry.function_epoch
+                || self.cconv_dynvars_value() != entry.dynvars)
+        {
+            return Err(CconvMemoEvent::MissEpoch);
         }
         if self.depth.saturating_add(entry.depth_budget) > self.cconv_eval_depth_limit() {
             return Err(CconvMemoEvent::MissDepth);
@@ -1149,6 +1390,7 @@ impl Context {
         Ok(MemoHit {
             lexv: entry.lexv.iter().copied().collect(),
             dynv: entry.dynv.iter().copied().collect(),
+            expanded: entry.expanded,
         })
     }
 
@@ -1185,7 +1427,7 @@ impl Context {
         self.push_specpdl_root(newenv);
         let closure = builtins::symbols::make_interpreted_closure_from_parts(
             &params,
-            &body,
+            &hit.expanded.unwrap_or(body),
             &newenv,
             Some(&docstring),
             Some(&iform),
@@ -1203,19 +1445,32 @@ impl Context {
         params: Value,
         body: Value,
         env: Value,
-    ) -> Option<(Box<[SymId]>, Box<[SymId]>)> {
+    ) -> Option<DerivedResult> {
         let symbol_mode = self.symbol_mode();
         use neovm_value::tagged::header::{CLOSURE_ARGLIST, CLOSURE_CODE, CLOSURE_CONSTANTS};
         if closure.veclike_type() != Some(VecLikeType::Lambda) {
             return None;
         }
         let slots = closure.closure_slots()?;
-        if slots.get(CLOSURE_ARGLIST) != Some(&params) || slots.get(CLOSURE_CODE) != Some(&body) {
+        if slots.get(CLOSURE_ARGLIST) != Some(&params) {
             return None;
         }
+        // cconv.el:966-971 hands back the macroexpanded body when it has one.
+        let code = *slots.get(CLOSURE_CODE)?;
+        let expanded = if code == body {
+            None
+        } else if code.is_cons() {
+            Some(code)
+        } else {
+            return None;
+        };
         let newenv = *slots.get(CLOSURE_CONSTANTS)?;
         if newenv == self.cconv_memo.trusted.empty_env() {
-            return Some((Box::default(), Box::default()));
+            return Some(DerivedResult {
+                lexv: Box::default(),
+                dynv: Box::default(),
+                expanded,
+            });
         }
         let mut lexv = Vec::new();
         let mut dynv = Vec::new();
@@ -1238,7 +1493,11 @@ impl Context {
         if !tail.is_nil() || (lexv.is_empty() && dynv.is_empty()) {
             return None;
         }
-        Some((lexv.into_boxed_slice(), dynv.into_boxed_slice()))
+        Some(DerivedResult {
+            lexv: lexv.into_boxed_slice(),
+            dynv: dynv.into_boxed_slice(),
+            expanded,
+        })
     }
 
     /// Run the filter itself.
@@ -1280,19 +1539,20 @@ impl Context {
                 false
             }
             Ok(closure) => {
-                let identity = closure
+                let same_args = closure
                     .closure_slot(neovm_value::tagged::header::CLOSURE_ARGLIST)
-                    .is_some_and(|a| a == params)
-                    && closure.closure_body_value().is_some_and(|b| b == body);
+                    .is_some_and(|a| a == params);
+                let identity = same_args && closure.closure_body_value().is_some_and(|b| b == body);
                 self.cconv_memo.note(if identity {
                     CconvMemoEvent::RunIdentity
                 } else {
                     CconvMemoEvent::RunRewritten
                 });
-                identity
+                // A rewritten body is a macroexpansion the entry keeps.
+                same_args
             }
         };
-        if after != before {
+        if before.moved_beyond_gensym(&after) {
             self.cconv_memo.note(CconvMemoEvent::RunEffect);
             clean = false;
         }
@@ -1442,8 +1702,6 @@ impl Context {
         self.cconv_memo.note(CconvMemoEvent::Trim);
         let refusal = if !self.cconv_trusted_set_valid() {
             Some(CconvMemoEvent::Untrusted)
-        } else if !iform.is_nil() {
-            Some(CconvMemoEvent::RefuseInteractive)
         } else {
             self.cconv_bypass()
         };
@@ -1456,7 +1714,7 @@ impl Context {
             }
         };
         let lexical_binding = self.cconv_variable_truthy(lexical_binding_symbol());
-        match self.cconv_memo_lookup(params, body, &summary, lexical_binding) {
+        match self.cconv_memo_lookup(params, body, iform, &summary, lexical_binding) {
             Ok(hit) => {
                 self.cconv_memo.note(CconvMemoEvent::Hit);
                 return match self.cconv_memo.mode {
@@ -1464,6 +1722,9 @@ impl Context {
                         match self.cconv_memo_build(params, body, env, docstring, iform, &hit) {
                             Ok(closure) => {
                                 self.cconv_memo.note(CconvMemoEvent::Served);
+                                if hit.expanded.is_some() {
+                                    self.cconv_memo.note(CconvMemoEvent::ServedExpanded);
+                                }
                                 Ok(closure)
                             }
                             // Unreachable for a recorded shape; the Lisp
@@ -1509,7 +1770,7 @@ impl Context {
                 }
             }
         }
-        let analysis = match self.cconv_analyze_source(params, body) {
+        let analysis = match self.cconv_analyze_source(params, body, iform) {
             Ok(analysis) => analysis,
             Err(refusal) => {
                 self.cconv_memo.note(refusal);
@@ -1528,20 +1789,56 @@ impl Context {
             }
             _ => None,
         };
-        let Some((lexv, dynv)) = derived else {
+        let Some(DerivedResult {
+            lexv,
+            dynv,
+            expanded,
+        }) = derived
+        else {
             self.cconv_memo.note(CconvMemoEvent::RecordRefused);
             return result;
         };
+        let Analysis {
+            shape,
+            facts,
+            iform_shape,
+            macro_heads,
+        } = analysis;
+        if macro_heads && expanded.is_none() {
+            // A macro head must have rewritten the body.
+            self.cconv_memo.note(CconvMemoEvent::RecordRefused);
+            return result;
+        }
+        let mut facts = facts.into_vec();
+        let mut depth_levels = shape.car_depth as usize;
+        if let Some(expanded) = expanded {
+            // The memo serves the expansion: its symbols are facts too, and
+            // the expansion's own nesting counts toward V7.
+            let (Some(expansion_facts), Ok(expansion_shape)) = (
+                self.cconv_expansion_facts(params, expanded),
+                ClosureShape::of(params, expanded),
+            ) else {
+                self.cconv_memo.note(CconvMemoEvent::RecordRefused);
+                return result;
+            };
+            facts.extend(expansion_facts);
+            depth_levels += expansion_shape.car_depth as usize;
+        }
         self.cconv_memo_insert(
             body,
             MemoEntry {
-                depth_budget: 4 * analysis.shape.car_depth as usize + 64,
-                shape: analysis.shape,
-                facts: analysis.facts,
+                depth_budget: 4 * depth_levels + 64,
+                shape,
+                facts: facts.into_boxed_slice(),
                 env: summary,
                 lexical_binding,
                 lexv,
                 dynv,
+                expanded,
+                iform,
+                iform_shape,
+                dynvars: self.cconv_dynvars_value(),
+                function_epoch: function_cell_clock(),
             },
         );
         result
@@ -1651,7 +1948,7 @@ impl Context {
             gc_cycles,
         } = self.cconv_observe_lisp(closure_hook, params, body, env, docstring, iform);
         let writes = OBSERVED_FUNCTION_WRITES.with(|log| log.borrow_mut().take());
-        let quiet = after == before;
+        let quiet = !before.moved_beyond_gensym(&after);
         let agree = match (&memo, &lisp) {
             (Ok(m), Ok(l)) => closures_agree(*m, *l),
             _ => false,
