@@ -97,7 +97,9 @@ impl Harness {
     fn report(&mut self) -> Vec<u8> {
         self.status_write = None;
         let mut report = Vec::new();
-        self.status_read.read_to_end(&mut report).expect("read report");
+        self.status_read
+            .read_to_end(&mut report)
+            .expect("read report");
         report
     }
 
@@ -197,7 +199,11 @@ fn the_child_leads_a_session_controlled_by_the_slave_and_holds_no_other_descript
         .next()
         .expect("the stat line")
         .split(' ')
-        .map(|field| field.parse::<u64>().unwrap_or_else(|_| panic!("a number in {output:?}")))
+        .map(|field| {
+            field
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("a number in {output:?}"))
+        })
         .collect::<Vec<_>>()[..]
     else {
         panic!("stat line of {output:?}");
@@ -214,5 +220,51 @@ fn the_child_leads_a_session_controlled_by_the_slave_and_holds_no_other_descript
     // while it lists; the status pipe (4) and the leaked one (7) must be gone.
     let mut fds: Vec<&str> = lines.collect();
     fds.sort_unstable();
-    assert_eq!(fds, ["fd 0", "fd 1", "fd 2", "fd 3"], "nothing else is open");
+    assert_eq!(
+        fds,
+        ["fd 0", "fd 1", "fd 2", "fd 3"],
+        "nothing else is open"
+    );
+}
+
+/// The editor's own start through the trampoline (`NEOMACS_PTYEXEC` selects
+/// it where the platform needs none, so Linux runs macOS's engine arm): the
+/// child is a session leader with a controlling terminal, and a program that
+/// cannot be run is reported as a failed exec.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_editor_starts_a_pty_child_through_the_trampoline() {
+    let lisp = r#"
+(let ((report nil))
+  (dolist (command (list
+                    (list "/bin/sh" "-c"
+                          (concat "read -r pid comm state ppid pgrp session tty rest < /proc/self/stat; "
+                                  "[ \"$pid\" = \"$session\" ] && echo LEADER; "
+                                  "[ -t 0 ] && [ -t 1 ] && [ -t 2 ] && echo TTY; "
+                                  ": < /dev/tty && echo CTTY"))
+                    (list "/nonexistent/neomacs-ptyexec-test")))
+    (let* ((out "")
+           (p (make-process :name "t" :command command :connection-type 'pty
+                            :noquery t
+                            :filter (lambda (_p s) (setq out (concat out s))))))
+      (while (process-live-p p) (accept-process-output p 0.1))
+      (accept-process-output p 0.1)
+      (push (list (process-exit-status p) (replace-regexp-in-string "\r" "" out)) report)))
+  (princ (format "%S" (nreverse report))))
+"#;
+    let output = Command::new(env!("CARGO_BIN_EXE_neomacs"))
+        .env("NEOMACS_PTYEXEC", env!("CARGO_BIN_EXE_neomacs-ptyexec"))
+        .args(["-Q", "--batch", "--eval", lisp])
+        .output()
+        .expect("run the editor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(0 \"LEADER\nTTY\nCTTY\n\")"),
+        "stdout {stdout:?} stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("neomacs-ptyexec-test: No such file or directory"),
+        "{stdout:?}"
+    );
 }

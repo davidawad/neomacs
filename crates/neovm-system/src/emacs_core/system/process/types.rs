@@ -1983,13 +1983,21 @@ fn spawn_pty_child(
 
 /// Start a pty child: in its own session, with the slave at `tty` as its
 /// controlling terminal, stdin and stdout, and as its stderr unless `cmd`
-/// names another one.  A forked child opens the slave before `exec`.
+/// names another one.  macOS `posix_spawn`s the `neomacs-ptyexec` trampoline
+/// when it is installed beside the editor; otherwise a forked child opens the
+/// slave before `exec`.
 #[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
 fn spawn_pty_child(
     cmd: crate::emacs_core::callproc::ChildCommand,
     tty: &std::path::Path,
 ) -> std::io::Result<SpawnedChild> {
     use std::os::unix::process::CommandExt;
+
+    #[cfg(target_os = "macos")]
+    if crate::emacs_core::callproc::ChildCommand::pty_spawn_available() {
+        let mut cmd = cmd;
+        return cmd.spawn_on_pty(tty);
+    }
 
     // The forking `Command` already carries the `setsid` `pre_exec` (own
     // session, no controlling tty).  Chain a second `pre_exec` that opens
@@ -5215,7 +5223,7 @@ impl SystemProcessExt for ProcessManager {
         // where `std_err` is the separate `forkerr` fd and only merges into
         // `std_out` when no stderr pipe-process exists.
         let split_stderr = stderr_transfer.pipe_id().is_some();
-        if split_stderr || cfg!(all(target_os = "linux", target_env = "gnu")) {
+        if split_stderr || crate::emacs_core::callproc::ChildCommand::pty_spawn_available() {
             let Some(tty_path) = tty_name_path.clone() else {
                 return Err("PTY has no tty name to start the child on".to_string());
             };

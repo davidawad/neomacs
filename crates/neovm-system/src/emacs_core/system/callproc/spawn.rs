@@ -23,18 +23,21 @@
 //! `posix_spawn` shares the address space until `exec` (`CLONE_VM |
 //! CLONE_VFORK`) and costs tens of microseconds regardless of heap size.
 //!
-//! The platform split is resolved ONCE here.  glibc Linux takes the
-//! `posix_spawn` engine; every other platform keeps `std::process::Command`
-//! with the same session isolation applied by
-//! [`super::isolate_child_command`].
+//! The platform split is resolved ONCE here.  glibc Linux and macOS take the
+//! `posix_spawn` engine (GNU's `USABLE_POSIX_SPAWN` holds on both); every
+//! other platform keeps `std::process::Command` with the same session
+//! isolation applied by [`super::isolate_child_command`].
 //!
-//! GNU takes `vfork` for pseudoterminal children, but on glibc Linux
-//! `posix_spawn` expresses that setup too: after `POSIX_SPAWN_SETSID` the
+//! GNU takes `vfork` for pseudoterminal children, but `posix_spawn`
+//! expresses that setup too.  On glibc Linux, after `POSIX_SPAWN_SETSID` the
 //! child opens the pty slave by name, and a session leader without a
 //! controlling terminal acquires the terminal it opens (Linux `open(2)`) --
-//! GNU's own reopen of `pty_name` in the child.  So glibc Linux starts pty
-//! children with [`ChildCommand::spawn_on_pty`]; elsewhere they take
-//! [`ChildCommand::into_forking_command`].
+//! GNU's own reopen of `pty_name` in the child.  XNU grants a controlling
+//! terminal only to `ioctl(TIOCSCTTY)`, so on macOS the spawned program is
+//! the `neomacs-ptyexec` trampoline beside the editor, which runs that ioctl
+//! and `exec`s the real program.  Both start pty children with
+//! [`ChildCommand::spawn_on_pty`]; elsewhere (and on macOS without the
+//! trampoline) they take [`ChildCommand::into_forking_command`].
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -260,19 +263,38 @@ impl ChildCommand {
         command.spawn().map(SpawnedChild::from_std)
     }
 
+    /// Whether [`Self::spawn_on_pty`] can start a child here: always on glibc
+    /// Linux, and on macOS when the `neomacs-ptyexec` trampoline is installed
+    /// beside the editor.  Where it cannot, a pty child forks.
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+    pub(crate) fn pty_spawn_available() -> bool {
+        posix::pty_start().is_some()
+    }
+
+    #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+    pub(crate) fn pty_spawn_available() -> bool {
+        false
+    }
+
     /// Spawn the child on the pseudoterminal whose slave is at `slave`: in
     /// its own session with the slave as controlling terminal, stdin and
     /// stdout, and as stderr unless [`Self::stderr`] named another
     /// descriptor (GNU `emacs_spawn` with `pty_name`, src/callproc.c).
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
     pub(crate) fn spawn_on_pty(&mut self, slave: &Path) -> io::Result<SpawnedChild> {
         debug_assert!(
             self.stdin.is_none() && self.stdout.is_none(),
             "a pty child's stdin and stdout are the slave"
         );
+        let start = posix::pty_start().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no pty trampoline (neomacs-ptyexec) beside the editor",
+            )
+        })?;
         let stderr = self.stderr.take().unwrap_or(ChildStdio::Inherit);
         super::retain_child_exit_status()?;
-        posix::spawn_on_pty(self, slave, stderr)
+        posix::spawn_on_pty(self, slave, start, stderr)
     }
 
     /// The same child as a `std::process::Command` that will `fork`, with
@@ -802,18 +824,69 @@ mod posix {
         )
     }
 
+    /// How a pty child gets its controlling terminal.
+    pub(super) enum PtyStart {
+        /// The child opens the slave itself right after `POSIX_SPAWN_SETSID`:
+        /// a session leader without a controlling terminal acquires the
+        /// terminal it opens (Linux `open(2)`).
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        Direct,
+        /// XNU grants a controlling terminal only to `ioctl(TIOCSCTTY)`, so
+        /// the child is the `neomacs-ptyexec` trampoline at this path, which
+        /// makes the slave the terminal and `exec`s the real program.
+        Trampoline(PathBuf),
+    }
+
+    /// The helper's name, built beside the editor by the `neomacs` package.
+    const TRAMPOLINE_NAME: &str = "neomacs-ptyexec";
+
+    /// `NEOMACS_PTYEXEC=/path/to/neomacs-ptyexec` forces the trampoline, so
+    /// that it can run where the platform needs none (the tests do).
+    const TRAMPOLINE_ENV: &str = "NEOMACS_PTYEXEC";
+
+    pub(super) fn pty_start() -> Option<PtyStart> {
+        if let Some(path) = std::env::var_os(TRAMPOLINE_ENV) {
+            return Some(PtyStart::Trampoline(PathBuf::from(path)));
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        return Some(PtyStart::Direct);
+        #[cfg(target_os = "macos")]
+        return trampoline_beside_editor().map(PtyStart::Trampoline);
+    }
+
+    /// The release layout and the `.app` bundle both keep the helper in the
+    /// editor's own directory.  A missing helper means pty children fork, as
+    /// before; say so once.
+    #[cfg(target_os = "macos")]
+    fn trampoline_beside_editor() -> Option<PathBuf> {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        let found = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.join(TRAMPOLINE_NAME)))
+            .filter(|path| engine::is_executable_file(path));
+        if found.is_none() {
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "{TRAMPOLINE_NAME} is missing beside the editor: pty children fork it"
+                );
+            });
+        }
+        found
+    }
+
     pub(super) fn spawn_on_pty(
         command: &ChildCommand,
         slave: &Path,
+        start: PtyStart,
         stderr: ChildStdio,
     ) -> io::Result<SpawnedChild> {
-        let slave = engine::StdinStdout::pty_slave(slave)?;
+        let slave = engine::StdinStdout::pty_slave(slave, start)?;
         engine::spawn(command, slave, stderr)
     }
 
     mod engine {
         use super::*;
-        use std::ffi::CString;
+        use std::ffi::{CStr, CString};
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
         use std::os::unix::ffi::OsStrExt;
 
@@ -840,13 +913,26 @@ mod posix {
             /// in its new session so that it becomes the controlling
             /// terminal.  An inherited stderr is the slave too.
             PtySlave(CString),
+            /// The same child, started through the trampoline at this path
+            /// (see [`PtyStart::Trampoline`]).
+            PtyTrampoline { slave: CString, helper: PathBuf },
         }
 
         impl StdinStdout {
-            pub(super) fn pty_slave(slave: &Path) -> io::Result<Self> {
-                c_string(slave.as_os_str(), "pty slave name").map(Self::PtySlave)
+            pub(super) fn pty_slave(slave: &Path, start: PtyStart) -> io::Result<Self> {
+                let slave = c_string(slave.as_os_str(), "pty slave name")?;
+                Ok(match start {
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    PtyStart::Direct => Self::PtySlave(slave),
+                    PtyStart::Trampoline(helper) => Self::PtyTrampoline { slave, helper },
+                })
             }
         }
+
+        /// Where the trampoline finds its pipe of start-up errors and, when
+        /// the child's stderr is not the pty, that descriptor.
+        const TRAMPOLINE_STDERR_FD: RawFd = 3;
+        const TRAMPOLINE_STATUS_FD: RawFd = 4;
 
         fn slot(stdio: ChildStdio, child_reads: bool) -> io::Result<Slot> {
             Ok(match stdio {
@@ -882,28 +968,33 @@ mod posix {
         }
 
         impl Slot {
-            /// Move a dup source the editor holds as 0, 1 or 2 (it runs with
-            /// that standard descriptor closed) above 2, so that the file
-            /// actions that set up the child's 0 and 1 do not overwrite it.
-            fn move_above_stdio(&mut self) -> io::Result<()> {
+            /// Move a dup source the editor holds at or below `floor` (it
+            /// runs with a standard descriptor closed, or the file actions
+            /// that follow target descriptors up to `floor`) above `floor`,
+            /// so that those file actions do not overwrite it.
+            fn move_above(&mut self, floor: RawFd) -> io::Result<()> {
                 let SlotAction::Dup(source) = self.action else {
                     return Ok(());
                 };
-                if source > libc::STDERR_FILENO {
+                if source > floor {
                     return Ok(());
                 }
-                // SAFETY: plain FFI on a descriptor this slot owns.
-                let moved =
-                    unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
-                if moved < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: `fcntl` just returned `moved`, owned by nothing else;
-                // the old source is closed when its owner is replaced.
-                self._child_end = Some(unsafe { OwnedFd::from_raw_fd(moved) });
-                self.action = SlotAction::Dup(moved);
+                let moved = dup_above(source, floor)?;
+                self.action = SlotAction::Dup(moved.as_raw_fd());
+                self._child_end = Some(moved);
                 Ok(())
             }
+        }
+
+        /// A close-on-exec duplicate of `source` numbered above `floor`.
+        fn dup_above(source: RawFd, floor: RawFd) -> io::Result<OwnedFd> {
+            // SAFETY: plain FFI on a descriptor the caller holds.
+            let moved = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, floor + 1) };
+            if moved < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fcntl` just returned `moved`, owned by nothing else.
+            Ok(unsafe { OwnedFd::from_raw_fd(moved) })
         }
 
         #[cfg(target_os = "linux")]
@@ -988,12 +1079,7 @@ mod posix {
                 }
             }
 
-            fn open(
-                &mut self,
-                target: RawFd,
-                path: &CString,
-                flags: libc::c_int,
-            ) -> io::Result<()> {
+            fn open(&mut self, target: RawFd, path: &CStr, flags: libc::c_int) -> io::Result<()> {
                 // SAFETY: `path` is a valid NUL-terminated C string that
                 // outlives the spawn.
                 check(unsafe {
@@ -1052,8 +1138,10 @@ mod posix {
         impl Attributes {
             /// GNU `emacs_posix_spawn_init_attributes`: own session, default
             /// dispositions for `default_signals` (plus SIGCHLD on macOS), and
-            /// an empty signal mask in the child.
-            fn gnu(default_signals: &[libc::c_int]) -> io::Result<Self> {
+            /// an empty signal mask in the child.  With `close_unlisted` the
+            /// child keeps only the descriptors the file actions name
+            /// (`POSIX_SPAWN_CLOEXEC_DEFAULT`, macOS only).
+            fn gnu(default_signals: &[libc::c_int], close_unlisted: bool) -> io::Result<Self> {
                 let mut attributes = std::mem::MaybeUninit::<libc::posix_spawnattr_t>::uninit();
                 // SAFETY: `init` fully initializes the out-pointer on success.
                 check(unsafe { libc::posix_spawnattr_init(attributes.as_mut_ptr()) })?;
@@ -1061,7 +1149,12 @@ mod posix {
                 let mut this = Self(unsafe { attributes.assume_init() });
                 let flags = sys::POSIX_SPAWN_SETSID as libc::c_int
                     | libc::POSIX_SPAWN_SETSIGDEF
-                    | libc::POSIX_SPAWN_SETSIGMASK;
+                    | libc::POSIX_SPAWN_SETSIGMASK
+                    | if close_unlisted {
+                        sys::POSIX_SPAWN_CLOEXEC_DEFAULT
+                    } else {
+                        0
+                    };
                 // SAFETY: FFI on an initialized attributes object.
                 check(unsafe {
                     libc::posix_spawnattr_setflags(&mut this.0, flags as libc::c_short)
@@ -1109,6 +1202,13 @@ mod posix {
             #[cfg(target_os = "linux")]
             pub(super) use libc::{POSIX_SPAWN_SETSID, posix_spawn_file_actions_addchdir_np};
 
+            /// Apple's `POSIX_SPAWN_CLOEXEC_DEFAULT`; glibc has no such flag,
+            /// where the trampoline closes the descriptors itself.
+            #[cfg(target_os = "linux")]
+            pub(super) const POSIX_SPAWN_CLOEXEC_DEFAULT: libc::c_int = 0;
+            #[cfg(target_os = "macos")]
+            pub(super) use libc::POSIX_SPAWN_CLOEXEC_DEFAULT;
+
             /// `<sys/spawn.h>`: `#define POSIX_SPAWN_SETSID 0x0400`.
             #[cfg(target_os = "macos")]
             pub(super) const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
@@ -1145,12 +1245,29 @@ mod posix {
                 .find(|candidate| is_executable_file(candidate))
         }
 
-        fn is_executable_file(candidate: &Path) -> bool {
+        pub(super) fn is_executable_file(candidate: &Path) -> bool {
             let Ok(c_path) = CString::new(candidate.as_os_str().as_bytes()) else {
                 return false;
             };
             // SAFETY: `c_path` is a valid NUL-terminated C string.
             candidate.is_file() && unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0
+        }
+
+        /// The `errno` the trampoline reports when it could not start the
+        /// program, or `None` once the pipe closed with the program running.
+        fn read_trampoline_failure(read_end: OwnedFd) -> io::Result<Option<i32>> {
+            let mut pipe = File::from(read_end);
+            let mut report = [0u8; 4];
+            let mut filled = 0;
+            while filled < report.len() {
+                match io::Read::read(&mut pipe, &mut report[filled..]) {
+                    Ok(0) => break,
+                    Ok(count) => filled += count,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok((filled == report.len()).then(|| i32::from_ne_bytes(report)))
         }
 
         pub(super) fn spawn(
@@ -1180,14 +1297,14 @@ mod posix {
                 .find(|(name, _)| *name == OsStr::new("PATH"))
                 .map(|(_, value)| *value);
             let resolved = resolve_program(&command.program, child_path);
-            let search_path = resolved.is_none();
-            let file = c_string(
+            let mut search_path = resolved.is_none();
+            let mut file = c_string(
                 resolved
                     .as_deref()
                     .map_or(command.program.as_os_str(), Path::as_os_str),
                 "program",
             )?;
-            let argv: Vec<CString> = std::iter::once(c_string(&command.program, "program"))
+            let mut argv: Vec<CString> = std::iter::once(c_string(&command.program, "program"))
                 .chain(command.args.iter().map(|arg| c_string(arg, "argument")))
                 .collect::<io::Result<_>>()?;
             let envp: Vec<CString> = vars
@@ -1218,6 +1335,8 @@ mod posix {
 
             let mut stderr = slot(stderr, false)?;
             let mut actions = FileActions::new()?;
+            // The read end of the trampoline's start-up error pipe.
+            let mut handshake = None;
             // `_slave` keeps a pty slave name alive until `posix_spawn` has
             // run its file actions.
             let (mut stdin, mut stdout, attributes, _slave) = match stdin_stdout {
@@ -1227,13 +1346,77 @@ mod posix {
                     actions.apply(libc::STDIN_FILENO, &stdin.action)?;
                     actions.apply(libc::STDOUT_FILENO, &stdout.action)?;
                     actions.apply(libc::STDERR_FILENO, &stderr.action)?;
-                    (stdin, stdout, Attributes::gnu(GNU_DEFAULT_SIGNALS)?, None)
+                    (
+                        stdin,
+                        stdout,
+                        Attributes::gnu(GNU_DEFAULT_SIGNALS, false)?,
+                        None,
+                    )
+                }
+                StdinStdout::PtyTrampoline { slave, helper } => {
+                    // Both sources move above the descriptors the actions
+                    // below fill, so no action overwrites another's source.
+                    stderr.move_above(TRAMPOLINE_STATUS_FD)?;
+                    let (read_end, write_end) = cloexec_pipe()?;
+                    let write_end = if write_end.as_raw_fd() > TRAMPOLINE_STATUS_FD {
+                        write_end
+                    } else {
+                        dup_above(write_end.as_raw_fd(), TRAMPOLINE_STATUS_FD)?
+                    };
+                    actions.apply(
+                        TRAMPOLINE_STATUS_FD,
+                        &SlotAction::Dup(write_end.as_raw_fd()),
+                    )?;
+                    let stderr_arg = match &stderr.action {
+                        SlotAction::Inherit => "-".to_string(),
+                        SlotAction::Null => {
+                            actions.open(TRAMPOLINE_STDERR_FD, c"/dev/null", libc::O_WRONLY)?;
+                            TRAMPOLINE_STDERR_FD.to_string()
+                        }
+                        action @ SlotAction::Dup(_) => {
+                            actions.apply(TRAMPOLINE_STDERR_FD, action)?;
+                            TRAMPOLINE_STDERR_FD.to_string()
+                        }
+                    };
+                    // A program the child's PATH does not name is looked up on
+                    // the editor's, as `posix_spawnp` does for other children.
+                    let program = match resolved.as_deref() {
+                        Some(path) => path.to_path_buf(),
+                        None => {
+                            resolve_program(&command.program, std::env::var_os("PATH").as_deref())
+                                .unwrap_or_else(|| PathBuf::from(&command.program))
+                        }
+                    };
+                    let default_signals = match &stderr.action {
+                        SlotAction::Inherit => PTY_DEFAULT_SIGNALS,
+                        _ => GNU_DEFAULT_SIGNALS,
+                    };
+                    let helper = c_string(helper.as_os_str(), "pty trampoline")?;
+                    let mut helper_argv = vec![
+                        helper.clone(),
+                        slave,
+                        c_string(OsStr::new(&TRAMPOLINE_STATUS_FD.to_string()), "descriptor")?,
+                        c_string(OsStr::new(&stderr_arg), "descriptor")?,
+                        c"--".to_owned(),
+                        c_string(program.as_os_str(), "program")?,
+                    ];
+                    helper_argv.append(&mut argv);
+                    argv = helper_argv;
+                    file = helper;
+                    search_path = false;
+                    handshake = Some((read_end, write_end));
+                    (
+                        slot(ChildStdio::Inherit, true)?,
+                        slot(ChildStdio::Inherit, false)?,
+                        Attributes::gnu(default_signals, true)?,
+                        None,
+                    )
                 }
                 StdinStdout::PtySlave(slave) => {
                     // No `O_NOCTTY`: the child has just become a session
                     // leader, so this open makes the slave its controlling
                     // terminal.  glibc runs the file actions after `setsid`.
-                    stderr.move_above_stdio()?;
+                    stderr.move_above(libc::STDERR_FILENO)?;
                     actions.open(libc::STDIN_FILENO, &slave, libc::O_RDWR)?;
                     let tty = SlotAction::Dup(libc::STDIN_FILENO);
                     actions.apply(libc::STDOUT_FILENO, &tty)?;
@@ -1245,7 +1428,7 @@ mod posix {
                     (
                         slot(ChildStdio::Inherit, true)?,
                         slot(ChildStdio::Inherit, false)?,
-                        Attributes::gnu(default_signals)?,
+                        Attributes::gnu(default_signals, false)?,
                         Some(slave),
                     )
                 }
@@ -1287,6 +1470,16 @@ mod posix {
                 }
             };
             check(code)?;
+            if let Some((read_end, write_end)) = handshake {
+                // The trampoline's `exec` closes its end; a failure writes
+                // its errno first.  Our own write end must close for that
+                // end-of-file to arrive.
+                drop(write_end);
+                if let Some(errno) = read_trampoline_failure(read_end)? {
+                    wait_blocking(pid as u32)?;
+                    return Err(io::Error::from_raw_os_error(errno));
+                }
+            }
 
             Ok(SpawnedChild {
                 pid: pid as u32,
