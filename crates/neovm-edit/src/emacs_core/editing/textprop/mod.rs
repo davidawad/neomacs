@@ -1386,6 +1386,21 @@ pub fn verify_text_read_only_emacs_byte_range_in_state<'a, Vars: EditVariableRea
     )
     .filter(|value| value.is_cons())
     .and_then(|defaults| plist_get_value(defaults, read_only_sym));
+    // `read-only` reaches an interval only as its own property, through its
+    // `category`, through an alias or from `default-text-properties`.  When
+    // the buffer's name summary proves neither property occurs and neither
+    // list names one, no interval in the range can be read-only: skip the
+    // per-interval resolution, which an edit over a large propertized range
+    // (`erase-buffer` of an agenda) paid for every interval.
+    if read_only_aliases.is_nil()
+        && read_only_default.is_none_or(|value| value.is_nil())
+        && buf.text_props_property_name_presence(read_only_sym)
+            == crate::buffer::text_props::PropertyNamePresence::DefinitelyAbsent
+        && buf.text_props_property_name_presence(Value::from_sym_id(category_sym_id()))
+            == crate::buffer::text_props::PropertyNamePresence::DefinitelyAbsent
+    {
+        return Ok(());
+    }
     buf.text_props_try_for_each_interval_plist_in_emacs_byte_range(byte_range, |_range, plist| {
         let direct = DirectCharProperties::from_plist(plist, read_only_sym);
         let mut alias_tail = read_only_aliases;

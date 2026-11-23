@@ -338,3 +338,54 @@ fn whole_string_property_application_matches_the_general_path() {
         assert_eq!(&got, want, "{form}");
     }
 }
+
+/// An edit over a propertized range looks for `read-only` text.  When the
+/// buffer's name summary proves no interval has the property or a `category`,
+/// and neither `char-property-alias-alist` nor `default-text-properties`
+/// supplies one, no interval can be read-only and the walk is skipped.  Every
+/// way an interval can still be read-only must keep signalling, and the
+/// `inhibit-read-only` forms must keep their meaning.
+#[test]
+fn read_only_text_still_blocks_edits_when_the_walk_can_be_skipped() {
+    let mut eval = property_transfer_fixture();
+    let cases: &[(&str, &str)] = &[
+        // No read-only anywhere: the edit goes through.
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (insert s) (delete-region 1 101) (list (buffer-size) (get-text-property 1 'face)))",
+            "OK (100 (:run 25))",
+        ),
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (insert s) (erase-buffer) (buffer-size))",
+            "OK 0",
+        ),
+        // The property itself.
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (let ((inhibit-read-only t)) (insert (propertize \"locked\" 'read-only t) \" free\")) (list (condition-case e (erase-buffer) (error e)) (condition-case e (delete-region 1 4) (error e)) (let ((inhibit-read-only t)) (delete-region 1 3)) (buffer-string)))",
+            "OK ((text-read-only) (text-read-only) nil #(\"cked free\" 0 4 (read-only t)))",
+        ),
+        // Through a category symbol's plist.
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (put 'zz-ro 'read-only t) (let ((inhibit-read-only t)) (insert (propertize \"cat\" 'category 'zz-ro) \" free\")) (list (condition-case e (delete-region 1 3) (error e)) (buffer-string)))",
+            "OK ((text-read-only) #(\"cat free\" 0 3 (category zz-ro)))",
+        ),
+        // Through an alias.
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (let ((inhibit-read-only t)) (insert (propertize \"alias\" 'my-ro t) \" free\")) (list (let ((char-property-alias-alist '((read-only my-ro)))) (condition-case e (delete-region 1 3) (error e))) (buffer-string)))",
+            "OK ((text-read-only) #(\"alias free\" 0 5 (my-ro t)))",
+        ),
+        // Through the default properties, on a buffer that has intervals.
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (insert (propertize \"plain props\" 'face 'bold) \" free\") (list (let ((default-text-properties '(read-only t))) (condition-case e (delete-region 1 3) (error e))) (buffer-string)))",
+            "OK ((text-read-only) #(\"plain props free\" 0 11 (face bold)))",
+        ),
+        // `inhibit-read-only` as a list names the values it overrides.
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (let ((inhibit-read-only t)) (insert (propertize \"locked\" 'read-only 'foo) \" free\")) (list (condition-case e (delete-region 1 3) (error e)) (let ((inhibit-read-only '(foo))) (delete-region 1 3)) (buffer-string)))",
+            "OK ((text-read-only) nil #(\"cked free\" 0 4 (read-only foo)))",
+        ),
+    ];
+    for (form, want) in cases {
+        let got = format_eval_result(&eval.eval_str(form));
+        assert_eq!(&got, want, "{form}");
+    }
+}
