@@ -3209,7 +3209,7 @@ fn build_load_history(eval: &mut super::eval::Context, filename: &LispString, en
         .unwrap_or(Value::NIL);
     eval.push_specpdl_root(history);
     let filtered_history = if entire {
-        filter_load_history_without_filename(eval, history, filename)
+        splice_load_history_entry_in_place(history, filename)
     } else {
         history
     };
@@ -3245,37 +3245,35 @@ fn reverse_copy_rooted_list(eval: &mut super::eval::Context, list: Value) -> Val
     reversed
 }
 
-fn filter_load_history_without_filename(
-    eval: &mut super::eval::Context,
-    history: Value,
-    filename: &LispString,
-) -> Value {
-    let roots = eval.save_specpdl_roots();
-    eval.push_specpdl_root(history);
+/// Remove the entries whose car names FILENAME from the `load-history` list
+/// HISTORY by mutating the cons cells, as GNU's `build_load_history`
+/// (src/lread.c) does with `Fsetcdr (prev, XCDR (tail))`, and return the new
+/// list head.  One walk, no allocation: rebuilding the list copied its
+/// ~3000 entries twice per `load`.
+fn splice_load_history_entry_in_place(history: Value, filename: &LispString) -> Value {
+    let mut head = history;
+    let mut prev = Value::NIL;
     let mut tail = history;
-    let mut filtered_reversed = Value::NIL;
     while tail.is_cons() {
         let existing = tail.cons_car();
-        let keep = if existing.is_cons() {
-            existing
+        let matches = existing.is_cons()
+            && existing
                 .cons_car()
                 .as_lisp_string()
-                .is_none_or(|loaded| !load_name_equal(loaded, filename))
+                .is_some_and(|loaded| load_name_equal(loaded, filename));
+        let next = tail.cons_cdr();
+        if matches {
+            if prev.is_cons() {
+                prev.set_cdr(next);
+            } else {
+                head = next;
+            }
         } else {
-            true
-        };
-        if keep {
-            let iter_roots = eval.save_specpdl_roots();
-            eval.push_specpdl_root(filtered_reversed);
-            filtered_reversed = Value::cons(existing, filtered_reversed);
-            eval.restore_specpdl_roots(iter_roots);
+            prev = tail;
         }
-        tail = tail.cons_cdr();
+        tail = next;
     }
-    eval.push_specpdl_root(filtered_reversed);
-    let filtered = reverse_copy_rooted_list(eval, filtered_reversed);
-    eval.restore_specpdl_roots(roots);
-    filtered
+    head
 }
 
 fn run_after_load_evaluation(eval: &mut super::eval::Context, path_lisp: &LispString) {

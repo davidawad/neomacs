@@ -10141,6 +10141,60 @@ fn load_file_records_load_history() {
 }
 
 #[test]
+fn reloading_a_file_splices_its_old_load_history_entry_out_in_place() {
+    crate::test_utils::init_test_tracing();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("neovm-load-history-splice-{unique}"));
+    fs::create_dir_all(&dir).expect("create temp fixture dir");
+    let file = dir.join("probe.el");
+    fs::write(&file, "(setq vm-splice-probe t)\n").expect("write fixture");
+
+    let mut eval = crate::test_utils::new_context();
+    eval.eval_str("(setq load-history (list '(\"vm-splice-first\") '(\"vm-splice-second\")))")
+        .expect("seed load-history");
+    let path_str = file.to_string_lossy().to_string();
+    // Entries before and after the file's own entry on later loads.
+    for round in 0..3 {
+        load_file(&mut eval, &file).expect("load file");
+        if round == 0 {
+            eval.eval_str("(setq load-history (append load-history '((\"vm-splice-last\"))))")
+                .expect("append entry");
+        }
+    }
+
+    let history = eval
+        .obarray()
+        .symbol_value_copied("load-history")
+        .unwrap_or(Value::NIL);
+    let names: Vec<String> = list_to_vec(&history)
+        .expect("load-history is a list")
+        .iter()
+        .map(|entry| {
+            entry
+                .cons_car()
+                .as_utf8_str()
+                .expect("entry names a file")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            path_str,
+            "vm-splice-first".to_string(),
+            "vm-splice-second".to_string(),
+            "vm-splice-last".to_string(),
+        ],
+        "one entry for the file, at the head, the others in their old order"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn require_of_a_loaded_feature_answers_from_the_live_features_list() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::test_utils::new_context();
