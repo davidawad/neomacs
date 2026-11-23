@@ -5197,9 +5197,9 @@ impl TextPropertyTable {
         // with a full rebalance climb -- ~3.4K Ir per face run, a third of a
         // 50-line yank in the kill/yank sim window (GNU: ~0.4K per interval).
         let runs = other.intervals.runs();
-        for run in &runs {
-            self.property_names.observe_plist(run.plist);
-        }
+        // Every name in OTHER's runs is on OTHER's summary, so merging the
+        // summaries covers the grafted plists without a hash probe per run.
+        self.property_names.include(&other.property_names);
         self.intervals.graft_shifted_runs(&runs, offset, new_root);
     }
 

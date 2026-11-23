@@ -248,3 +248,31 @@ fn concat_of_propertized_strings_copies_no_interval_tree() {
         "OK (402 (:run 0) nil (:run 0) (:run 49) t)",
     );
 }
+
+/// Inserting a propertized string records its property names on the buffer's
+/// summary, so a name the string carries is possibly present and every other
+/// name stays provably absent -- the proof the interval-walk gates rely on.
+#[test]
+fn grafting_a_string_publishes_its_property_names_to_the_buffer() {
+    use neovm_edit::buffer::text_props::PropertyNamePresence::DefinitelyAbsent;
+    let mut eval = property_transfer_fixture();
+    let inserted = eval.eval_str("(progn (erase-buffer) (insert s) (buffer-size))");
+    assert_eq!(format_eval_result(&inserted), "OK 200");
+    let presence = |eval: &mut Context, name: &'static str| {
+        let name = neovm_value::value::Value::symbol(name);
+        eval.edit
+            .buffers
+            .current_buffer()
+            .expect("current buffer")
+            .text_props_property_name_presence(name)
+    };
+    assert_ne!(presence(&mut eval, "face"), DefinitelyAbsent);
+    assert_ne!(presence(&mut eval, "k"), DefinitelyAbsent);
+    assert_eq!(presence(&mut eval, "read-only"), DefinitelyAbsent);
+    assert_eq!(presence(&mut eval, "never-assigned-name"), DefinitelyAbsent);
+
+    // Names added afterwards join the summary; it stays a superset of the text.
+    let put = eval.eval_str("(put-text-property 1 5 'added-later 1)");
+    assert_eq!(format_eval_result(&put), "OK nil");
+    assert_ne!(presence(&mut eval, "added-later"), DefinitelyAbsent);
+}

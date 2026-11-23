@@ -25,10 +25,19 @@ fn assert_same_tables(actual: &TextPropertyTable, expected: &TextPropertyTable, 
         "syntax-table",
     ] {
         let name = Value::symbol(name);
-        assert_eq!(
+        // The reference grafts a slice table, whose summary is its source's
+        // whole summary, and a graft merges summaries.  The direct slice graft
+        // observes only the runs it copies, so it may prove a name absent that
+        // the reference cannot, and never the reverse.
+        let (actual, expected) = (
             actual.property_name_presence(name),
             expected.property_name_presence(name),
-            "name summary: {context}"
+        );
+        assert!(
+            actual == expected
+                || (actual == PropertyNamePresence::DefinitelyAbsent
+                    && expected == PropertyNamePresence::PossiblyPresent),
+            "name summary {name:?}: {context}: slice graft {actual:?}, reference {expected:?}"
         );
     }
 }
