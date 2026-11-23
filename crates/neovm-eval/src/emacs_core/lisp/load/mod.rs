@@ -2952,13 +2952,21 @@ fn load_file_body(
             .map_err(crate::emacs_core::print::map_flow);
     }
 
-    if !is_elc
+    // `load-source-compile-cache`: a valid cached `.elc` stands in for the
+    // source, but only for reading.  `found` and `hist_file_name` stay the
+    // source's, so `load-file-name`, `load-true-file-name` and `load-history`
+    // name the source file.
+    let cached = if is_elc { None } else { source_cache::probe(eval, path) };
+    let is_compiled = is_elc || cached.is_some();
+    let read_path = cached.as_deref().unwrap_or(path);
+
+    if !is_compiled
         && let load_source_file_function =
             eval.visible_variable_value_or_nil("load-source-file-function")
         && !load_source_file_function.is_nil()
     {
         let full_name = Value::heap_string(found.clone());
-        return eval
+        let result = eval
             .apply(
                 load_source_file_function,
                 vec![
@@ -2969,6 +2977,10 @@ fn load_file_body(
                 ],
             )
             .map_err(crate::emacs_core::print::map_flow);
+        if result.is_ok() {
+            source_cache::after_source_load(eval, path);
+        }
+        return result;
     }
 
     // GNU src/lread.c:1473, reached only once `load-source-file-function` has
@@ -2979,12 +2991,12 @@ fn load_file_body(
 
     // Read raw bytes and decode (with Emacs-extended UTF-8 for .el,
     // or header-skipping for .elc).
-    let raw_bytes = std::fs::read(path).map_err(|e| {
+    let raw_bytes = std::fs::read(read_path).map_err(|e| {
         EvalError::signal(
             intern("file-error"),
             vec![Value::string(format!(
                 "Cannot read file: {}: {}",
-                path.display(),
+                read_path.display(),
                 e
             ))],
             None,
@@ -3000,7 +3012,7 @@ fn load_file_body(
     // Emacs-bytes LispString and reads via the LispString reader, so source
     // characters — including non-Unicode literals — keep their real codes and
     // never round-trip through the in-Unicode storage-string form (issue #131).
-    let result = if is_elc {
+    let result = if is_compiled {
         // GNU `Fload`, src/lread.c:1368-1398: having opened a `.elc`, stat the
         // `.el` beside it and say so when the source is newer.  GNU skips the
         // comparison when `load-prefer-newer' is on, because then `openp'
@@ -3010,9 +3022,10 @@ fn load_file_body(
         // load that ran superseded bytecode ran it silently -- and four
         // separate sessions read the resulting behaviour difference as a code
         // defect instead of a build fault.
-        if !eval
-            .visible_variable_value_or_nil("load-prefer-newer")
-            .is_truthy()
+        if cached.is_none()
+            && !eval
+                .visible_variable_value_or_nil("load-prefer-newer")
+                .is_truthy()
             && let CompiledFreshness::SourceNewer { source, .. } =
                 CompiledFreshness::of_compiled(path)
         {
@@ -3037,7 +3050,7 @@ fn load_file_body(
                 super::reader::ReadSourceObject::LoadFile(Value::heap_string(found.clone()));
             streaming_readevalloop(
                 eval,
-                path,
+                read_path,
                 &hist_file_name,
                 content,
                 content_start,
@@ -3093,6 +3106,9 @@ fn load_file_body(
     // callbacks see the caller's restored lexenv.
     if result.is_ok() {
         run_after_load_evaluation(eval, &hist_file_name);
+        if !is_compiled {
+            source_cache::after_source_load(eval, path);
+        }
     }
 
     result
@@ -7245,6 +7261,7 @@ pub(crate) fn expand_tilde(path: &str) -> String {
 
 #[cfg(unix)]
 mod probe_cache;
+pub(crate) mod source_cache;
 
 #[cfg(test)]
 #[path = "tests/bootstrap_error_test.rs"]

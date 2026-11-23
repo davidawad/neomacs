@@ -795,6 +795,9 @@ markerp	1	1	eval	always
 get-load-suffixes	0	0	eval	always
 base64-decode-string	1	3	eval	always
 base64url-encode-string	1	2	eval	always
+neomacs-source-cache-flush	0	1	eval	always
+neomacs-source-cache-compile	1	1	eval	always
+neomacs-source-cache-clear	0	0	eval	always
 fboundp	1	1	eval	always
 getenv-internal	1	2	system	always
 run-window-configuration-change-hook	0	1	core	always

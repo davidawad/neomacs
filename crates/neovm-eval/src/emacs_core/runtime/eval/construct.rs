@@ -804,6 +804,14 @@ impl Context {
         obarray.make_special("load-read-function");
         obarray.seed_value("load-source-file-function", Value::NIL);
         obarray.make_special("load-source-file-function");
+        // Neomacs-only: the transparent byte-compile cache for `.el` loaded as
+        // source (`lisp/load/source_cache.rs`).  Off while nil.
+        obarray.seed_value("load-source-compile-cache", Value::NIL);
+        obarray.make_special("load-source-compile-cache");
+        obarray.seed_value("load-source-compile-cache-exclude", Value::NIL);
+        obarray.make_special("load-source-compile-cache-exclude");
+        obarray.seed_value("load-source-compile-cache-jobs", Value::fixnum(2));
+        obarray.make_special("load-source-compile-cache-jobs");
         obarray.seed_value("load-true-file-name", Value::NIL);
         obarray.make_special("load-true-file-name");
         obarray.seed_value("user-init-file", Value::NIL);

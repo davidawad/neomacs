@@ -844,7 +844,7 @@ pub(crate) const POST_P3_WORLD_REGISTRATIONS: &[&str] = &[
 
 /// Canonical P3 totals over the 1,726 classified names.
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.
-pub(crate) const CANONICAL_WORLD_NAMES: usize = 1_651;
+pub(crate) const CANONICAL_WORLD_NAMES: usize = 1_654;
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.
 pub(crate) const CANONICAL_SEALED_NAMES: usize = 41;
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.
@@ -852,9 +852,9 @@ pub(crate) const CANONICAL_SCALAR_NAMES: usize = 34;
 
 /// Exact generated-table expectations (all inventory entries and kinds).
 #[allow(dead_code)] // Read by the architecture gate.
-pub(crate) const EXPECTED_INVENTORY_ENTRIES: usize = 1_741;
+pub(crate) const EXPECTED_INVENTORY_ENTRIES: usize = 1_744;
 #[allow(dead_code)] // Read by the architecture gate.
-pub(crate) const EXPECTED_PRIMITIVE_ENTRIES: usize = 1_580;
+pub(crate) const EXPECTED_PRIMITIVE_ENTRIES: usize = 1_583;
 #[allow(dead_code)] // Read by the architecture gate.
 pub(crate) const EXPECTED_OPCODE_ENTRIES: usize = 107;
 #[allow(dead_code)] // Read by the architecture gate.
@@ -870,14 +870,14 @@ pub(crate) const EXPECTED_SEALED_ENTRIES: usize = 41;
 #[allow(dead_code)] // Read by the architecture gate.
 pub(crate) const EXPECTED_SCALAR_ENTRIES: usize = 34;
 #[allow(dead_code)] // Read by the architecture gate.
-pub(crate) const EXPECTED_WORLD_ENTRIES: usize = 1_666;
+pub(crate) const EXPECTED_WORLD_ENTRIES: usize = 1_669;
 
-/// Exact canonical dispatch-arm expectations over the 1,726 names. The
+/// Exact canonical dispatch-arm expectations over the 1,729 names. The
 /// canonical P3 class stays World for the typed splits; these counts name the
 /// ARM each canonical name resolves to, so a projection or count drift fails
 /// the closed-world gate.
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.
-pub(crate) const EXPECTED_WORLD_ESCAPE_NAMES: usize = 1_614;
+pub(crate) const EXPECTED_WORLD_ESCAPE_NAMES: usize = 1_617;
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.
 pub(crate) const EXPECTED_RETURN_SPLIT_NAMES: usize = 1;
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.
@@ -891,7 +891,7 @@ pub(crate) const EXPECTED_CANNOT_REENTER_NAMES: usize = 5;
 
 /// Exact declaration and canonical-name expectations.
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.
-pub(crate) const EXPECTED_CANONICAL_NAMES: usize = 1_726;
+pub(crate) const EXPECTED_CANONICAL_NAMES: usize = 1_729;
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.
 pub(crate) const EXPECTED_SEALED_DECLARATIONS: usize = 38;
 #[allow(dead_code)] // Read by the architecture gate and catalog tests.

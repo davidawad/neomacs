@@ -4567,6 +4567,57 @@ crate::emacs_core::subr::define_subrs! {
         }),
         SubrArity::new(1, Some(2)),
     )),
+    crate::emacs_core::subr::world_subr!(SubrSpec::new(
+        "neomacs-source-cache-flush",
+        NativeFn::ContextVec(source_cache_flush),
+        SubrArity::new(0, Some(1)),
+    )),
+    crate::emacs_core::subr::world_subr!(SubrSpec::new(
+        "neomacs-source-cache-compile",
+        NativeFn::ContextVec(source_cache_compile),
+        SubrArity::new(1, Some(1)),
+    )),
+    crate::emacs_core::subr::world_subr!(SubrSpec::new(
+        "neomacs-source-cache-clear",
+        NativeFn::ContextVec(source_cache_clear),
+        SubrArity::new(0, Some(0)),
+    )),
+}
+
+/// `(neomacs-source-cache-flush &optional TIMEOUT-MS)`: start every queued
+/// compile and wait for the children; the number still unfinished (0 when
+/// done, or when the cache is off).
+fn source_cache_flush(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
+    expect_max_args("neomacs-source-cache-flush", &args, 1)?;
+    let timeout_ms = args
+        .first()
+        .and_then(|v| v.as_int())
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(60_000);
+    let pending = crate::emacs_core::load::source_cache::flush(
+        ctx,
+        std::time::Duration::from_millis(timeout_ms),
+    );
+    Ok(Value::fixnum(pending as i64))
+}
+
+/// `(neomacs-source-cache-compile FILE)`: queue a compile of FILE into the
+/// cache without loading it; t when it was queued, nil when the cache is off
+/// or FILE is cached, excluded, known to fail, or has no lexical-binding cookie.
+fn source_cache_compile(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
+    expect_args("neomacs-source-cache-compile", &args, 1)?;
+    let Some(file) = args[0].as_lisp_string() else {
+        return Err(neovm_value::error::signal("wrong-type-argument", vec![Value::symbol("stringp"), args[0]]));
+    };
+    let path = crate::emacs_core::load::load_path_buf(file);
+    Ok(Value::bool_val(crate::emacs_core::load::source_cache::enqueue(ctx, &path)))
+}
+
+/// `(neomacs-source-cache-clear)`: delete the cache directory and drop the
+/// queue; t when a directory was removed.
+fn source_cache_clear(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
+    expect_args("neomacs-source-cache-clear", &args, 0)?;
+    Ok(Value::bool_val(crate::emacs_core::load::source_cache::clear(ctx)))
 }
 
 #[cfg(feature = "shared-heap")]
