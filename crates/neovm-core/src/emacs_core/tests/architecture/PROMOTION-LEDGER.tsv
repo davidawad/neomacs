@@ -1355,3 +1355,5 @@ AttachedScope::enter	method	(new)	crates/neovm-value/src/detached.rs:208	detache
 with_attached	fn	(new fn)	crates/neovm-value/src/detached.rs:234	detached	shared-heap S3 detached-thread gate (feature-gated): signed exact-caller row: with_tagged_heap gate
 detached	mod	(new)	crates/neovm-value/src/lib.rs:14	crate root	shared-heap S3 detached-thread gate (feature-gated): the evaluator reaches the gate module
 TaggedHeap::sweep_in_stop_on	method	(new)	crates/neovm-value/src/tagged/gc/incremental.rs:474	tagged::gc::incremental	shared-heap stop sweep (feature-gated): signed exact-caller row: world::parallel_gc collect_with_world_stopped
+small_time_whole_seconds	fn	(new)	crates/neovm-value/src/time_core.rs:696	time_core	fixnum-only whole-seconds fast path; decode-time in neovm-system skips the bignum decode
+small_time_float	fn	(new)	crates/neovm-value/src/time_core.rs:704	time_core	fixnum-only float-time fast path; float-time in neovm-system skips the bignum decode

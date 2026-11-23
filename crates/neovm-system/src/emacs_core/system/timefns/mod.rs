@@ -21,6 +21,8 @@ pub use neovm_value::time_core::{
     time_spec_invalid, time_value_seconds_and_nanos, value_to_integer,
 };
 
+use neovm_value::time_core::{small_time_float, small_time_whole_seconds};
+
 #[doc(hidden)]
 pub use neovm_eval::emacs_core::builtins::misc_eval::{
     builtin_current_time_in_context, lisp_time_output_from_context,
@@ -504,11 +506,11 @@ fn refresh_tz_env() {
     unsafe {
         tzset();
     }
-}
-#[cfg(not(unix))]
     // The rules now follow whatever `TZ` was just set to, which the local
     // conversion's record of what it loaded no longer describes.
     mktime::forget_loaded_zone();
+}
+#[cfg(not(unix))]
 fn refresh_tz_env() {}
 /// Serializes local libc timezone reads with temporary timezone writers.
 /// This lock-only guard preserves the process TZ and stays on its mutator thread.
@@ -1019,6 +1021,9 @@ pub fn builtin_float_time(args: Vec<Value>) -> EvalResult {
     if matches!(arg.kind(), ValueKind::Float) {
         return Ok(arg);
     }
+    if let Some(seconds) = small_time_float(&arg) {
+        return Ok(Value::make_float(seconds));
+    }
     let th = decode_lisp_time(&arg)?.th;
     Ok(Value::make_float(frac_to_double(&th.ticks, &th.hz)))
 }
@@ -1270,8 +1275,13 @@ pub fn builtin_decode_time(args: Vec<Value>) -> EvalResult {
     } else {
         // GNU `lisp_seconds_argument`: the floor of the exact (TICKS . HZ), so TICKS may be a
         // bignum as long as the seconds fit.
-        let th = decode_lisp_time(&time_arg)?.th;
-        let secs = i64::try_from(&ticks_hz_seconds(&th)).map_err(|_| time_error_overflow())?;
+        let secs = match small_time_whole_seconds(&time_arg) {
+            Some(secs) => secs,
+            None => {
+                let th = decode_lisp_time(&time_arg)?.th;
+                i64::try_from(&ticks_hz_seconds(&th)).map_err(|_| time_error_overflow())?
+            }
+        };
         (secs, None)
     };
 
@@ -1291,7 +1301,7 @@ pub fn builtin_decode_time(args: Vec<Value>) -> EvalResult {
         }
         _ => Value::fixnum(dt.sec),
     };
-    Ok(Value::list(vec![
+    Ok(Value::list_from_slice(&[
         sec,
         Value::fixnum(dt.min),
         Value::fixnum(dt.hour),

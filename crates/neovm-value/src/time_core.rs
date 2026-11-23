@@ -338,6 +338,14 @@ pub fn time_value_seconds_and_nanos(val: &Value) -> Result<(i64, i64), Flow> {
     // nanosecond count is floor((ticks * 10**9) / hz) reduced mod 10**9. Doing
     // this on the exact pair (rather than a microsecond-rounded intermediate)
     // keeps `%N`/`%3N`/`%6N` byte-exact for arbitrary HZ.
+    if let Some(time) = SmallTime::decode(val)
+        && let Some(scaled) = time.ticks.checked_mul(1_000_000_000)
+    {
+        let total_nanos = scaled.div_euclid(time.hz);
+        if let Ok(secs) = i64::try_from(total_nanos.div_euclid(1_000_000_000)) {
+            return Ok((secs, total_nanos.rem_euclid(1_000_000_000) as i64));
+        }
+    }
     let th = decode_lisp_time(val)?.th;
     let timespec_hz = Integer::from(1_000_000_000i64);
     let total_nanos = integer_div_floor(&(&th.ticks * &timespec_hz), &th.hz);
@@ -582,6 +590,145 @@ pub fn decode_time_components(
         hz: hz.clone(),
     }
 }
+/// A time value whose every part is a fixnum, as the exact pair
+/// `ticks / hz` in machine integers.
+///
+/// GNU keeps `struct lisp_time` as a fixnum pair whenever the parts fit
+/// (`FASTER_TIMEFNS`) and falls back to `mpz` only on overflow.  Every
+/// constructor below returns `None` for anything it cannot represent exactly
+/// (a bignum or float part, a malformed list, an overflowing product), so the
+/// caller takes the arbitrary-precision path and its errors unchanged.
+#[derive(Clone, Copy, Debug)]
+struct SmallTime {
+    ticks: i128,
+    hz: i128,
+    form: TimeInputForm,
+}
+
+const SMALL_MILLION: i128 = 1_000_000;
+const SMALL_TRILLION: i128 = 1_000_000_000_000;
+
+impl SmallTime {
+    /// The small form of `val`, for the forms `decode_lisp_time` reads from
+    /// fixnums alone: an integer, `(TICKS . HZ)`, `(HIGH LOW)`,
+    /// `(HIGH LOW USEC)`, `(HIGH LOW . USEC)` and `(HIGH LOW USEC PSEC)`.
+    fn decode(val: &Value) -> Option<Self> {
+        if let Some(n) = val.as_fixnum() {
+            return Some(Self {
+                ticks: i128::from(n),
+                hz: 1,
+                form: TimeInputForm::Scalar,
+            });
+        }
+        if !val.is_cons() {
+            return None;
+        }
+        let high = val.cons_car();
+        let rest = val.cons_cdr();
+        if !rest.is_cons() {
+            let ticks = high.as_fixnum()?;
+            let hz = rest.as_fixnum().filter(|hz| *hz > 0)?;
+            return Some(Self {
+                ticks: i128::from(ticks),
+                hz: i128::from(hz),
+                form: TimeInputForm::TicksHz,
+            });
+        }
+        let high = i128::from(high.as_fixnum()?);
+        let low = i128::from(rest.cons_car().as_fixnum()?);
+        let tail = rest.cons_cdr();
+        let (usec, psec, hz) = if tail.is_cons() {
+            let usec = i128::from(tail.cons_car().as_fixnum()?);
+            let tail2 = tail.cons_cdr();
+            if tail2.is_cons() {
+                (usec, i128::from(tail2.cons_car().as_fixnum()?), SMALL_TRILLION)
+            } else {
+                (usec, 0, SMALL_MILLION)
+            }
+        } else if tail.is_nil() {
+            (0, 0, 1)
+        } else {
+            (i128::from(tail.as_fixnum()?), 0, SMALL_MILLION)
+        };
+        // `decode_time_components`: USEC and PSEC carry into the seconds.
+        let us_adj = usec + psec.div_euclid(SMALL_MILLION);
+        let seconds = high * 65536 + low + us_adj.div_euclid(SMALL_MILLION);
+        let ticks = match hz {
+            SMALL_TRILLION => seconds
+                .checked_mul(SMALL_TRILLION)?
+                .checked_add(us_adj.rem_euclid(SMALL_MILLION) * SMALL_MILLION)?
+                .checked_add(psec.rem_euclid(SMALL_MILLION))?,
+            SMALL_MILLION => seconds
+                .checked_mul(SMALL_MILLION)?
+                .checked_add(us_adj.rem_euclid(SMALL_MILLION))?,
+            _ => seconds,
+        };
+        Some(Self {
+            ticks,
+            hz,
+            form: TimeInputForm::List,
+        })
+    }
+
+    /// Whole seconds, `floor (ticks / hz)` (`ticks_hz_seconds`).
+    fn whole_seconds(self) -> i128 {
+        self.ticks.div_euclid(self.hz)
+    }
+}
+
+/// A Lisp integer from a machine integer, bignum only past the fixnum range.
+fn small_integer_value(n: i128) -> Value {
+    match i64::try_from(n) {
+        Ok(n)
+            if (crate::tagged::value::TaggedValue::MOST_NEGATIVE_FIXNUM
+                ..=crate::tagged::value::TaggedValue::MOST_POSITIVE_FIXNUM)
+                .contains(&n) =>
+        {
+            Value::fixnum(n)
+        }
+        _ => Value::make_integer(Integer::from(n)),
+    }
+}
+
+/// Whole seconds of the fixnum-only time forms, or `None` for any value the
+/// arbitrary-precision decoder must read (floats, nil, bignums, bad input).
+#[doc(hidden)]
+pub fn small_time_whole_seconds(val: &Value) -> Option<i64> {
+    i64::try_from(SmallTime::decode(val)?.whole_seconds()).ok()
+}
+
+/// `float-time` of a fixnum-only time form when the quotient is exact in
+/// binary64: both operands below 2**53 make the one IEEE division the
+/// correctly rounded rational, which is `frac_to_double`'s answer.
+#[doc(hidden)]
+pub fn small_time_float(val: &Value) -> Option<f64> {
+    const EXACT: i128 = 1 << 53;
+    let time = SmallTime::decode(val)?;
+    (time.ticks.abs() < EXACT && time.hz < EXACT).then(|| time.ticks as f64 / time.hz as f64)
+}
+
+/// `time_arith_to_lisp` for machine integers; `None` when the result needs the
+/// arbitrary-precision constructors.
+fn small_arith_to_lisp(ticks: i128, hz: i128, a: TimeInputForm, b: TimeInputForm) -> Option<Value> {
+    if hz == 1 {
+        return Some(small_integer_value(ticks));
+    }
+    if a == TimeInputForm::TicksHz || b == TimeInputForm::TicksHz || SMALL_TRILLION % hz != 0 {
+        return Some(Value::cons(small_integer_value(ticks), small_integer_value(hz)));
+    }
+    // `ticks_hz_list4`: floor (ticks * 10**12 / hz), split into seconds and a
+    // 12-digit fraction, then seconds into 16-bit HIGH and LOW.
+    let scaled = ticks.checked_mul(SMALL_TRILLION)?.div_euclid(hz);
+    let seconds = scaled.div_euclid(SMALL_TRILLION);
+    let fraction = scaled.rem_euclid(SMALL_TRILLION);
+    Some(Value::list_from_slice(&[
+        small_integer_value(seconds.div_euclid(65536)),
+        small_integer_value(seconds.rem_euclid(65536)),
+        small_integer_value(fraction / SMALL_MILLION),
+        small_integer_value(fraction % SMALL_MILLION),
+    ]))
+}
+
 /// GNU `decode_lisp_time` (`src/timefns.c:959`), returning the exact
 /// `(TICKS . HZ)` and the syntactic form. Accepts the same four canonical and
 /// three compatibility forms GNU does:
@@ -757,6 +904,25 @@ pub fn ticks_hz_hz_ticks(t: &TicksHz, hz_out: &Integer) -> Result<Integer, Flow>
 /// values exactly and choose the GNU result representation.
 #[doc(hidden)]
 pub fn time_arith(a: &Value, b: &Value, subtract: bool) -> Result<Value, Flow> {
+    // Equal frequencies (two integers, two `(HIGH LOW)` lists, two
+    // `(HIGH LOW USEC PSEC)` lists) need only one machine-integer add.
+    if let (Some(sa), Some(sb)) = (SmallTime::decode(a), SmallTime::decode(b))
+        && sa.hz == sb.hz
+        && let Some(ticks) = if subtract {
+            sa.ticks.checked_sub(sb.ticks)
+        } else {
+            sa.ticks.checked_add(sb.ticks)
+        }
+        && let Some(value) = small_arith_to_lisp(ticks, sa.hz, sa.form, sb.form)
+    {
+        return Ok(value);
+    }
+    time_arith_exact(a, b, subtract)
+}
+
+/// `time_arith` on the arbitrary-precision pair, for every input the fixnum
+/// fast path declines.
+fn time_arith_exact(a: &Value, b: &Value, subtract: bool) -> Result<Value, Flow> {
     let da = decode_lisp_time(a)?;
     let db = decode_lisp_time(b)?;
 
@@ -832,6 +998,16 @@ pub fn time_arith_to_lisp(
 /// cross-multiplying ATICKS*BHZ vs BTICKS*AHZ.
 #[doc(hidden)]
 pub fn time_cmp(a: &Value, b: &Value) -> Result<std::cmp::Ordering, Flow> {
+    if let (Some(sa), Some(sb)) = (SmallTime::decode(a), SmallTime::decode(b))
+        && let (Some(lhs), Some(rhs)) = (sa.ticks.checked_mul(sb.hz), sb.ticks.checked_mul(sa.hz))
+    {
+        return Ok(lhs.cmp(&rhs));
+    }
+    time_cmp_exact(a, b)
+}
+
+/// `time_cmp` on the arbitrary-precision pair.
+fn time_cmp_exact(a: &Value, b: &Value) -> Result<std::cmp::Ordering, Flow> {
     let da = decode_lisp_time(a)?;
     let db = decode_lisp_time(b)?;
     let lhs = &da.th.ticks * &db.th.hz;
@@ -871,3 +1047,7 @@ pub fn current_time_value(output: LispTimeOutput) -> Value {
 pub fn make_lisp_time(secs: i64, nanos: i64, output: LispTimeOutput) -> Value {
     output.encode(TimeMicros::from_timespec(secs, nanos))
 }
+
+#[cfg(test)]
+#[path = "time_core/tests/small_time_test.rs"]
+mod small_time_tests;
