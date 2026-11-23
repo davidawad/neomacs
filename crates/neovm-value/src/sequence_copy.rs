@@ -17,7 +17,7 @@ use crate::error::{EvalResult, LispCondition, signal};
 use crate::list_scan::{for_each_tail_cycle_tail, scan_car, scan_cdr, unobserved_list_scan};
 use crate::tagged::SymbolMode;
 use crate::value::{
-    Value, ValueKind, VecLikeType, get_string_text_properties_table_for_value,
+    Value, ValueKind, VecLikeType, borrow_string_text_properties_table_for_value,
     set_string_text_properties_table_for_value,
 };
 
@@ -41,10 +41,11 @@ pub fn copy_sequence_with_symbols(arg: Value, symbols: SymbolMode) -> EvalResult
             if string.is_empty() {
                 return Ok(arg);
             }
-            let new_val = Value::heap_string(string.clone());
-            // Copy text properties
+            // The bytes alone: the properties are copied once below, straight
+            // from the source's table (GNU `copy_intervals`).
+            let new_val = Value::heap_string(string.without_properties());
             if new_val.is_string()
-                && let Some(table) = get_string_text_properties_table_for_value(arg)
+                && let Some(table) = borrow_string_text_properties_table_for_value(arg)
             {
                 set_string_text_properties_table_for_value(
                     new_val,

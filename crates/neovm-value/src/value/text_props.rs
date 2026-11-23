@@ -2987,7 +2987,10 @@ impl TextPropertyTable {
             run.plist = copy_plist_value(run.plist);
             run.refresh_cache();
         }
-        Self::from_interval_runs_preserving_shape(runs)
+        // The copied plists carry the source's names, so the source's summary
+        // describes the copy too (shared in O(1)); recounting every run's
+        // names into a fresh set was the larger half of the copy.
+        Self::with_runs_and_names(runs, self.property_names.clone())
     }
 
     // -- Query helpers -------------------------------------------------------

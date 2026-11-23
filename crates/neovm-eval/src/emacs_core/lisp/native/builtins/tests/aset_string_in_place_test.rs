@@ -159,3 +159,66 @@ fn putting_a_property_on_a_string_does_not_copy_its_interval_tree() {
         "300 property writes copied the interval tree instead of editing it"
     );
 }
+
+/// A string of 50 property runs (`face` over 3 of every 4 characters, `k` over
+/// 2 of them) and a scratch buffer, the fixture of the transfer tests below.
+fn property_transfer_fixture() -> Context {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new(crate::test_utils::unit_runtime());
+    let setup = eval.eval_str(
+        r#"(progn
+             (setq s (let ((s (make-string 200 ?a)) (i 0))
+                       (while (< i 50)
+                         (put-text-property (* i 4) (+ (* i 4) 3) 'face (list :run i) s)
+                         (put-text-property (* i 4) (+ (* i 4) 2) 'k i s)
+                         (setq i (1+ i)))
+                       s))
+             (setq b (get-buffer-create "transfer"))
+             (set-buffer b)
+             t)"#,
+    );
+    assert_eq!(format_eval_result(&setup), "OK t");
+    eval
+}
+
+/// Evaluate FORM and assert it produced WANT without copying any interval
+/// tree.  The clone counter is the only thing that tells a primitive that
+/// reads the source's tree from one that duplicates it first.
+fn assert_form_copies_no_interval_tree(eval: &mut Context, form: &str, want: &str) {
+    use neovm_edit::buffer::text_props::text_property_table_clones_for_test;
+    use neovm_value::test_support::authority::reset_text_property_table_clones_for_test;
+    reset_text_property_table_clones_for_test();
+    let got = format_eval_result(&eval.eval_str(form));
+    assert_eq!(got, want, "{form}");
+    assert_eq!(
+        text_property_table_clones_for_test(),
+        0,
+        "{form} duplicated an interval tree"
+    );
+}
+
+/// `copy-sequence` of a propertized string builds its one copy of the tree
+/// from the source's tree; it does not first duplicate the tree (GNU
+/// `copy_intervals`).  The copy keeps every property of the source, owns its
+/// plists, and the source is untouched by writes to the copy.
+#[test]
+fn copy_sequence_of_a_propertized_string_copies_no_interval_tree() {
+    let mut eval = property_transfer_fixture();
+    assert_form_copies_no_interval_tree(
+        &mut eval,
+        "(let ((c (copy-sequence s))) (list (equal-including-properties c s) (eq c s) (text-properties-at 0 c)))",
+        "OK (t nil (k 0 face (:run 0)))",
+    );
+    let isolated = eval.eval_str(
+        r#"(let ((c (copy-sequence s)))
+             (put-text-property 0 200 'face 'changed c)
+             (put-text-property 0 200 'fresh 1 c)
+             (list (get-text-property 1 'face s) (get-text-property 1 'face c)
+                   (get-text-property 1 'fresh s) (get-text-property 1 'fresh c)))"#,
+    );
+    assert_eq!(
+        format_eval_result(&isolated),
+        "OK ((:run 0) changed nil 1)",
+        "writes to the copy, including a name the source never had, stay in the copy"
+    );
+}
