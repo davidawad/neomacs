@@ -3800,7 +3800,7 @@ impl Context {
         nargs: usize,
         sym_id: Option<SymId>,
     ) -> EvalResult {
-        if self.threading_mode() == super::admission::ThreadingMode::Parallel
+        if self.threading_mode().is_parallel()
             && self.threads.current_thread_id() != 0
             && sym_id.is_some_and(is_host_affine_primitive)
         {
@@ -4082,7 +4082,7 @@ impl Context {
         args: &[Value],
         entry: SubrEntry,
     ) -> EvalResult {
-        if self.threading_mode() == super::admission::ThreadingMode::Parallel
+        if self.threading_mode().is_parallel()
             && self.threads.current_thread_id() != 0
             && is_host_affine_primitive(sym_id)
         {

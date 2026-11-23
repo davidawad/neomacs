@@ -89,7 +89,7 @@ impl TextHost for Context {
 
     #[inline]
     fn parallel_stop_points_enabled(&self) -> bool {
-        self.threading_mode() == super::admission::ThreadingMode::Parallel
+        self.threading_mode().is_parallel()
     }
 
     fn join_world_stop(&mut self, held: &[Value]) {

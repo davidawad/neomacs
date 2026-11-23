@@ -85,6 +85,20 @@ pub(crate) fn parallel_world_made() -> bool {
 }
 
 impl ThreadingMode {
+    /// Whether this is the Parallel mode, which exists only with
+    /// `shared-heap`; without it no World is Parallel.
+    #[inline]
+    pub(crate) fn is_parallel(self) -> bool {
+        #[cfg(feature = "shared-heap")]
+        {
+            self == Self::Parallel
+        }
+        #[cfg(not(feature = "shared-heap"))]
+        {
+            false
+        }
+    }
+
     /// This mode, for a World being made in it: a Parallel one is recorded
     /// ([`PARALLEL_WORLD_MADE`]) before any Lisp runs in it.
     pub(crate) fn for_new_world(self) -> Self {
