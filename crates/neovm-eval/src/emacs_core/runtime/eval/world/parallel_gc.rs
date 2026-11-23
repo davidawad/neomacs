@@ -721,11 +721,13 @@ impl Context {
         stop.park(image);
         stop.resume();
         if stop.counters().collections != seen {
-            // The collection changed heap state this thread mirrors; the
-            // mirrors are refreshed under the Baton, as at any install.
-            let baton = lock.attach().into_baton();
+            // This is only a thread-local pointer publication. Every parked
+            // owner already holds its own Context and WorldView, and the
+            // stop has ended before it can touch the heap again. Taking the
+            // Baton here serialized every awakened worker behind the
+            // collector (and made a parked Main owner wait for a service
+            // turn that the collection does not need).
             self.tagged_heap.install_tagged_heap();
-            lock.detach(baton);
         }
         neovm_value::detached::resume_detached(gate);
     }

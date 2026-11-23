@@ -282,6 +282,64 @@ fn a_collection_stops_a_thread_running_detached() {
     assert_eq!(after.safepoint_stops - before.safepoint_stops, 1);
 }
 
+/// Every worker parked for one collection reinstalls its own heap pointer
+/// after the stop without taking the World's Baton to do so. The collector
+/// itself may account for one attach while requesting the collection.
+#[test]
+fn parked_workers_reinstall_after_collection_without_baton_attaches() {
+    const THREADS: usize = 8;
+    let mut ev = parallel();
+    let inside = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let mut names = Vec::with_capacity(THREADS);
+    for index in 0..THREADS {
+        let name = Box::leak(format!("pgc-refresh-{index}").into_boxed_str());
+        let (inside, release) = (Arc::clone(&inside), Arc::clone(&release));
+        register_thread_body(name, move |owner| {
+            with_detached(owner, &[], move |section| {
+                inside.fetch_add(1, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    section.safepoint();
+                    std::thread::yield_now();
+                }
+                1
+            })
+        });
+        names.push(name);
+    }
+    let threads = names
+        .iter()
+        .map(|name| format!("(make-thread '{name})"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        eval(
+            &mut ev,
+            &format!("(progn (setq pgc-refresh-threads (list {threads})) t)")
+        ),
+        "t"
+    );
+    while inside.load(Ordering::Acquire) != THREADS {
+        assert_eq!(eval(&mut ev, "(thread-yield)"), "nil");
+        std::thread::yield_now();
+    }
+
+    let before = stats(&ev);
+    eval(&mut ev, "(garbage-collect)");
+    let after = stats(&ev);
+    assert_eq!(after.collections - before.collections, 1);
+    assert!(
+        after.attach_count - before.attach_count <= 1,
+        "parked workers attached to the Baton: {after:?}"
+    );
+
+    release.store(true, Ordering::Release);
+    assert_eq!(
+        eval(&mut ev, "(mapcar 'thread-join pgc-refresh-threads)"),
+        "(1 1 1 1 1 1 1 1)"
+    );
+}
+
 /// Eight threads, each building 10_000-element lists in Lisp and summing
 /// them in detached sections, with a tiny `gc-cons-threshold`.
 fn eight_threads_cons_and_collect() {
