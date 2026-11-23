@@ -4,6 +4,7 @@
 //! points at them. The text engine stays in `neovm-text`.
 
 use super::Context;
+use neovm_edit::buffer::buffer::BUFFER_SLOT_CASE_TABLE;
 use neovm_text::emacs_core::casetab::{
     CaseTableOverride, cache_standard_case_table_heap, cache_standard_case_table_object,
     case_table_extra, current_case_table_for_buffer_in_state_with_symbols,
@@ -97,6 +98,26 @@ pub fn sync_current_buffer_case_table_state(ctx: &mut Context) -> Result<(), Flo
 
 pub fn current_case_canon_table(ctx: &mut Context) -> Result<Value, Flow> {
     let mode = ctx.symbol_mode();
+    // A complete table is the steady state: answer its canon table without
+    // re-deriving the table on every search.  `current_case_table_for_context`
+    // and `ensure_case_table_derived_slots_with_symbols` below validate the
+    // table twice more and rewrite the same eqv slot; GNU reads the field
+    // (`BVAR (current_buffer, case_canon_table)`).
+    if let Some(buffer) = ctx.edit.buffers.current_buffer() {
+        let table = buffer.slots()[BUFFER_SLOT_CASE_TABLE.index()];
+        if is_case_table_with_symbols(&table, mode) {
+            let canon = case_table_extra(table, 1);
+            let eqv = case_table_extra(table, 2);
+            // `is_case_table` makes every non-nil subsidiary a char-table.
+            if !case_table_extra(table, 0).is_nil()
+                && !canon.is_nil()
+                && !eqv.is_nil()
+                && case_table_extra(canon, 2).bits() == eqv.bits()
+            {
+                return Ok(canon);
+            }
+        }
+    }
     let table = current_case_table_for_context(ctx, mode)?;
     ensure_case_table_derived_slots_with_symbols(table, mode)?;
     Ok(case_table_extra(table, 1))
