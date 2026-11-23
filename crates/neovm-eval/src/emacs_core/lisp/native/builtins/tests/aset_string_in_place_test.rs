@@ -235,3 +235,16 @@ fn propertize_of_a_propertized_string_copies_no_interval_tree() {
         "OK ((extra 7 k new face (:run 0)) 7 7 (:run 0) 0)",
     );
 }
+
+/// `concat` reads each propertized argument's tree where it is and builds the
+/// one tree it returns.  Each argument's properties land at its offset in the
+/// result; the unpropertized arguments leave gaps.
+#[test]
+fn concat_of_propertized_strings_copies_no_interval_tree() {
+    let mut eval = property_transfer_fixture();
+    assert_form_copies_no_interval_tree(
+        &mut eval,
+        "(let ((c (concat s \"--\" s))) (list (length c) (get-text-property 1 'face c) (get-text-property 201 'face c) (get-text-property 202 'face c) (get-text-property 399 'face c) (equal-including-properties (substring c 202) s)))",
+        "OK (402 (:run 0) nil (:run 0) (:run 49) t)",
+    );
+}

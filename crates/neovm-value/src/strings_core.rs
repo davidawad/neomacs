@@ -31,7 +31,7 @@ use crate::value::text_props::{
     PropertyPlistApplication, ShiftedTextPropertySource, TextPropertyTable,
 };
 use crate::value::{
-    Value, ValueKind, VecLikeType, get_string_text_properties_table_for_value,
+    Value, ValueKind, VecLikeType, borrow_string_text_properties_table_for_value,
     set_string_text_properties_table_for_value, string_has_text_properties_for_value,
 };
 
@@ -343,7 +343,7 @@ fn concatenated_string_text_properties(
     let sources = string_sources
         .iter()
         .filter_map(|(source, offset)| {
-            get_string_text_properties_table_for_value(*source)
+            borrow_string_text_properties_table_for_value(*source)
                 .map(|table| ShiftedTextPropertySource::new(table, CharLen::new(*offset)))
         })
         .collect::<Vec<_>>();

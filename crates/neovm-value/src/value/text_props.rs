@@ -2497,14 +2497,14 @@ pub enum PropertyPlistApplication {
 /// interval storage and GNU's string-property positions are character based
 /// even when the destination string is multibyte.
 #[doc(hidden)]
-pub struct ShiftedTextPropertySource {
-    table: TextPropertyTable,
+pub struct ShiftedTextPropertySource<'a> {
+    table: &'a TextPropertyTable,
     char_offset: CharLen,
 }
 
-impl ShiftedTextPropertySource {
+impl<'a> ShiftedTextPropertySource<'a> {
     #[doc(hidden)]
-    pub fn new(table: TextPropertyTable, char_offset: CharLen) -> Self {
+    pub fn new(table: &'a TextPropertyTable, char_offset: CharLen) -> Self {
         Self { table, char_offset }
     }
 }
@@ -3129,7 +3129,7 @@ impl TextPropertyTable {
     /// then builds the destination tree once from all known runs.
     #[doc(hidden)]
     pub fn from_shifted_sources(
-        sources: Vec<ShiftedTextPropertySource>,
+        sources: Vec<ShiftedTextPropertySource<'_>>,
         application: PropertyPlistApplication,
     ) -> Self {
         fn applied_to_empty_destination(
@@ -3161,7 +3161,11 @@ impl TextPropertyTable {
 
         let saved_roots = save_scratch_gc_roots();
         let mut runs = Vec::new();
+        // Each destination plist holds names of its source's plists, so the
+        // sources' summaries merged describe the result.
+        let mut property_names = ConservativePropertyNames::default();
         for source in sources {
+            property_names.include(&source.table.property_names);
             for run in source.table.intervals.runs() {
                 if run.is_empty_plist() {
                     continue;
@@ -3180,7 +3184,7 @@ impl TextPropertyTable {
                 ));
             }
         }
-        let table = Self::from_interval_runs_preserving_shape(runs);
+        let table = Self::with_runs_and_names(runs, property_names);
         restore_scratch_gc_roots(saved_roots);
         table
     }
