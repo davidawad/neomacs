@@ -430,3 +430,30 @@ fn modification_hooks_are_still_found_when_the_walk_can_be_skipped() {
         assert_eq!(&got, want, "{form}");
     }
 }
+
+/// A unibyte string goes into a multibyte buffer as the characters it spells:
+/// ASCII is copied as it is, and a raw byte becomes the matching raw-byte
+/// character.  The ASCII case is the common one (every string literal), and
+/// its character count is its byte count, known without a scan.
+#[test]
+fn inserting_a_unibyte_string_into_a_multibyte_buffer_keeps_its_characters() {
+    let mut eval = property_transfer_fixture();
+    let cases: &[(&str, &str)] = &[
+        (
+            "(let ((u (string-to-unibyte \"abc def\"))) (let ((inhibit-read-only t)) (erase-buffer)) (insert u) (list (multibyte-string-p u) (buffer-size) (position-bytes (point-max)) (buffer-string)))",
+            "OK (nil 7 8 \"abc def\")",
+        ),
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (insert (unibyte-string 97 200 98)) (list (buffer-size) (aref (buffer-string) 1) (position-bytes (point-max))))",
+            "OK (3 4194248 5)",
+        ),
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (insert (make-string 5000 ?x)) (list (buffer-size) (position-bytes (point-max)) (char-after 5000)))",
+            "OK (5000 5001 120)",
+        ),
+    ];
+    for (form, want) in cases {
+        let got = format_eval_result(&eval.eval_str(form));
+        assert_eq!(&got, want, "{form}");
+    }
+}

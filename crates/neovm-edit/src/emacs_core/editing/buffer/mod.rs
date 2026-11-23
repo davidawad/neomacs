@@ -2574,11 +2574,16 @@ pub fn buffer_insert_lisp_string_from_lisp_string(
         let bytes = string.as_bytes();
         // Unibyte ASCII is already valid canonical multibyte content. Copy
         // with one spare slot so the constructor's trailing-NUL push cannot
-        // force a realloc + full re-copy of an exact-capacity Vec.
-        if bytes.iter().all(|&byte| byte < 0x80) {
+        // force a realloc + full re-copy of an exact-capacity Vec.  The
+        // check is the vectorized `is_ascii`, and the character count is the
+        // byte count, so the bytes are walked once more by neither.
+        if bytes.is_ascii() {
             let mut owned = Vec::with_capacity(bytes.len() + 1);
             owned.extend_from_slice(bytes);
-            return neovm_value::heap_types::LispString::from_emacs_bytes(owned);
+            return neovm_value::heap_types::LispString::from_emacs_bytes_with_chars(
+                owned,
+                bytes.len(),
+            );
         }
         // Real conversion: raw 128-255 bytes become their (byte8) chars.
         // Encode through one reused stack buffer, not a Vec per char.
