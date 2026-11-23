@@ -217,6 +217,36 @@ impl TextPropertyPlistRun {
 
 type IntervalPlist = Value;
 
+/// The plist a run takes when PROPERTIES are applied, in order, to an interval
+/// with no properties: GNU `add_properties` prepends each name it does not find
+/// and overwrites the value of one it does.
+fn applied_to_empty_destination(
+    properties: Vec<(Value, Value)>,
+    application: PropertyPlistApplication,
+) -> Vec<(Value, Value)> {
+    let mut destination = Vec::with_capacity(properties.len());
+    let mut apply = |(name, value): (Value, Value)| {
+        if let Some((_, existing)) = destination
+            .iter_mut()
+            .find(|(existing_name, _)| eq_value(existing_name, &name))
+        {
+            *existing = value;
+        } else {
+            destination.insert(0, (name, value));
+        }
+    };
+
+    match application {
+        PropertyPlistApplication::AddProperties => {
+            properties.into_iter().for_each(&mut apply);
+        }
+        PropertyPlistApplication::PreserveSuppliedOrder => {
+            properties.into_iter().rev().for_each(&mut apply);
+        }
+    }
+    destination
+}
+
 fn plist_value_from_pairs(plist: &[(Value, Value)]) -> Value {
     let mut items = Vec::with_capacity(plist.len() * 2);
     for (key, value) in plist {
@@ -3132,33 +3162,6 @@ impl TextPropertyTable {
         sources: Vec<ShiftedTextPropertySource<'_>>,
         application: PropertyPlistApplication,
     ) -> Self {
-        fn applied_to_empty_destination(
-            properties: Vec<(Value, Value)>,
-            application: PropertyPlistApplication,
-        ) -> Vec<(Value, Value)> {
-            let mut destination = Vec::with_capacity(properties.len());
-            let mut apply = |(name, value): (Value, Value)| {
-                if let Some((_, existing)) = destination
-                    .iter_mut()
-                    .find(|(existing_name, _)| eq_value(existing_name, &name))
-                {
-                    *existing = value;
-                } else {
-                    destination.insert(0, (name, value));
-                }
-            };
-
-            match application {
-                PropertyPlistApplication::AddProperties => {
-                    properties.into_iter().for_each(&mut apply);
-                }
-                PropertyPlistApplication::PreserveSuppliedOrder => {
-                    properties.into_iter().rev().for_each(&mut apply);
-                }
-            }
-            destination
-        }
-
         let saved_roots = save_scratch_gc_roots();
         let mut runs = Vec::new();
         // Each destination plist holds names of its source's plists, so the
@@ -3311,6 +3314,19 @@ impl TextPropertyTable {
         properties: &[(Value, Value)],
         application: PropertyPlistApplication,
     ) -> bool {
+        // A string with no properties taking some over its whole length (every
+        // `propertize` of a plain string, `org-add-props`): the result is one
+        // interval whose plist is known up front, so build it, rather than
+        // walking the tree once per property.
+        if self.intervals.is_empty()
+            && !properties.is_empty()
+            && range.start() == CharPos0::ZERO
+            && range.end() == CharPos0::ZERO.add_len(object_len)
+            && !range.is_empty()
+            && let Some(changed) = self.apply_to_plain_whole_object(range, properties, application)
+        {
+            return changed;
+        }
         let mut changed = false;
         let mut apply = |&(name, value): &(Value, Value)| {
             changed |= self.put_property_for_object_len_raw(range, object_len, name, value);
@@ -3322,6 +3338,36 @@ impl TextPropertyTable {
             }
         }
         changed
+    }
+
+    /// [`Self::apply_property_plist_for_object_char_len`] for an object with no
+    /// intervals and a range covering all of it: the one interval's plist,
+    /// built in one step.  Names that move the syntax memos keep the general
+    /// path (`None`).  Kept out of line so the general path stays small.
+    #[inline(never)]
+    fn apply_to_plain_whole_object(
+        &mut self,
+        range: CharRange,
+        properties: &[(Value, Value)],
+        application: PropertyPlistApplication,
+    ) -> Option<bool> {
+        if properties
+            .iter()
+            .any(|&(name, _)| Self::name_is_syntax_relevant(name))
+        {
+            return None;
+        }
+        let destination = applied_to_empty_destination(properties.to_vec(), application);
+        for &(name, _) in &destination {
+            self.property_names.observe(name);
+        }
+        let plist = plist_value_from_pairs(&destination);
+        self.mutation_tick += 1;
+        self.intervals =
+            IntervalTree::from_runs_preserving_shape(vec![IntervalRun::new_in_char_range(
+                range, plist,
+            )]);
+        Some(true)
     }
 
     fn put_property_for_object_len_raw(

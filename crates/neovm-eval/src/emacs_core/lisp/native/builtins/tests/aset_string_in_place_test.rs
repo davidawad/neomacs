@@ -276,3 +276,65 @@ fn grafting_a_string_publishes_its_property_names_to_the_buffer() {
     assert_eq!(format_eval_result(&put), "OK nil");
     assert_ne!(presence(&mut eval, "added-later"), DefinitelyAbsent);
 }
+
+/// A string with no properties that takes some over its whole length gets one
+/// interval whose plist is the properties in GNU's order: `add-text-properties`
+/// prepends each new name (the plist comes out reversed), `propertize` reverses
+/// its arguments first (supplied order), and a repeated name keeps the value
+/// the later application wrote.  Names that move the syntax memos
+/// (`category`, `syntax-table`) go through the general path and read the same.
+#[test]
+fn whole_string_property_application_matches_the_general_path() {
+    let mut eval = property_transfer_fixture();
+    let cases: &[(&str, &str)] = &[
+        (
+            "(let ((s (propertize \"abcdef\" 'a 1 'b 2 'a 3 'c nil))) (list s (text-properties-at 0 s)))",
+            "OK (#(\"abcdef\" 0 6 (b 2 a 1 c nil)) (b 2 a 1 c nil))",
+        ),
+        (
+            "(let ((s (copy-sequence \"abcdef\"))) (list (add-text-properties 0 6 '(a 1 b 2 a 3) s) s))",
+            "OK (t #(\"abcdef\" 0 6 (b 2 a 3)))",
+        ),
+        (
+            "(let ((s (copy-sequence \"abc\"))) (list (add-text-properties 0 3 '(a nil) s) (text-properties-at 0 s)))",
+            "OK (t (a nil))",
+        ),
+        (
+            "(let ((s (copy-sequence \"abc\"))) (list (add-text-properties 0 3 nil s) (add-text-properties 1 1 '(a 1) s) s))",
+            "OK (nil nil \"abc\")",
+        ),
+        (
+            "(let ((s (copy-sequence \"héllo\"))) (add-text-properties 0 5 '(face bold q 1) s) s)",
+            "OK #(\"héllo\" 0 5 (q 1 face bold))",
+        ),
+        (
+            "(propertize \"abc\" 'category 'zz 'face 'bold)",
+            "OK #(\"abc\" 0 3 (category zz face bold))",
+        ),
+        (
+            "(let ((s (copy-sequence \"abc\"))) (add-text-properties 0 3 '(category c1 z 1) s) (text-properties-at 0 s))",
+            "OK (z 1 category c1)",
+        ),
+        ("(propertize \"\" 'a 1)", "OK \"\""),
+        (
+            // A string that already has properties, or a partial range, takes
+            // the general path and still agrees.
+            "(let ((s (copy-sequence \"abcdef\"))) (add-text-properties 0 6 '(a 1) s) (list (add-text-properties 0 6 '(a 1) s) (add-text-properties 0 6 '(a 2 c 3) s) s))",
+            "OK (nil t #(\"abcdef\" 0 6 (c 3 a 2)))",
+        ),
+        (
+            "(let ((s (copy-sequence \"abcdef\"))) (add-text-properties 1 4 '(a 1 b 2) s) s)",
+            "OK #(\"abcdef\" 1 4 (b 2 a 1))",
+        ),
+        (
+            // Whole-string application equals building the same properties one
+            // `put-text-property` at a time.
+            "(let ((s1 (copy-sequence \"abcdef\")) (s2 (copy-sequence \"abcdef\"))) (add-text-properties 0 6 '(a 1 b 2 c 3) s1) (put-text-property 0 6 'a 1 s2) (put-text-property 0 6 'b 2 s2) (put-text-property 0 6 'c 3 s2) (list (equal-including-properties s1 s2) (text-properties-at 0 s1)))",
+            "OK (t (c 3 b 2 a 1))",
+        ),
+    ];
+    for (form, want) in cases {
+        let got = format_eval_result(&eval.eval_str(form));
+        assert_eq!(&got, want, "{form}");
+    }
+}
