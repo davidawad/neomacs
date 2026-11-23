@@ -81,6 +81,10 @@ path = "src/bin/neomacsclient.rs"
 test = false
 
 [[bin]]
+name = "neomacs-ptyexec"
+path = "src/bin/ptyexec.rs"
+
+[[bin]]
 name = "cmdproxy"
 path = "src/bin/cmdproxy/main.rs"
 required-features = ["windows-tools"]
@@ -156,6 +160,10 @@ workspace = true
 [[test]]
 name = "neomacs_integration"
 path = "tests/neomacs_integration.rs"
+
+[[test]]
+name = "ptyexec"
+path = "tests/ptyexec.rs"
 
 [[test]]
 name = "keyword_after_parallel_run"
