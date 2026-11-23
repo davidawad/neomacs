@@ -389,3 +389,44 @@ fn read_only_text_still_blocks_edits_when_the_walk_can_be_skipped() {
         assert_eq!(&got, want, "{form}");
     }
 }
+
+/// An edit over a propertized range collects the `modification-hooks` of its
+/// intervals.  The collection is skipped when no interval can answer the
+/// property; every route that can -- the property, its `category`, an alias,
+/// `default-text-properties` -- must still call its hook with the range.
+#[test]
+fn modification_hooks_are_still_found_when_the_walk_can_be_skipped() {
+    let mut eval = property_transfer_fixture();
+    let defined = eval.eval_str("(progn (setq log nil) (fset (quote hook) (quote (lambda (b e) (setq log (cons (list b e) log))))) t)");
+    assert_eq!(format_eval_result(&defined), "OK t");
+    let cases: &[(&str, &str)] = &[
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (setq log nil) (insert (propertize \"hooked text\" 'modification-hooks '(hook))) (delete-region 1 3) (reverse log))",
+            "OK ((1 3))",
+        ),
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (setq log nil) (insert (propertize \"face text\" 'face 'bold)) (delete-region 1 3) (reverse log))",
+            "OK nil",
+        ),
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (setq log nil) (put 'hook-cat 'modification-hooks '(hook)) (insert (propertize \"cat text\" 'category 'hook-cat)) (delete-region 2 4) (reverse log))",
+            "OK ((2 4))",
+        ),
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (setq log nil) (insert (propertize \"alias text\" 'my-hooks '(hook))) (let ((char-property-alias-alist '((modification-hooks my-hooks)))) (delete-region 1 2)) (reverse log))",
+            "OK ((1 2))",
+        ),
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (setq log nil) (insert (propertize \"plain text\" 'face 'bold)) (let ((default-text-properties '(modification-hooks (hook)))) (delete-region 3 5)) (reverse log))",
+            "OK ((3 5))",
+        ),
+        (
+            "(progn (let ((inhibit-read-only t)) (erase-buffer)) (setq log nil) (insert (propertize \"hooked text\" 'modification-hooks '(hook))) (remove-text-properties 1 12 '(modification-hooks nil)) (setq log nil) (delete-region 1 3) (list (reverse log) (buffer-string)))",
+            "OK (nil \"oked text\")",
+        ),
+    ];
+    for (form, want) in cases {
+        let got = format_eval_result(&eval.eval_str(form));
+        assert_eq!(&got, want, "{form}");
+    }
+}

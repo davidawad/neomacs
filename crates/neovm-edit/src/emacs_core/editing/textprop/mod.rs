@@ -1713,6 +1713,44 @@ fn call_text_property_hook_lists<H: EditHost>(
 /// non-empty changes, call `modification-hooks` before the text is changed;
 /// for insertions, record `insert-behind-hooks` and `insert-in-front-hooks`
 /// so `signal_after_change` can replay them after the inserted text exists.
+/// Whether no interval of BUF can answer `textget` for NAME: the name is
+/// provably on no interval, `category` (which indirects to a symbol's plist)
+/// is on none, and neither `char-property-alias-alist` nor
+/// `default-text-properties` supplies one.  A walk over such a buffer's
+/// intervals can only find nil, so an edit's interval-hook scan may skip it.
+fn buffer_cannot_resolve_text_property<'a, Vars: EditVariableRead<'a>>(
+    vars: Vars,
+    buffers: &BufferManager,
+    buf: &crate::buffer::Buffer,
+    name: Value,
+) -> bool {
+    use crate::buffer::text_props::PropertyNamePresence::DefinitelyAbsent;
+    if buf.text_props_property_name_presence(name) != DefinitelyAbsent
+        || buf.text_props_property_name_presence(Value::from_sym_id(category_sym_id()))
+            != DefinitelyAbsent
+    {
+        return false;
+    }
+    let aliased = current_textprop_variable_value(
+        vars,
+        buffers,
+        TextPropertyControlVariable::CharPropertyAliasAlist,
+    )
+    .and_then(|value| assq_rest(value, name))
+    .is_some_and(|aliases| !aliases.is_nil());
+    if aliased {
+        return false;
+    }
+    !current_textprop_variable_value(
+        vars,
+        buffers,
+        TextPropertyControlVariable::DefaultTextProperties,
+    )
+    .filter(|value| value.is_cons())
+    .and_then(|defaults| plist_get_value(defaults, name))
+    .is_some_and(|value| !value.is_nil())
+}
+
 pub(crate) fn prepare_interval_modification_for_change<H: EditHost>(
     host: &mut H,
     buf_id: BufferId,
@@ -1748,25 +1786,30 @@ pub(crate) fn prepare_interval_modification_for_change<H: EditHost>(
         let mod_sym = modification_hooks_prop();
         let mut prev: Option<Value> = None;
         let mut hooks = Vec::new();
-        let _ = buf.text_props_try_for_each_interval_in_emacs_byte_range(
-            byte_range,
-            |_range, plist| {
-                // GNU `verify_interval_modification` reads `modification-hooks'
-                // via `textget`, which resolves through a `category' symbol.
-                let mh = lookup_text_property_from_plist_slice(vars, buffers, plist, mod_sym);
-                if mh.is_nil() {
-                    return Ok::<(), ()>(());
-                }
-                if let Some(p) = prev
-                    && eq_value(&p, &mh)
-                {
-                    return Ok(());
-                }
-                prev = Some(mh);
-                hooks.push(mh);
-                Ok(())
-            },
-        );
+        // No interval can carry `modification-hooks`: nothing to collect, and
+        // no walk (an edit over a large propertized range paid for one
+        // `textget` per interval).
+        if !buffer_cannot_resolve_text_property(vars, buffers, buf, mod_sym) {
+            let _ = buf.text_props_try_for_each_interval_in_emacs_byte_range(
+                byte_range,
+                |_range, plist| {
+                    // GNU `verify_interval_modification` reads `modification-hooks'
+                    // via `textget`, which resolves through a `category' symbol.
+                    let mh = lookup_text_property_from_plist_slice(vars, buffers, plist, mod_sym);
+                    if mh.is_nil() {
+                        return Ok::<(), ()>(());
+                    }
+                    if let Some(p) = prev
+                        && eq_value(&p, &mh)
+                    {
+                        return Ok(());
+                    }
+                    prev = Some(mh);
+                    hooks.push(mh);
+                    Ok(())
+                },
+            );
+        }
         (lisp_start, lisp_end, hooks)
     };
 
