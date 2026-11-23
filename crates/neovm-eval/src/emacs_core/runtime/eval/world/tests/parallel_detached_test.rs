@@ -778,7 +778,10 @@ fn stats_delta(before: &ParallelStats, after: &ParallelStats) -> ParallelStats {
         attach_by_blv: after.attach_by_blv - before.attach_by_blv,
         stop_wait_ns: after.stop_wait_ns - before.stop_wait_ns,
         stop_max_ns: after.stop_max_ns.max(before.stop_max_ns),
+        stop_wait_max_ns: after.stop_wait_max_ns.max(before.stop_wait_max_ns),
         requester_parks: after.requester_parks - before.requester_parks,
+        waker_stop_waits: after.waker_stop_waits - before.waker_stop_waits,
+        owner_service_turns: after.owner_service_turns - before.owner_service_turns,
     }
 }
 

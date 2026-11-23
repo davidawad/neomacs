@@ -4613,6 +4613,14 @@ fn shared_heap_stats(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
         Value::fixnum(i64::try_from(parallel.stop_wait_ns).unwrap_or(i64::MAX)),
         Value::symbol(":stop-max-ns"),
         Value::fixnum(i64::try_from(parallel.stop_max_ns).unwrap_or(i64::MAX)),
+        Value::symbol(":stop-wait-max-ns"),
+        Value::fixnum(i64::try_from(parallel.stop_wait_max_ns).unwrap_or(i64::MAX)),
+        Value::symbol(":requester-parks"),
+        Value::fixnum(i64::try_from(parallel.requester_parks).unwrap_or(i64::MAX)),
+        Value::symbol(":waker-stop-waits"),
+        Value::fixnum(i64::try_from(parallel.waker_stop_waits).unwrap_or(i64::MAX)),
+        Value::symbol(":owner-service-turns"),
+        Value::fixnum(i64::try_from(parallel.owner_service_turns).unwrap_or(i64::MAX)),
     ]))
 }
 

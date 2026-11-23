@@ -466,17 +466,31 @@ impl Context {
         let lock = self.parallel_lock_shared()?;
         let gate = neovm_value::detached::suspend_detached()?;
         lock.count_attach(reason);
+        // Attached for World work, the thread still runs: a stop waits for
+        // it to park at a safe point.
         self.parallel_seat_baton(lock.attach().into_baton());
-        lock.body_attached();
         Some(ParallelAttach { lock, gate })
     }
 
     /// The second half of [`Self::with_parallel_attach`].
     pub(crate) fn parallel_detach(&mut self, attach: ParallelAttach) {
+        self.parallel_defer_due_collection(&attach.lock);
         let baton = self.parallel_unseat_baton();
-        attach.lock.body_detached();
         attach.lock.detach(baton);
         neovm_value::detached::resume_detached(attach.gate);
+    }
+
+    /// This thread, attached for World work, is about to run detached
+    /// again. What it allocated attached may have made a collection due,
+    /// and it passes no attached safe point that would see it: leave the
+    /// collection due for the next detached safe point, as the allocation
+    /// gate's detach does. With the main owner parked in a wait, no other
+    /// thread would ever collect.
+    fn parallel_defer_due_collection(&self, lock: &BatonLock) {
+        let bytes = self.tagged_heap.bytes_since_gc();
+        if bytes >= self.tagged_heap.gc_threshold() {
+            lock.defer_collection(bytes as u64);
+        }
     }
 
     /// A GC safe point's answer in a Parallel World when it is not the
@@ -523,7 +537,6 @@ impl Context {
         if neovm_value::detached::pin_at(self.specpdl.len()) {
             lock.count_attach(AttachReason::Class);
             self.parallel_seat_baton(lock.attach().into_baton());
-            lock.body_attached();
             if self.project_plain_dynamic_binding(sym) {
                 // A newly encountered plain variable can be made owner-local
                 // while the Baton protects the obarray redirect. Future
@@ -567,8 +580,8 @@ impl Context {
         let Some(lock) = self.parallel_lock_shared() else {
             return;
         };
+        self.parallel_defer_due_collection(&lock);
         let baton = self.parallel_unseat_baton();
-        lock.body_detached();
         lock.detach(baton);
         neovm_value::detached::resume_detached(gate);
     }

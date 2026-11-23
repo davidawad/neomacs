@@ -84,19 +84,17 @@ fn run_detached_body(
         return run_body(owner, function);
     }
     prepare_detached_table();
-    // Counted before the Baton goes back, so no collection starts in between.
-    lock.body_detached();
+    // The thread runs on, detached: a collection's stop counts it from its
+    // start until it parks (`StopWorld`).
     lock.detach(owner.parallel_unseat_baton());
     neovm_value::detached::begin_detached(detached_gate(lock));
     let outcome = run_body(owner, function);
     // A body that unwound while attached for a primitive still holds the
-    // Baton and left the detached count then; every other one attaches for
-    // the epilogue.
+    // Baton; every other one attaches for the epilogue.
     let detached = neovm_value::detached::is_detached();
     neovm_value::detached::end_detached();
     if detached {
         owner.parallel_seat_baton(lock.attach().into_baton());
-        lock.body_attached();
     }
     outcome
 }
@@ -161,7 +159,8 @@ fn run(
     // start while it copies.
     tables.install();
     drop(tables);
-    let mut baton = lock.attach().into_baton();
+    // A thread that starts during a collection's stop waits for its end.
+    let mut baton = lock.attach_unparked();
     control.parallel_resumed(key);
     #[cfg(feature = "jit")]
     crate::emacs_core::jit::green_owner::begin_owner_turn();

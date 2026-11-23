@@ -26,7 +26,9 @@ impl Control {
     }
 
     /// ME, holding BATON, waits for WAIT: detach, wait detached until WAIT
-    /// is over, and attach again. A `Runnable` wait is a yield: a runnable
+    /// is over, and attach again. The waiting thread is at a safe point: a
+    /// collection's stop does not wait for it, and it attaches again only
+    /// outside a stop (`BatonLock::detach_parked`, `attach_unparked`). A `Runnable` wait is a yield: a runnable
     /// peer attaches first (GNU's FIFO order is not kept: the lock's wake
     /// order decides among several). Like Green's `transfer`, a
     /// blocking wait no other thread could ever end returns the Baton as
@@ -93,11 +95,11 @@ impl Control {
                 self.parallel_resumed(me);
                 return Ok(Wake::Resume(baton));
             }
-            lock.yield_baton(baton, peer_runnable)
+            lock.yield_parked(baton, peer_runnable)
         } else {
-            lock.detach(baton);
+            lock.detach_parked(baton);
             self.await_parallel_wake(me, service_host_events);
-            lock.attach().into_baton()
+            lock.attach_unparked()
         };
         self.parallel_resumed(me);
         Ok(Wake::Resume(baton))
@@ -208,6 +210,7 @@ impl Control {
         }
         lock.thread_finished();
         self.metadata_changed.notify_all();
-        lock.detach(baton);
+        // The ended thread holds no root: no stop waits for it.
+        lock.detach_parked(baton);
     }
 }

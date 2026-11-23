@@ -895,6 +895,10 @@ impl Context {
             return Ok(false);
         };
         let synthetic_wake = control.take_owner_service_wake(key);
+        #[cfg(feature = "shared-heap")]
+        if synthetic_wake && let Some(lock) = self.parallel_lock() {
+            lock.count_owner_service_turn();
+        }
         #[cfg(test)]
         if synthetic_wake {
             OWNER_SERVICE_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1563,7 +1567,8 @@ impl Context {
         let baton = self.start_green_runtime()?;
         #[cfg(feature = "shared-heap")]
         let baton = if self.threading_mode() == super::super::ThreadingMode::Parallel {
-            self.install_parallel_lock(baton).attach().into_baton()
+            // Main is the World's first running mutator.
+            self.install_parallel_lock(baton).attach_unparked()
         } else {
             baton
         };

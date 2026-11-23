@@ -1,46 +1,47 @@
 //! Stop-the-world collection in a Parallel World (feature `shared-heap`).
 //!
-//! A collection in a Parallel World runs on the thread holding the Baton,
-//! the requester, with the existing synchronous collector (the Baton keeps
-//! the concurrent marker excluded, `green_owner` point 5). Before it marks,
-//! every other thread must be stopped somewhere its roots are known:
+//! A collection in a Parallel World runs on the thread that requests it,
+//! with the existing synchronous collector. Before it marks, every other
+//! mutator must be stopped somewhere its roots are known. [`StopWorld`]
+//! keeps the set of mutators that run; a stop is established once that set
+//! holds nobody but the requester, as in a JVM or Go safepoint rendezvous:
 //!
-//! - a thread blocked in `thread-join`, `mutex-lock`, `condition-wait`,
-//!   `thread-yield` or a wait for the Baton itself parked through Green's
-//!   park path, which published its private and thread-local roots in the
-//!   World's parked registry before it blocked. It is stopped already and the
-//!   collector traces that registry.
-//! - a thread running detached (S3's detached execution, and this slice's
-//!   test-only detached section) is counted in [`StopWorld`] as running,
-//!   from the moment it puts the Baton back to run detached until it holds
-//!   the Baton again for World work; a heap access it attaches for keeps it
-//!   counted, since its Rust frames hold values no image names. The
-//!   requester raises [`AsyncSource::StopRequest`] in `ASYNC_ATTENTION` and
-//!   waits until no thread is running. A thread reaching its next exact
-//!   safe point (a collection point of the evaluator, the VM or compiled
-//!   code, where every value it holds is rooted in its Context) copies its
-//!   roots into a root image owned by the World's [`StopWorld`], closes its
-//!   allocation runs and parks on its condition variable.
+//! - a thread blocked in a wait (`thread-join`, `mutex-lock`,
+//!   `condition-wait`, `thread-yield`'s park, `sleep-for`,
+//!   `accept-process-output`, the main owner's Green park) is at a safe
+//!   point already. Its park published its private and thread-local roots,
+//!   and it leaves the running set as it puts the Baton back
+//!   ([`BatonLock::detach_parked`]). When its wait ends while a stop is in
+//!   progress it waits for the stop to end before it takes the Baton or
+//!   touches the heap ([`BatonLock::attach_unparked`]); the main owner's
+//!   10 ms service turn wakes through the same door.
+//! - a thread that runs, detached or holding the Baton for World work,
+//!   stays in the running set. The requester raises
+//!   [`AsyncSource::StopRequest`] in `ASYNC_ATTENTION`; each running thread
+//!   reaches its next exact safe point (a collection point of the
+//!   evaluator, the VM or compiled code, where every value it holds is
+//!   rooted in its Context). A detached one copies its roots into a root
+//!   image owned by the World's [`StopWorld`], closes its allocation runs
+//!   and parks on the stop's condition variable; one holding the Baton
+//!   parks as a wait does.
 //!
-//! The requester waits WITHOUT the Baton: it parks as `sleep-for` does, for
-//! [`STOP_POLL`] at a time (Green's park publishes its roots and puts the
-//! Baton back), until no thread runs. A running thread blocked attaching
-//! (for a `World`-class primitive or a heap access) gets the Baton
-//! meanwhile, finishes that work and parks at its next safe point; were the
-//! requester to wait holding the Baton, that thread would wait for it
-//! forever. Any Baton holder that finds no thread running may collect for
-//! the stop, and a requester that finds a collection ran meanwhile does not
-//! collect again.
+//! The requester takes no Baton to establish the stop: a detached requester
+//! waits on the stop's condition variable until the running set is empty
+//! but for itself, so it never queues behind another holder's turn, and no
+//! parked owner has to take a turn for it. Only then does it seat the
+//! Baton, which is at rest because every stopped mutator put it back: the
+//! collector body needs the World's carried state (GC roots among it) that
+//! travels with the Baton, and the parked registry it holds.
 //!
 //! The collector then runs with its own roots, the World's (parked registry,
 //! shared-root transport table, owner slabs), and every parked image, and
 //! finishes the cycle's sweep before the parked threads resume, so they
-//! never run in a cycle between its slices. The parked threads sweep with
-//! it: while they wait for the stop to end they take the shares of its
-//! in-stop sweep ([`StopWorld::run_on_parked`]). It lowers the request and wakes
-//! everyone. A resumed thread re-installs its heap thread-locals, briefly
-//! attached, before it touches the heap again, so its mirrors of collector
-//! state are current.
+//! never run in a cycle between its slices. The image-parked threads sweep
+//! with it: while they wait for the stop to end they take the shares of its
+//! in-stop sweep ([`StopWorld::run_on_parked`]). It lowers the request and
+//! wakes everyone. A resumed detached thread re-installs its heap
+//! thread-locals before it touches the heap again, so its mirrors of
+//! collector state are current.
 //!
 //! The stop's mutex and condition variable are the only synchronization
 //! this adds; every stop is counted (`safepoint_stops`, `collections`,
@@ -52,7 +53,7 @@ use crate::emacs_core::eval::green::Wait;
 use neovm_value::quit::{ASYNC_ATTENTION, AsyncSource};
 use neovm_value::tagged::gc::MarkPhase;
 use neovm_value::value::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
@@ -65,12 +66,15 @@ mod tests;
 /// Where the World's stop is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// No collection: detached threads run.
+    /// No collection: mutators run.
     Running,
-    /// A requester waits for the running threads to park.
+    /// A requester waits for the running mutators to park.
     Stopping,
-    /// Every detached thread is parked; the requester collects.
+    /// Every mutator but the requester is parked; the requester collects.
     Stopped,
+    /// The collection is over and the requester waits: the threads parked
+    /// for the stop refresh their heap mirrors, one at a time.
+    Refreshing,
 }
 
 /// The stop's state, under its mutex.
@@ -78,15 +82,48 @@ struct StopState {
     phase: Phase,
     /// When the stop in progress was requested.
     requested_at: Option<Instant>,
-    /// Detached threads that run, and so may hold roots no one else knows.
-    running: u64,
+    /// The mutator whose stop is in progress: the only one that runs in it.
+    requester: Option<ThreadId>,
+    /// Whether the requester's collector took the stop: a collection it
+    /// requests from then on runs inside that one.
+    collecting: bool,
+    /// The mutators that run, detached or holding the Baton, and so may
+    /// hold roots no one else knows. A thread parked in a wait or with an
+    /// image is not among them.
+    running: HashSet<ThreadId>,
     /// The root image of every parked detached thread, as raw words: a
     /// `Value` never crosses threads, and the words are read back only while
     /// the thread that published them is parked.
     images: HashMap<ThreadId, Vec<usize>>,
+    /// How many threads parked for the stop have yet to refresh their heap
+    /// mirrors, or to find that no collection ran
+    /// ([`StopWorld::park_for_stop`]). The stop does not end before.
+    refreshes_due: usize,
     /// Work the collecting thread hands its parked threads
     /// ([`StopWorld::run_on_parked`]), while it does.
     shares: Option<ParkedShares>,
+}
+
+impl StopState {
+    /// Whether a mutator other than ME runs.
+    fn others_run(&self, me: ThreadId) -> bool {
+        self.running.iter().any(|thread| *thread != me)
+    }
+
+    /// Whether THREAD may run: no stop is in progress, or the stop is its
+    /// own.
+    fn admits(&self, thread: ThreadId) -> bool {
+        self.phase == Phase::Running || self.requester == Some(thread)
+    }
+
+    /// Back to no stop.
+    fn clear_stop(&mut self) {
+        ASYNC_ATTENTION.take(AsyncSource::StopRequest);
+        self.phase = Phase::Running;
+        self.requested_at = None;
+        self.requester = None;
+        self.collecting = false;
+    }
 }
 
 /// The shares of one [`StopWorld::run_on_parked`] call.
@@ -129,13 +166,16 @@ const STOP_POLL: Duration = Duration::from_micros(50);
 /// What a stop request found ([`StopWorld::request`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Requested {
-    /// No thread runs: the World is stopped for the caller to collect.
+    /// No other thread runs: the World is stopped for the caller to collect.
     Stopped,
-    /// The World was stopped already (a collection inside a collection).
+    /// The caller collects already (a collection inside its collection).
     Nested,
     /// Threads still run; the stop is requested, and the caller waits for
     /// them without the Baton, then asks again.
     Busy,
+    /// Another thread's stop is in progress: the caller parks for it as
+    /// for a wait, and that stop's collection is the collection.
+    Join,
     /// Threads still run and the caller cannot wait: nothing was requested.
     Refused,
 }
@@ -147,9 +187,14 @@ pub(crate) struct StopCounters {
     pub(crate) collections: u64,
     pub(crate) stop_wait_ns: u64,
     pub(crate) stop_max_ns: u64,
+    /// The longest wait from a stop's request to its collector's start.
+    pub(crate) stop_wait_max_ns: u64,
     /// Parks of a requester waiting for running threads, each one detach
     /// and one attach of the Baton.
     pub(crate) requester_parks: u64,
+    /// Wakes of parked threads that waited for a stop to end before they
+    /// took the Baton.
+    pub(crate) waker_waits: u64,
 }
 
 /// The rendezvous of a Parallel World's collections, kept beside the Baton
@@ -162,7 +207,9 @@ pub(crate) struct StopWorld {
     collections: AtomicU64,
     stop_wait_ns: AtomicU64,
     stop_max_ns: AtomicU64,
+    stop_wait_max_ns: AtomicU64,
     requester_parks: AtomicU64,
+    waker_waits: AtomicU64,
     /// The notifications [`Self::notify_if_none_runs`] made.
     #[cfg(test)]
     none_running_notifies: AtomicU64,
@@ -184,8 +231,11 @@ impl StopWorld {
             state: Mutex::new(StopState {
                 phase: Phase::Running,
                 requested_at: None,
-                running: 0,
+                requester: None,
+                collecting: false,
+                running: HashSet::new(),
                 images: HashMap::new(),
+                refreshes_due: 0,
                 shares: None,
             }),
             changed: Condvar::new(),
@@ -193,7 +243,9 @@ impl StopWorld {
             collections: AtomicU64::new(0),
             stop_wait_ns: AtomicU64::new(0),
             stop_max_ns: AtomicU64::new(0),
+            stop_wait_max_ns: AtomicU64::new(0),
             requester_parks: AtomicU64::new(0),
+            waker_waits: AtomicU64::new(0),
             #[cfg(test)]
             none_running_notifies: AtomicU64::new(0),
         }
@@ -211,13 +263,17 @@ impl StopWorld {
     }
 
     /// A thread stopped running (it parked, or left for good): wake the
-    /// waiters once none runs, under STATE. A waiter on the running count
-    /// (a stop's requester, a holder waiting in place) waits for it to
-    /// reach zero; a parked thread waits for the stop to end or for shares,
-    /// which a park does not change. Woken at every park, each parked
-    /// thread woke again for every thread that parked after it.
+    /// waiters once none runs but a stop's requester, under STATE. A waiter
+    /// on the running set (a stop's requester) waits for that; a parked
+    /// thread waits for the stop to end or for shares, which a park does
+    /// not change. Woken at every park, each parked thread woke again for
+    /// every thread that parked after it.
     fn notify_if_none_runs(&self, state: &StopState) {
-        if state.running == 0 {
+        let none_runs = match state.requester {
+            Some(requester) => !state.others_run(requester),
+            None => state.running.is_empty(),
+        };
+        if none_runs {
             #[cfg(test)]
             self.none_running_notifies.fetch_add(1, Ordering::Relaxed);
             self.changed.notify_all();
@@ -232,7 +288,9 @@ impl StopWorld {
             collections: load(&self.collections),
             stop_wait_ns: load(&self.stop_wait_ns),
             stop_max_ns: load(&self.stop_max_ns),
+            stop_wait_max_ns: load(&self.stop_wait_max_ns),
             requester_parks: load(&self.requester_parks),
+            waker_waits: load(&self.waker_waits),
         }
     }
 
@@ -242,24 +300,14 @@ impl StopWorld {
         self.requester_parks.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The calling thread, holding the Baton, is about to run detached: it
-    /// starts parked with IMAGE, so a collection that starts before it runs
+    /// The calling thread is about to run detached in a test: it starts
+    /// parked with IMAGE, so a collection that starts before it runs
     /// already knows its roots. [`Self::resume`] makes it run.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S3's detached execution is the production caller")
-    )]
+    #[cfg(test)]
     pub(crate) fn enter_parked(&self, image: Vec<usize>) {
         let me = std::thread::current().id();
         let previous = self.lock_state().images.insert(me, image);
         debug_assert!(previous.is_none(), "a thread runs one detached extent");
-    }
-
-    /// The calling thread, holding the Baton, puts it back to run detached.
-    /// It runs even while a stop is requested: it holds the Baton, so the
-    /// stop has not begun, and it parks at its next safe point.
-    pub(crate) fn enter_running(&self) {
-        self.lock_state().running += 1;
     }
 
     /// Whether a stop is requested or in progress (exact, unlike the
@@ -268,34 +316,108 @@ impl StopWorld {
         self.lock_state().phase != Phase::Running
     }
 
-    /// The calling thread, running detached, claimed a due collection: it
-    /// requests a stop and parks with IMAGE like any running thread, until
-    /// the stop ends (false: it runs again) or no thread runs (true: it
-    /// attaches and collects for the stop, then [`Self::withdraw_image`]).
-    pub(crate) fn request_and_park(&self, image: Vec<usize>) -> bool {
+    /// The calling thread parks in a wait, where it is at a safe point: its
+    /// park published its roots, and it touches no heap state until
+    /// [`Self::try_enter_running`] admits it again. A stop's requester may
+    /// stop waiting for it.
+    pub(crate) fn leave_running(&self) {
         let me = std::thread::current().id();
         let mut state = self.lock_state();
-        debug_assert!(state.running > 0, "only a running thread parks");
-        state.running -= 1;
-        state.images.insert(me, image);
-        if state.phase == Phase::Running {
-            state.requested_at = Some(Instant::now());
-            state.phase = Phase::Stopping;
-            ASYNC_ATTENTION.raise(AsyncSource::StopRequest);
+        state.running.remove(&me);
+        // A requester parking between its own looks wakes no one for it.
+        if state.requester != Some(me) {
+            self.notify_if_none_runs(&state);
         }
-        self.notify_if_none_runs(&state);
-        loop {
-            state = self.help(state);
-            match state.phase {
-                Phase::Running => {
-                    state.images.remove(&me);
-                    state.running += 1;
-                    return false;
-                }
-                Phase::Stopping if state.running == 0 => return true,
-                Phase::Stopping | Phase::Stopped => state = self.wait(state),
-            }
+    }
+
+    /// The calling thread's wait ended. While another thread's stop is in
+    /// progress it blocks, so it neither takes the Baton from the collector
+    /// nor touches the heap under it, and it runs again from the moment the
+    /// stop ends (true): a later stop waits for it as for any running
+    /// thread. Admitted only once it held the Baton, it would lose to the
+    /// next stop again and again while collections follow each other
+    /// closely. With no such stop (the stop's own requester passes too) it
+    /// returns at once (false), and the caller enters with
+    /// [`Self::try_enter_running`] once it holds the Baton.
+    #[must_use = "a thread that did not wait is not running yet"]
+    pub(crate) fn enter_running_after_stop(&self) -> bool {
+        let me = std::thread::current().id();
+        let state = self.lock_state();
+        if state.admits(me) {
+            return false;
         }
+        self.enter_running_locked(state, me);
+        true
+    }
+
+    /// [`Self::enter_running_after_stop`] for a thread that
+    /// [`Self::try_enter_running`] refused: it runs again when the stop
+    /// ends, or at once when it already did.
+    pub(crate) fn enter_running_when_admitted(&self) {
+        let me = std::thread::current().id();
+        self.enter_running_locked(self.lock_state(), me);
+    }
+
+    fn enter_running_locked(&self, mut state: MutexGuard<'_, StopState>, me: ThreadId) {
+        self.waker_waits.fetch_add(1, Ordering::Relaxed);
+        while !state.admits(me) {
+            state = self.wait(state);
+        }
+        state.running.insert(me);
+    }
+
+    /// The calling thread, holding the Baton after a wait, runs again:
+    /// false when another thread's stop began while it waited for the
+    /// Baton, and the caller must put the Baton back for the collector
+    /// ([`Self::enter_running_when_admitted`]).
+    #[must_use = "a refused thread must not run"]
+    pub(crate) fn try_enter_running(&self) -> bool {
+        let me = std::thread::current().id();
+        let mut state = self.lock_state();
+        let admitted = state.admits(me);
+        if admitted {
+            state.running.insert(me);
+        }
+        admitted
+    }
+
+    /// The calling thread, running detached at an exact safe point, claimed
+    /// a due collection. It requests the stop and waits here, with no
+    /// Baton, until every other mutator is parked (true: the World is
+    /// stopped for it to collect). When another thread's stop is already in
+    /// progress it parks for that one with IMAGE and REFRESH instead, as
+    /// [`Self::park_for_stop`] does (false: it runs again).
+    pub(crate) fn stop_from_detached(&self, image: Vec<usize>, refresh: impl FnOnce()) -> bool {
+        let me = std::thread::current().id();
+        let mut state = self.lock_state();
+        if state.phase != Phase::Running {
+            self.park_locked(state, image, refresh);
+            return false;
+        }
+        debug_assert!(state.running.contains(&me), "a detached requester runs");
+        state.requested_at = Some(Instant::now());
+        state.requester = Some(me);
+        state.phase = Phase::Stopping;
+        ASYNC_ATTENTION.raise(AsyncSource::StopRequest);
+        while state.others_run(me) {
+            state = self.wait(state);
+        }
+        state.phase = Phase::Stopped;
+        true
+    }
+
+    /// End a stop of the calling thread's that no collection took: its
+    /// requester could not wait for the running threads, or its collector
+    /// declined to run. The parked threads resume.
+    pub(crate) fn abandon(&self) {
+        let me = std::thread::current().id();
+        let mut state = self.lock_state();
+        if state.phase == Phase::Running || state.requester != Some(me) || state.collecting {
+            return;
+        }
+        state.clear_stop();
+        drop(state);
+        self.changed.notify_all();
     }
 
     /// How many threads are parked with an image.
@@ -370,11 +492,61 @@ impl StopWorld {
         state
     }
 
-    /// The requester of [`Self::request_and_park`] holds the Baton: its
-    /// roots are its Context's again.
-    pub(crate) fn withdraw_image(&self) {
+    /// The calling thread, running detached, parks for the stop in progress
+    /// with IMAGE and runs again once it ends. When a collection ran,
+    /// REFRESH runs first, inside the stop: it brings this thread's mirrors
+    /// of the heap up to date, which reads and writes state the World
+    /// shares unsynchronized (the heap's barrier windows, its collection-read
+    /// owner and that owner's `Rc` count). Inside the stop the parked
+    /// threads run it one at a time, under the stop's mutex, while the
+    /// collector waits and no thread holds the Baton to run: no Baton turn
+    /// per parked thread is needed for it.
+    pub(crate) fn park_for_stop(&self, image: Vec<usize>, refresh: impl FnOnce()) {
+        self.park_locked(self.lock_state(), image, refresh);
+    }
+
+    /// [`Self::park_for_stop`], under STATE.
+    fn park_locked<'a>(
+        &'a self,
+        mut state: MutexGuard<'a, StopState>,
+        image: Vec<usize>,
+        refresh: impl FnOnce(),
+    ) {
         let me = std::thread::current().id();
-        self.lock_state().images.remove(&me);
+        let ran = state.running.remove(&me);
+        debug_assert!(ran, "only a running thread parks");
+        state.images.insert(me, image);
+        state.refreshes_due += 1;
+        self.notify_if_none_runs(&state);
+        let mut refresh = Some(refresh);
+        loop {
+            state = self.help(state);
+            if state.phase == Phase::Refreshing
+                && let Some(refresh) = refresh.take()
+            {
+                // The collector waits for the count below even if the
+                // refresh unwinds: a stop must always end.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(refresh));
+                state.refreshes_due -= 1;
+                if state.refreshes_due == 0 {
+                    self.changed.notify_all();
+                }
+                if let Err(panic) = outcome {
+                    drop(state);
+                    std::panic::resume_unwind(panic);
+                }
+            }
+            if state.phase == Phase::Running {
+                break;
+            }
+            state = self.wait(state);
+        }
+        if refresh.is_some() {
+            // No collection ran: the stop was withdrawn.
+            state.refreshes_due -= 1;
+        }
+        state.running.insert(me);
+        state.images.remove(&me);
     }
 
     /// The calling thread, running detached, stops running: it publishes
@@ -382,8 +554,8 @@ impl StopWorld {
     pub(crate) fn park(&self, image: Vec<usize>) {
         let me = std::thread::current().id();
         let mut state = self.lock_state();
-        debug_assert!(state.running > 0, "only a running thread parks");
-        state.running -= 1;
+        let ran = state.running.remove(&me);
+        debug_assert!(ran, "only a running thread parks");
         state.images.insert(me, image);
         self.notify_if_none_runs(&state);
     }
@@ -400,7 +572,7 @@ impl StopWorld {
             }
             state = self.wait(state);
         }
-        state.running += 1;
+        state.running.insert(me);
         state.images.remove(&me).unwrap_or_default()
     }
 
@@ -423,67 +595,76 @@ impl StopWorld {
         self.resume();
     }
 
-    /// The calling thread stops running detached for good (it is about to
-    /// attach, or to end).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S3's detached execution is the production caller")
-    )]
+    /// The calling thread stops running detached for good in a test (its
+    /// section is over, or it ends).
+    #[cfg(test)]
     pub(crate) fn leave(&self) {
         let me = std::thread::current().id();
         let mut state = self.lock_state();
-        debug_assert!(state.running > 0, "only a running thread leaves");
-        state.running -= 1;
+        let ran = state.running.remove(&me);
+        debug_assert!(ran, "only a running thread leaves");
         state.images.remove(&me);
         self.notify_if_none_runs(&state);
     }
 
-    /// The calling thread holds the Baton and asks to stop every detached
-    /// thread. With none running the World is stopped now; otherwise the
-    /// stop is requested (once, by whichever holder asks first) and a
-    /// caller that CAN_WAIT waits without the Baton, then asks again.
+    /// The calling thread asks to stop every other mutator, for a
+    /// collection it runs itself. With none running the World is stopped
+    /// now; otherwise the stop is requested and a caller that CAN_WAIT
+    /// parks without the Baton, then asks again. A thread whose stop is
+    /// established already ([`Self::stop_from_detached`]) takes it here.
     pub(crate) fn request(&self, can_wait: bool) -> Requested {
+        let me = std::thread::current().id();
         let mut state = self.lock_state();
+        if state.phase != Phase::Running && state.requester != Some(me) {
+            return if can_wait {
+                Requested::Join
+            } else {
+                Requested::Refused
+            };
+        }
         match state.phase {
-            Phase::Stopped => Requested::Nested,
-            Phase::Running | Phase::Stopping if state.running == 0 => {
-                state.requested_at.get_or_insert_with(Instant::now);
-                state.phase = Phase::Stopped;
+            Phase::Stopped if state.collecting => Requested::Nested,
+            Phase::Stopped => {
+                state.collecting = true;
                 Requested::Stopped
             }
-            _ if !can_wait => Requested::Refused,
+            Phase::Running | Phase::Stopping if !state.others_run(me) => {
+                state.requested_at.get_or_insert_with(Instant::now);
+                state.requester = Some(me);
+                state.phase = Phase::Stopped;
+                state.collecting = true;
+                Requested::Stopped
+            }
+            Phase::Stopping => Requested::Busy,
+            // Its requester waits in `end_stop` and asks nothing.
+            Phase::Refreshing => Requested::Refused,
+            Phase::Running if !can_wait => Requested::Refused,
             Phase::Running => {
                 state.requested_at = Some(Instant::now());
+                state.requester = Some(me);
                 state.phase = Phase::Stopping;
                 ASYNC_ATTENTION.raise(AsyncSource::StopRequest);
                 Requested::Busy
             }
-            Phase::Stopping => Requested::Busy,
         }
     }
 
-    /// The calling thread holds the Baton: stop every detached thread,
-    /// waiting for them in place, run COLLECT with the roots of every parked
-    /// image, and resume them.
-    ///
-    /// A collection requested while the World is already stopped (the
-    /// collector's own `post-gc-hook` calling `garbage-collect`, or a peer
-    /// the hook let run) collects inside that stop.
+    /// Stop every running thread, waiting for them in place, run COLLECT
+    /// with the roots of every parked image, and resume them: the bare
+    /// rendezvous, for its tests.
+    #[cfg(test)]
     pub(crate) fn collect_stopped(&self, collect: impl FnOnce(&[Value])) {
+        let me = std::thread::current().id();
         let mut requested = self.request(true);
         while requested == Requested::Busy {
-            self.wait_running_in_place();
+            let mut state = self.lock_state();
+            while state.others_run(me) {
+                state = self.wait(state);
+            }
+            drop(state);
             requested = self.request(true);
         }
         self.collect_requested(requested, collect);
-    }
-
-    /// Wait, holding whatever the caller holds, until no thread runs.
-    fn wait_running_in_place(&self) {
-        let mut state = self.lock_state();
-        while state.running > 0 {
-            state = self.wait(state);
-        }
     }
 
     /// Run COLLECT for REQUESTED, which [`Self::request`] returned
@@ -516,13 +697,22 @@ impl StopWorld {
 
     fn end_stop(&self, requested: Instant, waited: u64, stopped: u64) {
         let mut state = self.lock_state();
-        ASYNC_ATTENTION.take(AsyncSource::StopRequest);
-        state.phase = Phase::Running;
-        state.requested_at = None;
+        if state.refreshes_due > 0 {
+            // Every thread parked for the stop refreshes its heap mirrors
+            // before any mutator runs (`Self::park_for_stop`). No thread
+            // joins them now: none runs to park.
+            state.phase = Phase::Refreshing;
+            self.changed.notify_all();
+            while state.refreshes_due > 0 {
+                state = self.wait(state);
+            }
+        }
+        state.clear_stop();
         drop(state);
         self.collections.fetch_add(1, Ordering::Relaxed);
         self.safepoint_stops.fetch_add(stopped, Ordering::Relaxed);
         self.stop_wait_ns.fetch_add(waited, Ordering::Relaxed);
+        self.stop_wait_max_ns.fetch_max(waited, Ordering::Relaxed);
         self.stop_max_ns
             .fetch_max(elapsed_ns(requested), Ordering::Relaxed);
         self.changed.notify_all();
@@ -580,7 +770,8 @@ impl Context {
     /// other thread of a Parallel World stopped. Outside one, run it as is.
     ///
     /// While threads still run this thread waits for them parked, [`STOP_POLL`]
-    /// at a time, and does not collect when another holder collected
+    /// at a time. When another thread's stop is in progress it parks for
+    /// that one as a wait does, and does not collect when a collection ran
     /// meanwhile. A holder that cannot park (it is not seated with the
     /// Baton) leaves the collection to a detached thread while threads run.
     /// With threads parked, the cycle's sweep finishes inside the stop.
@@ -599,20 +790,25 @@ impl Context {
                     return;
                 }
                 Requested::Busy => {
-                    // The driver's body has not begun: this park moves the
-                    // Baton as `sleep-for` does, which an active driver
-                    // refuses.
-                    let driver = std::mem::replace(&mut self.gc_driver_active, false);
-                    let wait_end = Instant::now() + STOP_POLL;
-                    let parked = self.green_park(Wait::Select { wait_end });
-                    self.gc_driver_active = driver;
-                    match parked {
-                        Ok(()) => stop.requester_parked(),
-                        // The park refused before the Baton moved: wait for
-                        // the stop in place, as a bare requester does.
-                        Err(_) => stop.wait_running_in_place(),
+                    if self.park_outside_gc_driver(STOP_POLL).is_err() {
+                        // The park refused before the Baton moved, and the
+                        // running threads may need it to reach their safe
+                        // points: withdraw the request and leave the
+                        // collection due.
+                        stop.abandon();
+                        lock.defer_collection(self.tagged_heap.bytes_since_gc() as u64);
+                        return;
                     }
-                    if stop.counters().collections != seen {
+                    stop.requester_parked();
+                }
+                Requested::Join => {
+                    // This park's wake waits for the stop to end
+                    // (`BatonLock::attach_unparked`). A refused park keeps
+                    // this thread running to its next safe point, where it
+                    // asks again.
+                    if self.park_outside_gc_driver(Duration::ZERO).is_err()
+                        || stop.counters().collections != seen
+                    {
                         return;
                     }
                 }
@@ -643,10 +839,21 @@ impl Context {
         });
     }
 
+    /// Park this Baton holder for TIMEOUT at a collection's entry, where it
+    /// is at a safe point. The driver's body has not begun: the park moves
+    /// the Baton as `sleep-for` does, which an active driver refuses.
+    fn park_outside_gc_driver(&mut self, timeout: Duration) -> Result<(), super::super::Flow> {
+        let driver = std::mem::replace(&mut self.gc_driver_active, false);
+        let wait_end = Instant::now() + timeout;
+        let parked = self.green_park(Wait::Select { wait_end });
+        self.gc_driver_active = driver;
+        parked
+    }
+
     /// `gc_collect_from_current_roots` on a thread running detached, at an
     /// exact safe point (its caller rooted what it holds): park for the
-    /// stop in progress, or request the collection the World has due, park
-    /// like the others, and collect once no thread runs.
+    /// stop in progress, or request the collection the World has due and
+    /// collect once no other thread runs.
     pub(crate) fn parallel_detached_collect(&mut self, force_complete: bool) {
         let Some(lock) = self.parallel_lock_shared() else {
             return;
@@ -658,32 +865,39 @@ impl Context {
         }
     }
 
-    /// The due collection this detached thread claimed: request the stop and
-    /// park; when every other detached thread has parked, attach (no longer
-    /// running), collect, and run detached again. A stop another holder ends
-    /// first is the collection.
+    /// The due collection this detached thread claimed. It requests the
+    /// stop and waits, with no Baton, until every other mutator is parked:
+    /// a thread blocked in a wait counts as parked already, so no parked
+    /// owner takes a turn for this, and the wait is not queued behind any
+    /// holder's turn. Then it seats the Baton, which every stopped mutator
+    /// put back, for the collector body: the World's carried state and
+    /// parked registry travel with the Baton and hold roots the collector
+    /// traces. It collects, and runs detached again. A stop another thread
+    /// began first is the collection.
     fn parallel_request_collection(&mut self, lock: &BatonLock, force_complete: bool) {
         let stop = lock.stop();
-        let seen = stop.counters().collections;
         let image = owner_image(self);
+        // Closes this thread's allocation runs: the collector finds every
+        // run closed, its own among them.
         let Some(gate) = neovm_value::detached::suspend_detached() else {
+            lock.release_collection_claim();
             return;
         };
-        if stop.request_and_park(image) {
+        let seen = stop.counters().collections;
+        if stop.stop_from_detached(image, || self.tagged_heap.install_tagged_heap()) {
+            // Only a thread between its wait's end and its look at the
+            // stop can hold the Baton now, and it puts it straight back.
             self.parallel_seat_baton(lock.attach().into_baton());
-            stop.withdraw_image();
-            if stop.counters().collections == seen {
-                self.gc_collect_from_current_roots_impl(force_complete);
-            } else {
-                self.tagged_heap.install_tagged_heap();
-            }
-            let baton = self.parallel_unseat_baton();
-            lock.body_detached();
-            lock.detach(baton);
-        } else if stop.counters().collections != seen {
-            let baton = lock.attach().into_baton();
-            self.tagged_heap.install_tagged_heap();
-            lock.detach(baton);
+            self.gc_collect_from_current_roots_impl(force_complete);
+            // A collector that returned without taking the stop must not
+            // leave the World stopped.
+            stop.abandon();
+            lock.detach(self.parallel_unseat_baton());
+        }
+        if stop.counters().collections == seen {
+            // No collection ran under the claim: the stop this thread
+            // parked for was withdrawn, or the collector refused.
+            lock.release_collection_claim();
         }
         neovm_value::detached::resume_detached(gate);
     }
@@ -712,23 +926,15 @@ impl Context {
     /// and HELD, close its allocation runs, and resume once the stop ends.
     fn parallel_park_for_stop(&mut self, lock: &BatonLock, held: &[Value]) {
         let stop = lock.stop();
-        let seen = stop.counters().collections;
         let mut image = owner_image(self);
         image.extend(held.iter().map(|value| value.bits()));
         let Some(gate) = neovm_value::detached::suspend_detached() else {
             return;
         };
-        stop.park(image);
-        stop.resume();
-        if stop.counters().collections != seen {
-            // This is only a thread-local pointer publication. Every parked
-            // owner already holds its own Context and WorldView, and the
-            // stop has ended before it can touch the heap again. Taking the
-            // Baton here serialized every awakened worker behind the
-            // collector (and made a parked Main owner wait for a service
-            // turn that the collection does not need).
-            self.tagged_heap.install_tagged_heap();
-        }
+        // The collection changed heap state this thread mirrors. The
+        // mirrors are refreshed inside the stop: under the Baton instead,
+        // every awakened worker queued behind the next holder.
+        stop.park_for_stop(image, || self.tagged_heap.install_tagged_heap());
         neovm_value::detached::resume_detached(gate);
     }
 }
@@ -854,7 +1060,10 @@ pub(crate) mod detached {
             baton: super::super::Baton,
         ) -> super::super::Baton {
             let stop = lock.stop();
-            stop.enter_parked(self.held.clone());
+            // The Baton holder ran: it parks with its image before the
+            // Baton goes back, so a collection that starts before the
+            // section runs already knows its roots.
+            stop.park(self.held.clone());
             lock.detach(baton);
             let mut section = Section {
                 stop,
@@ -868,7 +1077,7 @@ pub(crate) mod detached {
             stop.leave();
             self.out
                 .store(result.unwrap_or(SECTION_PANICKED), Ordering::Relaxed);
-            lock.attach().into_baton()
+            lock.attach_unparked()
         }
     }
 

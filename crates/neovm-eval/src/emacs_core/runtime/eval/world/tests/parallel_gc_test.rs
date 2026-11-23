@@ -4,13 +4,14 @@
 //! collect.
 
 use super::detached::{register_thread_body, with_detached};
-use super::{StopCounters, StopWorld};
+use super::{Requested, StopCounters, StopWorld};
 use crate::emacs_core::eval::{Context, ThreadingMode};
 use crate::emacs_core::print::print_value;
 use neovm_value::quit::{ASYNC_ATTENTION, AsyncSource};
 use neovm_value::value::Value;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 fn eval(ev: &mut Context, src: &str) -> String {
     match ev.eval_str(src) {
@@ -156,6 +157,232 @@ fn a_stop_waits_for_every_running_thread_and_roots_its_image() {
     );
 }
 
+/// The safepoint rule for blocked threads, at the bare rendezvous: the
+/// owner is parked in a wait (as in `thread-join`) and eight workers
+/// allocate. One more worker requests a collection and stops the World with
+/// no Baton and no turn of the owner; an owner whose wait ends inside the
+/// stop (its 10 ms service turn) waits for the stop's end before it runs.
+#[test]
+fn a_detached_requester_stops_the_world_while_the_owner_is_parked() {
+    const WORKERS: usize = 8;
+    let stop = Arc::new(StopWorld::new());
+    let ready = Arc::new(Barrier::new(WORKERS + 2));
+    let release = Arc::new(AtomicBool::new(false));
+    // Refreshes of heap mirrors in progress, and done.
+    let refreshing = Arc::new(AtomicUsize::new(0));
+    let refreshed = Arc::new(AtomicUsize::new(0));
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|index| {
+            let (stop, ready, release) =
+                (Arc::clone(&stop), Arc::clone(&ready), Arc::clone(&release));
+            let (refreshing, refreshed) = (Arc::clone(&refreshing), Arc::clone(&refreshed));
+            std::thread::spawn(move || {
+                let image = || vec![Value::fixnum(index as i64).bits()];
+                stop.enter_parked(image());
+                stop.resume();
+                ready.wait();
+                let mut allocated = Vec::new();
+                while !release.load(Ordering::Acquire) {
+                    allocated.push(index);
+                    if allocated.len() == 64 {
+                        allocated.clear();
+                        if stop.stop_pending() {
+                            stop.park_for_stop(image(), || {
+                                assert_eq!(
+                                    refreshing.fetch_add(1, Ordering::AcqRel),
+                                    0,
+                                    "one parked thread refreshes at a time"
+                                );
+                                std::thread::sleep(Duration::from_millis(1));
+                                refreshing.fetch_sub(1, Ordering::AcqRel);
+                                refreshed.fetch_add(1, Ordering::Release);
+                            });
+                        }
+                    }
+                }
+                stop.leave();
+            })
+        })
+        .collect();
+    let wake_owner = Arc::new(AtomicBool::new(false));
+    let owner_turns = Arc::new(AtomicUsize::new(0));
+    let owner = {
+        let (stop, ready) = (Arc::clone(&stop), Arc::clone(&ready));
+        let (wake_owner, owner_turns) = (Arc::clone(&wake_owner), Arc::clone(&owner_turns));
+        std::thread::spawn(move || {
+            assert!(stop.try_enter_running(), "no stop is in progress");
+            // `thread-join`: parked, and so at a safe point.
+            stop.leave_running();
+            ready.wait();
+            while !wake_owner.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // The service turn's wake (`BatonLock::attach_unparked`).
+            if !stop.enter_running_after_stop() && !stop.try_enter_running() {
+                stop.enter_running_when_admitted();
+            }
+            owner_turns.fetch_add(1, Ordering::Release);
+            stop.leave_running();
+        })
+    };
+    ready.wait();
+
+    // The requester: this thread, a ninth worker running detached.
+    assert!(stop.try_enter_running(), "no stop is in progress");
+    assert!(
+        stop.stop_from_detached(Vec::new(), || ()),
+        "the requester's own stop is established"
+    );
+    assert_eq!(stop.request(true), Requested::Stopped);
+    stop.collect_requested(Requested::Stopped, |roots| {
+        assert_eq!(roots.len(), WORKERS, "every worker parked with its image");
+        wake_owner.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            owner_turns.load(Ordering::Acquire),
+            0,
+            "the owner's wake waits for the stop to end"
+        );
+    });
+    assert_eq!(
+        refreshed.load(Ordering::Acquire),
+        WORKERS,
+        "every parked worker refreshed its mirrors inside the stop"
+    );
+    owner.join().expect("the owner ran after the stop");
+    assert_eq!(owner_turns.load(Ordering::Acquire), 1);
+    stop.leave_running();
+    release.store(true, Ordering::Release);
+    for worker in workers {
+        worker.join().expect("worker left the stop");
+    }
+    let counters = stop.counters();
+    assert_eq!(counters.collections, 1, "{counters:?}");
+    assert_eq!(counters.safepoint_stops, WORKERS as u64, "{counters:?}");
+    assert_eq!(counters.waker_waits, 1, "{counters:?}");
+    assert!(
+        counters.stop_wait_max_ns < 50_000_000,
+        "the stop waited for the workers' safe points only: {counters:?}"
+    );
+}
+
+/// Whether the World's main owner is hosted: a hosted one wakes from its
+/// wait every 10 ms for an event-service turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+    Bare,
+    Hosted,
+}
+
+/// The owner parked in `thread-join` while eight Lisp threads allocate with
+/// a tiny `gc-cons-threshold`: the collections the workers request complete
+/// with the owner parked the whole time. The joined thread samples the
+/// counters once the owner blocks and again before it ends, so both samples
+/// are taken inside the owner's one wait.
+fn workers_collect_while_the_owner_waits_in_thread_join(owner: Owner) {
+    const COLLECTIONS: u64 = 20;
+    let mut ev = parallel();
+    let _input = (owner == Owner::Hosted).then(|| {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        ev.attach_input_receiver(
+            crate::emacs_core::eval::host_input::HostInputReceiver::from_receiver(receiver),
+        );
+        sender
+    });
+    // The hosted owner's service turns fall between the collections: the
+    // workers churn on until it took a few.
+    let turns = if owner == Owner::Hosted { 3 } else { 0 };
+    // Set on the heap: a thread's own `setq` of `gc-cons-threshold` reaches
+    // the heap only once its owner resolved the GC settings, at the latest
+    // at the next collection, which the default threshold puts far away.
+    ev.set_gc_threshold(10_000);
+    let report = eval(
+        &mut ev,
+        &format!(
+            "(progn
+               (setq pgc-main (current-thread) pgc-target nil pgc-done nil)
+               (fset 'pgc-turns
+                     (lambda ()
+                       (plist-get (neomacs-shared-heap-stats) :owner-service-turns)))
+               (fset 'pgc-churn
+                     (lambda (leader)
+                       (let ((n 0))
+                         (while (and (< n 200000)
+                                     (if leader
+                                         (or (< gcs-done pgc-target)
+                                             (< (pgc-turns) pgc-turns-target))
+                                       (not pgc-done)))
+                           (setq n (1+ n))
+                           (make-list 50 n))
+                         n)))
+               (fset 'pgc-stat
+                     (lambda (after before key)
+                       (- (plist-get after key) (plist-get before key))))
+               (let ((gate (make-thread
+                            (lambda ()
+                              (while (null (thread--blocker pgc-main))
+                                (thread-yield))
+                              (let ((before (neomacs-shared-heap-stats)))
+                                (setq pgc-turns-target (+ (pgc-turns) {turns})
+                                      pgc-target (+ gcs-done {COLLECTIONS}))
+                                (pgc-churn t)
+                                (setq pgc-done t)
+                                (let ((after (neomacs-shared-heap-stats)))
+                                  (list (pgc-stat after before :collections)
+                                        (pgc-stat after before :requester-parks)
+                                        (plist-get after :stop-wait-max-ns)))))))
+                     (workers nil)
+                     (k 0))
+                 (while (< k 7)
+                   (setq workers
+                         (cons (make-thread
+                                (lambda ()
+                                  (while (null pgc-target) (thread-yield))
+                                  (pgc-churn nil)))
+                               workers)
+                         k (1+ k)))
+                 (prog1 (thread-join gate)
+                   (mapc #'thread-join workers))))"
+        ),
+    );
+    let numbers: Vec<u64> = report
+        .trim_matches(|c| c == '(' || c == ')')
+        .split_whitespace()
+        .map(|field| field.parse().unwrap_or(u64::MAX))
+        .collect();
+    let [collections, requester_parks, stop_wait_max_ns] = numbers[..] else {
+        panic!("the joined thread reports three counters: {report}");
+    };
+    // A worker that holds the Baton for a primitive when its collection
+    // comes due waits for its peers parked, as any holder does.
+    let _ = requester_parks;
+    assert!(
+        collections >= COLLECTIONS,
+        "workers collected while the owner was parked: {report} {:?}",
+        stats(&ev)
+    );
+    assert!(
+        stop_wait_max_ns < 50_000_000,
+        "no stop waited for a turn of the parked owner: {report}"
+    );
+    if owner == Owner::Hosted {
+        assert!(
+            stats(&ev).owner_service_turns > 0,
+            "the hosted owner took service turns inside its join"
+        );
+    }
+}
+
+#[test]
+fn workers_collect_while_the_owner_waits_in_thread_join_bare() {
+    workers_collect_while_the_owner_waits_in_thread_join(Owner::Bare);
+}
+
+#[test]
+fn workers_collect_while_the_hosted_owner_waits_in_thread_join() {
+    workers_collect_while_the_owner_waits_in_thread_join(Owner::Hosted);
+}
+
 /// The collector's work spread over a stop's parked threads
 /// (`StopWorld::run_on_parked`, the in-stop sweep's executor): every share
 /// runs exactly once, and the parked threads run shares while they wait,
@@ -282,9 +509,10 @@ fn a_collection_stops_a_thread_running_detached() {
     assert_eq!(after.safepoint_stops - before.safepoint_stops, 1);
 }
 
-/// Every worker parked for one collection reinstalls its own heap pointer
-/// after the stop without taking the World's Baton to do so. The collector
-/// itself may account for one attach while requesting the collection.
+/// Every worker parked for one collection refreshes its own heap mirrors
+/// without taking the World's Baton to do so. Only the collector attaches:
+/// once for the request, and once after each park it waits in while the
+/// workers reach their safe points.
 #[test]
 fn parked_workers_reinstall_after_collection_without_baton_attaches() {
     const THREADS: usize = 8;
@@ -328,9 +556,10 @@ fn parked_workers_reinstall_after_collection_without_baton_attaches() {
     eval(&mut ev, "(garbage-collect)");
     let after = stats(&ev);
     assert_eq!(after.collections - before.collections, 1);
+    let requester_parks = after.requester_parks - before.requester_parks;
     assert!(
-        after.attach_count - before.attach_count <= 1,
-        "parked workers attached to the Baton: {after:?}"
+        after.attach_count - before.attach_count <= 1 + requester_parks,
+        "parked workers attached to the Baton: {before:?} {after:?}"
     );
 
     release.store(true, Ordering::Release);

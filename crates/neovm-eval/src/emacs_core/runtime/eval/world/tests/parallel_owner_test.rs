@@ -375,7 +375,8 @@ fn stats_outside_a_parallel_world_are_zero() {
         "(:mode sim :threads 1 :attach-count 0 :attach-wait-ns 0 :detached-ns 0 \
          :safepoint-stops 0 :collections 0 :deferred-bytes 0 \
          :attach-by-class 0 :attach-by-alloc 0 :attach-by-intern 0 :attach-by-blv 0 \
-         :stop-wait-ns 0 :stop-max-ns 0)"
+         :stop-wait-ns 0 :stop-max-ns 0 :stop-wait-max-ns 0 :requester-parks 0 \
+         :waker-stop-waits 0 :owner-service-turns 0)"
     );
     let mut green = world(ThreadingMode::Green);
     assert_eq!(
@@ -387,7 +388,8 @@ fn stats_outside_a_parallel_world_are_zero() {
         "(:mode green :threads 1 :attach-count 0 :attach-wait-ns 0 :detached-ns 0 \
          :safepoint-stops 0 :collections 0 :deferred-bytes 0 \
          :attach-by-class 0 :attach-by-alloc 0 :attach-by-intern 0 :attach-by-blv 0 \
-         :stop-wait-ns 0 :stop-max-ns 0)"
+         :stop-wait-ns 0 :stop-max-ns 0 :stop-wait-max-ns 0 :requester-parks 0 \
+         :waker-stop-waits 0 :owner-service-turns 0)"
     );
 }
 

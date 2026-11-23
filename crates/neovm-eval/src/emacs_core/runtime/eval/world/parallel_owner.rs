@@ -44,6 +44,15 @@ pub(crate) struct ParallelStats {
     pub(crate) stop_wait_ns: u64,
     /// The longest stop, from request to resume.
     pub(crate) stop_max_ns: u64,
+    /// The longest wait from a collection's request to its collector's
+    /// start: every other thread parked, and the Baton seated.
+    pub(crate) stop_wait_max_ns: u64,
+    /// Wakes of parked threads that waited for a stop to end before they
+    /// took the Baton, the main owner's service turns among them.
+    pub(crate) waker_stop_waits: u64,
+    /// Service turns the hosted main owner took while it waited for another
+    /// thread.
+    pub(crate) owner_service_turns: u64,
     /// Parks of a collection's requester while detached threads still ran:
     /// each puts the Baton back and attaches again, so `attach_count`
     /// includes them. Their number follows how long the threads took to
@@ -90,6 +99,8 @@ pub(crate) struct BatonLock {
     collection_claimed: AtomicBool,
     /// Per [`AttachReason`], in declaration order.
     attach_by: [AtomicU64; 4],
+    /// Service turns of the hosted main owner inside its waits.
+    owner_service_turns: AtomicU64,
     /// The collections' rendezvous, with their counters.
     stop: StopWorld,
 }
@@ -122,6 +133,7 @@ impl BatonLock {
             collection_deferred: AtomicBool::new(false),
             collection_claimed: AtomicBool::new(false),
             attach_by: Default::default(),
+            owner_service_turns: AtomicU64::new(0),
             stop: StopWorld::new(),
         }
     }
@@ -270,8 +282,16 @@ impl BatonLock {
             attach_by_blv: load(&self.attach_by[3]),
             stop_wait_ns: stop.stop_wait_ns,
             stop_max_ns: stop.stop_max_ns,
+            stop_wait_max_ns: stop.stop_wait_max_ns,
+            waker_stop_waits: stop.waker_waits,
+            owner_service_turns: load(&self.owner_service_turns),
             requester_parks: stop.requester_parks,
         }
+    }
+
+    /// The hosted main owner woke from a wait for a service turn.
+    pub(crate) fn count_owner_service_turn(&self) {
+        self.owner_service_turns.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one attach (or detached read) for REASON.
@@ -285,16 +305,46 @@ impl BatonLock {
         self.attach_by[index].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A Lisp thread's body starts running detached, or detaches again: it
-    /// runs until it parks for a stop or attaches ([`StopWorld`]). The
-    /// caller holds the Baton.
-    pub(crate) fn body_detached(&self) {
-        self.stop.enter_running();
+    /// The holder parks in a wait: put the Baton back as a mutator that is
+    /// at a safe point, which a collection's stop need not wait for
+    /// ([`StopWorld`]). The caller's park published its roots, and it
+    /// touches no heap state until [`Self::attach_unparked`] returns.
+    pub(crate) fn detach_parked(&self, baton: Baton) {
+        self.stop.leave_running();
+        self.detach(baton);
     }
 
-    /// A Lisp thread's detached body attached, for World work or its end.
-    pub(crate) fn body_attached(&self) {
-        self.stop.leave();
+    /// A parked mutator's wait is over (or a new one starts): take the
+    /// Baton to run again, but never during another thread's stop. A stop
+    /// that begins while this waits for the Baton has it put the Baton
+    /// back, so the collector neither queues behind this thread's turn nor
+    /// has it touch the heap under it. A thread that waited for a stop
+    /// runs from that stop's end, before the next one can begin: the main
+    /// owner's service turn is not kept out by a run of collections.
+    pub(crate) fn attach_unparked(&self) -> Baton {
+        if self.stop.enter_running_after_stop() {
+            return self.attach().into_baton();
+        }
+        let baton = self.attach().into_baton();
+        if self.stop.try_enter_running() {
+            return baton;
+        }
+        self.detach(baton);
+        self.stop.enter_running_when_admitted();
+        self.attach().into_baton()
+    }
+
+    /// [`Self::yield_baton`] as a wait: the yielder is at a safe point
+    /// while a peer holds the Baton, and runs again as a parked mutator
+    /// does.
+    pub(crate) fn yield_parked(&self, baton: Baton, peer_runnable: bool) -> Baton {
+        self.stop.leave_running();
+        let baton = self.yield_baton(baton, peer_runnable);
+        if self.stop.try_enter_running() {
+            return baton;
+        }
+        self.detach(baton);
+        self.attach_unparked()
     }
 
     /// A detached thread's allocation made a collection due, which the
@@ -312,6 +362,13 @@ impl BatonLock {
     pub(crate) fn collection_due(&self) -> bool {
         self.collection_deferred.load(Ordering::Relaxed)
             && !self.collection_claimed.load(Ordering::Relaxed)
+    }
+
+    /// The claimed collection did not run: the stop the claimer parked for
+    /// was withdrawn. It is due again for the next safe point; without
+    /// this no detached thread would request another one.
+    pub(crate) fn release_collection_claim(&self) {
+        self.collection_claimed.store(false, Ordering::Release);
     }
 
     /// Claim the due collection: true for exactly one caller per due one.
