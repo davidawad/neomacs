@@ -30,7 +30,7 @@ fn form_past_the_small_budget_still_interns_its_last_symbol() {
     let mut ctx = crate::emacs_core::eval::Context::new(crate::test_utils::unit_runtime());
     let text = format!(
         "({} rfs-long-tail)",
-        "1 ".repeat(SMALL_FORM_NODE_BUDGET + 10)
+        "1 ".repeat(MemberWalkVisited::UNHASHED_BUDGET + 10)
     );
     read(&mut ctx, &text);
     assert!(is_member(&ctx, "rfs-long-tail"));

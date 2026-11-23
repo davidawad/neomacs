@@ -1032,6 +1032,53 @@ impl KeyboardInputRuntime for super::eval::Context {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
+/// The objects `intern_member_symbols_in` has entered. What the reader
+/// returns is nearly always a small tree, which needs no identity set: the
+/// walk counts objects instead, and only a form that outgrows
+/// [`Self::UNHASHED_BUDGET`] (a big literal, or a `#N=` cycle or share) is
+/// walked again with the set. Interning is idempotent, so the first,
+/// abandoned walk leaves nothing behind.
+pub(crate) struct MemberWalkVisited {
+    set: Option<rustc_hash::FxHashSet<usize>>,
+    budget: usize,
+    exhausted: bool,
+}
+
+impl MemberWalkVisited {
+    const UNHASHED_BUDGET: usize = 4096;
+
+    fn unhashed() -> Self {
+        Self {
+            set: None,
+            budget: Self::UNHASHED_BUDGET,
+            exhausted: false,
+        }
+    }
+
+    fn hashed() -> Self {
+        Self {
+            set: Some(rustc_hash::FxHashSet::default()),
+            budget: 0,
+            exhausted: false,
+        }
+    }
+
+    /// Whether the walk should enter the object with these tagged bits.
+    fn first_visit(&mut self, bits: usize) -> bool {
+        match &mut self.set {
+            Some(set) => set.insert(bits),
+            None if self.budget == 0 => {
+                self.exhausted = true;
+                false
+            }
+            None => {
+                self.budget -= 1;
+                true
+            }
+        }
+    }
+}
+
 /// Publish the canonical symbols inside VALUE as obarray members.
 ///
 /// GNU interns every symbol it hands to Lisp: the reader interns symbol
@@ -1041,13 +1088,9 @@ impl KeyboardInputRuntime for super::eval::Context {
 /// callers that read source or seed Lisp-visible boot values apply the same
 /// obarray side effect here. Extending `Obarray` keeps this helper out of
 /// the symbol module, which must not name a byte-code item.
-/// Conses `intern_member_symbols_in` visits before falling back to the cycle-safe walk.
-const SMALL_FORM_NODE_BUDGET: usize = 4096;
-
 pub(crate) trait ObarrayReadSymbolsExt {
     fn intern_member_symbols_in(&mut self, value: Value);
-    fn intern_small_form_symbols(&mut self, value: Value, budget: &mut usize) -> bool;
-    fn intern_member_symbols_in_1(&mut self, value: Value, seen: &mut rustc_hash::FxHashSet<usize>);
+    fn intern_member_symbols_in_1(&mut self, value: Value, seen: &mut MemberWalkVisited);
 }
 
 impl ObarrayReadSymbolsExt for Obarray {
@@ -1058,58 +1101,29 @@ impl ObarrayReadSymbolsExt for Obarray {
         // Cycle detection must use object *identity*, not `Value`'s `==`
         // (which is structural `equal`).  A `Vec` + `contains` here was
         // O(n^2) deep-`equal` over every loaded form -- the dominant cost of
-        // startup.  Track visited heap objects by their tagged-pointer bits.
+        // startup.  Track visited heap objects by their tagged-pointer bits,
+        // and only once a walk without that set has outgrown its budget.
         //
-        // Small forms (the common `read-from-string` result) are symbols,
-        // conses and string/number atoms only.  Walk those with a node
-        // budget and no visited set; anything else, or a form that
-        // exhausts the budget (possibly a `#1=` cycle), is walked again
-        // with the set.  Interning is idempotent, so the second walk is safe.
-        let mut budget = SMALL_FORM_NODE_BUDGET;
-        if !self.intern_small_form_symbols(value, &mut budget) {
-            let mut seen = rustc_hash::FxHashSet::default();
+        // A form that fits `MemberWalkVisited::UNHASHED_BUDGET` objects (the
+        // common `read-from-string` result) is walked with a count and no
+        // visited set; a bigger one, or a `#N=` cycle, is walked again with
+        // the set.  Interning is idempotent, so the second walk is safe.
+        let mut seen = MemberWalkVisited::unhashed();
+        self.intern_member_symbols_in_1(value, &mut seen);
+        if seen.exhausted {
+            let mut seen = MemberWalkVisited::hashed();
             self.intern_member_symbols_in_1(value, &mut seen);
         }
     }
 
-    /// Set-free walk of a form made only of symbols, conses and plain atoms.
-    /// Returns `false` when it met another object kind or ran out of budget.
-    fn intern_small_form_symbols(&mut self, mut value: Value, budget: &mut usize) -> bool {
-        loop {
-            match value.kind() {
-                ValueKind::Symbol(id) => {
-                    self.ensure_interned_global_id(id);
-                    return true;
-                }
-                ValueKind::Nil
-                | ValueKind::T
-                | ValueKind::Fixnum(_)
-                | ValueKind::String
-                | ValueKind::Float => return true,
-                ValueKind::Cons => {
-                    if *budget == 0 {
-                        return false;
-                    }
-                    *budget -= 1;
-                    if !self.intern_small_form_symbols(value.cons_car(), budget) {
-                        return false;
-                    }
-                    value = value.cons_cdr();
-                }
-                _ => return false,
-            }
+    fn intern_member_symbols_in_1(&mut self, value: Value, seen: &mut MemberWalkVisited) {
+        if seen.exhausted {
+            return;
         }
-    }
-
-    fn intern_member_symbols_in_1(
-        &mut self,
-        value: Value,
-        seen: &mut rustc_hash::FxHashSet<usize>,
-    ) {
         match value.kind() {
             ValueKind::Symbol(id) => self.ensure_interned_global_id(id),
             ValueKind::Cons => {
-                if !seen.insert(value.bits()) {
+                if !seen.first_visit(value.bits()) {
                     return;
                 }
                 self.intern_member_symbols_in_1(value.cons_car(), seen);
@@ -1121,7 +1135,7 @@ impl ObarrayReadSymbolsExt for Obarray {
                 | VecLikeType::Lambda
                 | VecLikeType::Macro,
             ) => {
-                if !seen.insert(value.bits()) {
+                if !seen.first_visit(value.bits()) {
                     return;
                 }
                 if let Some(slots) = value
@@ -1135,7 +1149,7 @@ impl ObarrayReadSymbolsExt for Obarray {
                 }
             }
             ValueKind::Veclike(VecLikeType::CharTable) => {
-                if !seen.insert(value.bits()) {
+                if !seen.first_visit(value.bits()) {
                     return;
                 }
                 if let Some(slots) = value.char_table_external_slots() {
@@ -1145,7 +1159,7 @@ impl ObarrayReadSymbolsExt for Obarray {
                 }
             }
             ValueKind::Veclike(VecLikeType::SubCharTable) => {
-                if !seen.insert(value.bits()) {
+                if !seen.first_visit(value.bits()) {
                     return;
                 }
                 if let Some(table) = value.as_sub_char_table_obj() {
@@ -1155,7 +1169,7 @@ impl ObarrayReadSymbolsExt for Obarray {
                 }
             }
             ValueKind::Veclike(VecLikeType::HashTable) => {
-                if !seen.insert(value.bits()) {
+                if !seen.first_visit(value.bits()) {
                     return;
                 }
                 if let Some(table) = value.as_hash_table() {
@@ -1168,7 +1182,7 @@ impl ObarrayReadSymbolsExt for Obarray {
                 }
             }
             ValueKind::Veclike(VecLikeType::ByteCode) => {
-                if !seen.insert(value.bits()) {
+                if !seen.first_visit(value.bits()) {
                     return;
                 }
                 if let Some(bytecode) = value.get_bytecode_data() {
@@ -1206,6 +1220,10 @@ impl ObarrayReadSymbolsExt for Obarray {
 #[cfg(test)]
 #[path = "tests/raw_bytes_test.rs"]
 mod raw_bytes_tests;
+
+#[cfg(test)]
+#[path = "tests/member_walk_test.rs"]
+mod member_walk_tests;
 
 #[cfg(test)]
 #[path = "tests/read_from_string_members_test.rs"]
