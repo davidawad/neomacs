@@ -2480,6 +2480,15 @@ fn add_feature_value_in_state(
     original: Value,
     mode: neovm_value::tagged::SymbolMode,
 ) {
+    // GNU `Fprovide` is `Fmemq` plus `Fcons`: a feature already on the live
+    // list needs no rebuild of the `Vec<SymId>` mirror.
+    let mut tail = vars.view().value_by_name("features").unwrap_or(Value::NIL);
+    while tail.is_cons() {
+        if tail.cons_car().as_symbol_id(mode) == Some(id) {
+            return;
+        }
+        tail = tail.cons_cdr();
+    }
     refresh_features_from_variable_in_state(vars.view(), features, mode);
     if !features.contains(&id) {
         features.insert(0, id);
@@ -4261,7 +4270,6 @@ pub(crate) fn plan_require_in_state(
     noerror: Option<Value>,
     mode: neovm_value::tagged::SymbolMode,
 ) -> Result<RequirePlan, Flow> {
-    refresh_features_from_variable_in_state(vars, features, mode);
     // Use symbol_id to transparently handle symbol-with-pos wrappers.
     let sym_id = super::builtins::symbols::symbol_id(&feature, mode).ok_or_else(|| {
         signal(
@@ -4269,6 +4277,19 @@ pub(crate) fn plan_require_in_state(
             vec![Value::symbol("symbolp"), feature],
         )
     })?;
+    // GNU `Frequire` (src/fns.c) answers a loaded feature with one
+    // allocation-free `Fmemq (feature, Vfeatures)`.  Walk the live list the
+    // same way before rebuilding the `Vec<SymId>` cache or allocating the
+    // feature's name: Doom calls `require` on loaded features thousands of
+    // times per session, and `features` holds ~1000 entries there.
+    let mut tail = vars.value_by_name("features").unwrap_or(Value::NIL);
+    while tail.is_cons() {
+        if tail.cons_car().as_symbol_id(mode) == Some(sym_id) {
+            return Ok(RequirePlan::Return(feature));
+        }
+        tail = tail.cons_cdr();
+    }
+    refresh_features_from_variable_in_state(vars, features, mode);
     let name = resolve_sym(sym_id).to_owned();
     if features.contains(&sym_id) {
         return Ok(RequirePlan::Return(feature));

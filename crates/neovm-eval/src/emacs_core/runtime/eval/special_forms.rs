@@ -1743,13 +1743,19 @@ impl Context {
         filename: Option<Value>,
         noerror: Option<Value>,
     ) -> EvalResult {
-        let feature_name = super::super::builtins::symbols::symbol_id(&feature, self.symbol_mode())
-            .map(|sid| resolve_sym(sid).to_string());
-        let filename_str = filename.as_ref().and_then(|v| {
-            v.as_lisp_string()
-                .map(|ls| neovm_value::emacs_char::to_utf8_lossy(ls.as_bytes()))
-        });
+        // Diagnostics only: built lazily so the hit path (a loaded feature)
+        // allocates nothing.
         let symbol_mode = self.symbol_mode();
+        let feature_name = || {
+            super::super::builtins::symbols::symbol_id(&feature, symbol_mode)
+                .map(|sid| resolve_sym(sid).to_string())
+        };
+        let filename_str = || {
+            filename.as_ref().and_then(|v| {
+                v.as_lisp_string()
+                    .map(|ls| neovm_value::emacs_char::to_utf8_lossy(ls.as_bytes()))
+            })
+        };
         match plan_require_in_state(
             VariableView::new(&self.obarray, &self.owner),
             self.edit.buffers.current_buffer(),
@@ -1763,8 +1769,8 @@ impl Context {
             Err(e) => {
                 let rendered = crate::emacs_core::print::format_flow_with_eval(self, &e);
                 tracing::error!(
-                    feature = ?feature_name,
-                    filename = ?filename_str,
+                    feature = ?feature_name(),
+                    filename = ?filename_str(),
                     "require plan failed: {}", rendered
                 );
                 return Err(e);
@@ -1824,7 +1830,7 @@ impl Context {
                             let path_str = path.display().to_string();
                             let rendered = crate::emacs_core::print::format_flow_with_eval(self, e);
                             tracing::error!(
-                                feature_name = ?feature_name,
+                                feature_name = ?feature_name(),
                                 path = %path_str,
                                 noerror = noerror_val,
                                 "require failed: {}", rendered

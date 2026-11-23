@@ -10141,6 +10141,62 @@ fn load_file_records_load_history() {
 }
 
 #[test]
+fn require_of_a_loaded_feature_answers_from_the_live_features_list() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::test_utils::new_context();
+    // The feature is on the variable only: a hit must not need a load, so the
+    // nonexistent FILENAME proves none is attempted.
+    eval.eval_str("(setq features (cons 'vm-require-hit features))")
+        .expect("push feature");
+    let hit = eval
+        .eval_str("(require 'vm-require-hit \"/nonexistent/vm-require-hit\")")
+        .expect("require of a loaded feature");
+    assert_eq!(hit, Value::symbol("vm-require-hit"));
+
+    // A feature in the middle of the list is found the same way.
+    eval.eval_str("(setq features (append features '(vm-require-tail)))")
+        .expect("append feature");
+    let tail = eval
+        .eval_str("(require 'vm-require-tail \"/nonexistent/vm-require-tail\")")
+        .expect("require of a trailing feature");
+    assert_eq!(tail, Value::symbol("vm-require-tail"));
+
+    // A feature that is not loaded still takes the load path and, with
+    // NOERROR, answers nil.
+    let miss = eval
+        .eval_str("(require 'vm-require-absent \"/nonexistent/vm-require-absent\" t)")
+        .expect("noerror require");
+    assert_eq!(miss, Value::NIL);
+}
+
+#[test]
+fn provide_of_a_loaded_feature_leaves_one_entry() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::test_utils::new_context();
+    let count =
+        "(length (delq nil (mapcar (lambda (f) (and (eq f 'vm-provide-twice) f)) features)))";
+    eval.eval_str("(provide 'vm-provide-twice)")
+        .expect("provide");
+    eval.eval_str("(provide 'vm-provide-twice)")
+        .expect("provide again");
+    assert_eq!(eval.eval_str(count).expect("count"), Value::fixnum(1));
+    assert_eq!(
+        eval.eval_str("(featurep 'vm-provide-twice)")
+            .expect("featurep"),
+        Value::T
+    );
+    // The mirror stays usable after a hit: a later new feature is still added.
+    eval.eval_str("(provide 'vm-provide-other)")
+        .expect("provide other");
+    assert_eq!(
+        eval.eval_str("(featurep 'vm-provide-other)")
+            .expect("featurep"),
+        Value::T
+    );
+    assert_eq!(eval.eval_str(count).expect("count"), Value::fixnum(1));
+}
+
+#[test]
 fn load_file_records_gnu_style_defalias_provide_and_require_history_items() {
     crate::test_utils::init_test_tracing();
     let unique = SystemTime::now()
