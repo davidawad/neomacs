@@ -655,6 +655,23 @@ fn register_marker_in_buffers(
     }
 }
 
+/// A fresh marker at `pos` in `buffer_id`, spliced onto the buffer's chain.
+///
+/// The marker is built detached and registration attaches it, as `copy-marker`
+/// and `save-excursion` do.  A marker born with a buffer slot but no chain link
+/// would take `register_marker_in_buffers`' rechain arm, whose `unchain_marker`
+/// walks the whole chain for a node that is not there: O(live markers) per
+/// `point-marker`, quadratic for code that keeps a marker per section.
+fn new_registered_marker(
+    buffers: &mut BufferManager,
+    buffer_id: BufferId,
+    pos: LispCharPos1,
+) -> Value {
+    let marker = make_marker_value(None, None, false);
+    register_marker_in_buffers(buffers, &marker, Some(buffer_id), Some(pos));
+    marker
+}
+
 /// (point-marker) -> marker at current point
 #[doc(hidden)]
 pub fn builtin_point_marker_in_buffers(
@@ -667,9 +684,7 @@ pub fn builtin_point_marker_in_buffers(
         .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
     let pos = buf.point_lisp_char_pos();
     let buffer_id = buf.id;
-    let marker = make_marker_value(Some(buffer_id), Some(pos), false);
-    register_marker_in_buffers(buffers, &marker, Some(buffer_id), Some(pos));
-    Ok(marker)
+    Ok(new_registered_marker(buffers, buffer_id, pos))
 }
 
 /// (point-min-marker) -> marker at point-min
@@ -684,9 +699,7 @@ pub fn builtin_point_min_marker_in_buffers(
         .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
     let pos = buf.point_min_lisp_char_pos();
     let buffer_id = buf.id;
-    let marker = make_marker_value(Some(buffer_id), Some(pos), false);
-    register_marker_in_buffers(buffers, &marker, Some(buffer_id), Some(pos));
-    Ok(marker)
+    Ok(new_registered_marker(buffers, buffer_id, pos))
 }
 
 /// (point-max-marker) -> marker at point-max
@@ -701,9 +714,7 @@ pub fn builtin_point_max_marker_in_buffers(
         .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
     let pos = buf.point_max_lisp_char_pos();
     let buffer_id = buf.id;
-    let marker = make_marker_value(Some(buffer_id), Some(pos), false);
-    register_marker_in_buffers(buffers, &marker, Some(buffer_id), Some(pos));
-    Ok(marker)
+    Ok(new_registered_marker(buffers, buffer_id, pos))
 }
 
 /// (mark-marker) -> the buffer's mark, as a marker object

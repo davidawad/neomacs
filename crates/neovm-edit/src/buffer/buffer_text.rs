@@ -3351,6 +3351,8 @@ impl BufferText {
     /// double-invoked during GC sweep and kill-buffer cleanup in T8/T9.
     #[doc(hidden)]
     pub fn chain_unlink(&self, marker: *mut neovm_value::tagged::header::MarkerObj) {
+        #[cfg(any(test, feature = "test-support"))]
+        CHAIN_UNLINK_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut storage = self.storage.borrow_mut();
         let mut prev: *mut neovm_value::tagged::header::MarkerObj = std::ptr::null_mut();
         let mut curr = storage.markers_head;
@@ -4222,4 +4224,18 @@ impl SyntaxSafeKey {
             escape_quotes_ender,
         }
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static CHAIN_UNLINK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has asked a marker chain to unlink a node, each
+/// a walk of the whole chain.  Test-only: lets a test assert that creating a
+/// marker does not pay for one.
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(feature = "test-support", visibility::make(pub))]
+pub(crate) fn chain_unlink_calls() -> usize {
+    CHAIN_UNLINK_CALLS.with(std::cell::Cell::get)
 }

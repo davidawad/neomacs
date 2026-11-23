@@ -509,3 +509,51 @@ fn call_set_marker_insertion_type(args: Vec<Value>) -> EvalResult {
 fn call_copy_marker(args: Vec<Value>) -> EvalResult {
     marker_test_ctx(|ctx| builtin_copy_marker_in_buffers(&mut ctx.edit.buffers, &args))
 }
+
+#[test]
+fn point_marker_creation_does_not_walk_the_marker_chain() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::test_utils::new_context();
+    let buf_id = eval
+        .edit
+        .buffers
+        .current_buffer_id()
+        .expect("current buffer");
+    let _ = eval.edit.buffers.insert_into_buffer(buf_id, "abcdef");
+
+    let before = neovm_edit::buffer::buffer_text::chain_unlink_calls();
+    let mut markers = Vec::new();
+    for _ in 0..1000 {
+        markers.push(
+            builtin_point_marker_in_buffers(&mut eval.edit.buffers, vec![]).expect("point-marker"),
+        );
+        markers.push(
+            builtin_point_min_marker_in_buffers(&mut eval.edit.buffers, vec![])
+                .expect("point-min-marker"),
+        );
+        markers.push(
+            builtin_point_max_marker_in_buffers(&mut eval.edit.buffers, vec![])
+                .expect("point-max-marker"),
+        );
+    }
+    assert_eq!(
+        neovm_edit::buffer::buffer_text::chain_unlink_calls(),
+        before,
+        "creating a marker must not unlink (walk the chain for) a node that is not on it"
+    );
+
+    let buffer = eval.edit.buffers.get(buf_id).expect("buffer");
+    let point = buffer.point_lisp_char_pos().as_i64();
+    assert!(
+        buffer.marker_chain_len() >= markers.len(),
+        "every marker is on the chain"
+    );
+    for (index, marker) in markers.iter().enumerate() {
+        let expected = [point, 1, 7][index % 3];
+        assert_eq!(
+            call_marker_position(vec![*marker]).unwrap(),
+            Value::fixnum(expected)
+        );
+        assert!(!marker_buffer_value(marker).is_nil());
+    }
+}
