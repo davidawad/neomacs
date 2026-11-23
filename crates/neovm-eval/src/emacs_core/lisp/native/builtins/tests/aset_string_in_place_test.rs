@@ -222,3 +222,16 @@ fn copy_sequence_of_a_propertized_string_copies_no_interval_tree() {
         "writes to the copy, including a name the source never had, stay in the copy"
     );
 }
+
+/// `propertize` of an already propertized string copies the source's tree
+/// once and applies the new properties to that copy in place; the new
+/// properties win over copied ones with the same name, in GNU's plist order.
+#[test]
+fn propertize_of_a_propertized_string_copies_no_interval_tree() {
+    let mut eval = property_transfer_fixture();
+    assert_form_copies_no_interval_tree(
+        &mut eval,
+        "(let ((p (propertize s 'extra 7 'k 'new))) (list (text-properties-at 0 p) (get-text-property 0 'extra p) (get-text-property 199 'extra p) (get-text-property 1 'face p) (get-text-property 0 'k s)))",
+        "OK ((extra 7 k new face (:run 0)) 7 7 (:run 0) 0)",
+    );
+}

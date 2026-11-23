@@ -291,19 +291,16 @@ pub fn builtin_sleep_for(
 
     let total_secs = secs + millis / 1000.0;
     if total_secs > 0.0 {
-        if eval.threads().current_thread_id() != 0
-            && !eval.green_threads_running()
-            && {
-                #[cfg(feature = "shared-heap")]
-                {
-                    !eval.parallel_threads_running()
-                }
-                #[cfg(not(feature = "shared-heap"))]
-                {
-                    true
-                }
+        if eval.threads().current_thread_id() != 0 && !eval.green_threads_running() && {
+            #[cfg(feature = "shared-heap")]
+            {
+                !eval.parallel_threads_running()
             }
-        {
+            #[cfg(not(feature = "shared-heap"))]
+            {
+                true
+            }
+        } {
             // The worker is already running because its caller released the
             // global lock (`thread_select`, src/thread.c:613-643). Parking
             // returns that OS thread for the deadline. `thread-signal` does
@@ -2653,7 +2650,8 @@ pub fn builtin_propertize(args: Vec<Value>) -> EvalResult {
 
     // Copy existing text properties from source string
     if args[0].is_string()
-        && let Some(src_table) = get_string_text_properties_table_for_value(args[0])
+        && let Some(src_table) =
+            neovm_value::value::borrow_string_text_properties_table_for_value(args[0])
     {
         // GNU `Fpropertize' starts with `Fcopy_sequence', whose string branch
         // copies the interval tree and each interval plist spine.  Sharing the
@@ -2670,18 +2668,20 @@ pub fn builtin_propertize(args: Vec<Value>) -> EvalResult {
             .as_lisp_string()
             .expect("new string must carry LispString payload")
             .schars();
-        let mut table = get_string_text_properties_table_for_value(new_str).unwrap_or_default();
         let properties: Vec<_> = args[1..]
             .chunks_exact(2)
             .map(|chunk| (chunk[0], chunk[1]))
             .collect();
-        table.apply_property_plist_for_object_char_len(
-            CharRange::new(CharPos0::new(0), CharPos0::new(char_len)),
-            CharLen::new(char_len),
-            &properties,
-            PropertyPlistApplication::PreserveSuppliedOrder,
-        );
-        set_string_text_properties_table_for_value(new_str, table);
+        // In place on the new string's own table: the copy above is the only
+        // copy of the source's intervals.
+        let _ = neovm_value::value::mutate_string_text_properties(new_str, |table| {
+            table.apply_property_plist_for_object_char_len(
+                CharRange::new(CharPos0::new(0), CharPos0::new(char_len)),
+                CharLen::new(char_len),
+                &properties,
+                PropertyPlistApplication::PreserveSuppliedOrder,
+            );
+        });
     }
 
     Ok(new_str)
