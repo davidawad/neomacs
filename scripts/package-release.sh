@@ -165,6 +165,11 @@ done
 for binary in neomacs-temacs bootstrap-neomacs; do
   install_binary_if_present "$binary" "$binary_ext" "$archlib_dir"
 done
+# The pty-child trampoline the macOS editor looks for beside its own
+# executable (callproc/spawn.rs); without it pty children fork the editor.
+if [[ "$target_triple" == *-apple-darwin ]]; then
+  install_binary_if_present "neomacs-ptyexec" "$binary_ext" "$package_dir/bin"
+fi
 if [[ "$target_triple" == *-windows-* ]]; then
   install_binary_if_present "runneomacs" "$binary_ext" "$package_dir/bin"
   install_binary_if_present "cmdproxy" "$binary_ext" "$archlib_dir"

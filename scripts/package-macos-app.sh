@@ -211,7 +211,9 @@ mkdir -p "$app_bundle/Contents/Frameworks"
 # neomacsclient is our emacsclient, so it stays beside the main executable
 # where install.sh symlinks it onto $PATH; the build-internal binaries move
 # into the archlib, which is what `exec-directory' now names.
-for binary in neomacs neomacsclient; do
+# neomacs-ptyexec is the pty-child trampoline the editor looks for beside its
+# own executable (callproc/spawn.rs); without it pty children fork the editor.
+for binary in neomacs neomacsclient neomacs-ptyexec; do
   if [[ -f "$release_dir/$binary" ]]; then
     install -m 0755 "$release_dir/$binary" "$macos_dir/$binary"
   fi
