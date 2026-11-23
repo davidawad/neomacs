@@ -90,6 +90,116 @@ pub(super) enum MktimeError {
     Invalid,
 }
 
+/// Identity of the zone file glibc falls back to while `TZ` is unset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ZoneFileId {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl ZoneFileId {
+    /// The identity of the file `path` names now; `None` when it cannot be
+    /// stat'ed (glibc then falls back to UTC, which is also a state to track).
+    fn of(path: &str) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+/// What the C library's zone rules were last loaded for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadedZone {
+    /// The `TZ` value (`None` = unset).
+    tz: Option<std::ffi::OsString>,
+    /// With `TZ` unset, the identity of `/etc/localtime`; glibc re-reads that
+    /// file only when its `stat` changes, so a change must trigger `tzset`.
+    zone_file: Option<ZoneFileId>,
+}
+
+/// The loaded zone and when `/etc/localtime` was last compared against it.
+#[derive(Debug)]
+struct ZoneRecord {
+    zone: LoadedZone,
+    zone_file_checked: std::time::Instant,
+}
+
+/// glibc's `TZDEFAULT`, which `tzset` reads while `TZ` is unset.
+const LOCAL_ZONE_FILE: &str = "/etc/localtime";
+
+/// How long a comparison of `/etc/localtime` with the loaded rules stays good
+/// while `TZ` is unset.  The `stat` is the whole cost glibc pays per call and
+/// costs as much as the reload it guards on hosts with expensive syscalls, so
+/// it is paid at most this often: a replaced zone file is noticed by the first
+/// `encode-time` after the interval (a changed `TZ` is noticed at once).
+const ZONE_FILE_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The zone rules the C library holds, guarded by the same process-wide lock
+/// that serializes timezone writers (`tz_env_lock`); the mutex only keeps the
+/// record itself sound.  `None` = unknown, so the next local call runs `tzset`.
+static LOADED_ZONE: std::sync::Mutex<Option<ZoneRecord>> = std::sync::Mutex::new(None);
+
+/// Forget which zone the C library holds: the next local conversion reloads it.
+/// Called after anything else runs `tzset` or edits `TZ`.
+pub(super) fn forget_loaded_zone() {
+    *LOADED_ZONE.lock().unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+fn reload_zone_rules() {
+    unsafe extern "C" {
+        fn tzset();
+    }
+    // SAFETY: tzset has no pointer arguments.  Its callers serialize timezone
+    // mutations through the same process-wide lock as `ScopedTzEnv`.
+    unsafe { tzset() };
+}
+
+/// Run libc `tzset` only when it could change the rules: `TZ` differs from the
+/// value they were loaded for, or `TZ` is unset and `/etc/localtime` changed.
+///
+/// glibc's own shortcut compares the `TZ` string with the last one and treats
+/// "unset" as always changed, so with `TZ` unset every call freed and
+/// re-allocated its state and re-read the zone file.  A set `TZ` is compared
+/// by value exactly as glibc does; with `TZ` unset the zone file's identity is
+/// compared at most every [`ZONE_FILE_RECHECK`].
+fn tzset_if_zone_changed() {
+    let tz = std::env::var_os("TZ");
+    let mut record = LOADED_ZONE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(known) = record.as_ref()
+        && known.zone.tz == tz
+        && (tz.is_some() || known.zone_file_checked.elapsed() < ZONE_FILE_RECHECK)
+    {
+        return;
+    }
+    let zone_file = if tz.is_none() {
+        ZoneFileId::of(LOCAL_ZONE_FILE)
+    } else {
+        None
+    };
+    let current = LoadedZone { tz, zone_file };
+    match record.as_mut() {
+        Some(known) if known.zone == current => {
+            known.zone_file_checked = std::time::Instant::now();
+        }
+        _ => {
+            reload_zone_rules();
+            *record = Some(ZoneRecord {
+                zone: current,
+                zone_file_checked: std::time::Instant::now(),
+            });
+        }
+    }
+}
+
 /// The epoch seconds of a canonicalized local `struct tm`, matching
 /// `__mktime_internal (tp, true, ...)`.
 ///
@@ -98,13 +208,8 @@ pub(super) enum MktimeError {
 #[cfg_attr(feature = "test-support", visibility::make(pub))]
 pub(super) fn mktime_local(broken_down: &mut libc::tm) -> Result<i64, MktimeError> {
     // GNU's `mktime_z` runs `set_tz`, which calls `tzset`; `localtime_r` below
-    // reads the resulting rules.  The `libc` crate does not bind `tzset`.
-    unsafe extern "C" {
-        fn tzset();
-    }
-    // SAFETY: tzset has no pointer arguments.  Its callers serialize timezone
-    // mutations through the same process-wide lock as `ScopedTzEnv`.
-    unsafe { tzset() };
+    // reads the resulting rules.
+    tzset_if_zone_changed();
     let sec = i64::from(broken_down.tm_sec);
     let min = i64::from(broken_down.tm_min);
     let hour = i64::from(broken_down.tm_hour);
@@ -444,3 +549,7 @@ fn isdst_differ(a: i64, b: i64) -> bool {
 fn long_int_avg(a: i64, b: i64) -> i64 {
     (a >> 1) + (b >> 1) + ((a | b) & 1)
 }
+
+#[cfg(test)]
+#[path = "mktime/tests/zone_file_test.rs"]
+mod zone_file_tests;

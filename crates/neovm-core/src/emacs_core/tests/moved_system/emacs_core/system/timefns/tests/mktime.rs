@@ -188,3 +188,52 @@ fn port_agrees_with_glibc_mktime() {
         });
     }
 }
+
+/// The local conversion skips `tzset` while `TZ` is unchanged, so every change
+/// to `TZ` -- including ones made behind the conversion's back -- must still
+/// be picked up by the very next call, as GNU's `mktime_z` does.
+#[test]
+fn local_conversion_follows_tz_changes_made_without_a_refresh() {
+    with_tz_env(Some("UTC"), || {
+        let convert = || {
+            let mut tm = broken_down(2026, 0, 15, 12, 0, 0, -1);
+            mktime_local(&mut tm).expect("2026-01-15 12:00 is representable")
+        };
+        let utc = convert();
+        assert_eq!(convert(), utc, "repeated calls agree");
+
+        // SAFETY: `with_tz_env` holds the process-wide timezone lock for the
+        // closure, and `ScopedTzEnv` restores the previous value on drop.
+        unsafe { std::env::set_var("TZ", "America/New_York") };
+        assert_eq!(convert(), utc + 5 * 3600, "UTC-5 in January");
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var("TZ", "Asia/Tokyo") };
+        assert_eq!(convert(), utc - 9 * 3600, "UTC+9");
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var("TZ", "UTC") };
+        assert_eq!(convert(), utc, "back to UTC");
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var("TZ", "Asia/Tokyo") };
+        assert_eq!(convert(), utc - 9 * 3600, "and to Tokyo again");
+    });
+}
+
+/// With `TZ` unset glibc falls back to `/etc/localtime`; the answer must be
+/// the C library's own, call after call.
+#[cfg(target_os = "linux")]
+#[test]
+fn local_conversion_with_tz_unset_agrees_with_glibc() {
+    with_tz_env(None, || {
+        for _ in 0..3 {
+            let mut port = broken_down(2026, 6, 15, 12, 0, 0, -1);
+            let mut libc_tm = port;
+            let port_result = mktime_local(&mut port).expect("representable");
+            // SAFETY: `libc_tm` is an initialized struct tm.
+            let libc_result = unsafe { libc::mktime(&mut libc_tm) };
+            assert_eq!(port_result, libc_result);
+        }
+    });
+}

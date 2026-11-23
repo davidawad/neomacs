@@ -506,6 +506,9 @@ fn refresh_tz_env() {
     }
 }
 #[cfg(not(unix))]
+    // The rules now follow whatever `TZ` was just set to, which the local
+    // conversion's record of what it loaded no longer describes.
+    mktime::forget_loaded_zone();
 fn refresh_tz_env() {}
 /// Serializes local libc timezone reads with temporary timezone writers.
 /// This lock-only guard preserves the process TZ and stays on its mutator thread.
