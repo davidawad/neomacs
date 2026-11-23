@@ -1041,8 +1041,12 @@ impl KeyboardInputRuntime for super::eval::Context {
 /// callers that read source or seed Lisp-visible boot values apply the same
 /// obarray side effect here. Extending `Obarray` keeps this helper out of
 /// the symbol module, which must not name a byte-code item.
+/// Conses `intern_member_symbols_in` visits before falling back to the cycle-safe walk.
+const SMALL_FORM_NODE_BUDGET: usize = 4096;
+
 pub(crate) trait ObarrayReadSymbolsExt {
     fn intern_member_symbols_in(&mut self, value: Value);
+    fn intern_small_form_symbols(&mut self, value: Value, budget: &mut usize) -> bool;
     fn intern_member_symbols_in_1(&mut self, value: Value, seen: &mut rustc_hash::FxHashSet<usize>);
 }
 
@@ -1055,8 +1059,46 @@ impl ObarrayReadSymbolsExt for Obarray {
         // (which is structural `equal`).  A `Vec` + `contains` here was
         // O(n^2) deep-`equal` over every loaded form -- the dominant cost of
         // startup.  Track visited heap objects by their tagged-pointer bits.
-        let mut seen = rustc_hash::FxHashSet::default();
-        self.intern_member_symbols_in_1(value, &mut seen);
+        //
+        // Small forms (the common `read-from-string` result) are symbols,
+        // conses and string/number atoms only.  Walk those with a node
+        // budget and no visited set; anything else, or a form that
+        // exhausts the budget (possibly a `#1=` cycle), is walked again
+        // with the set.  Interning is idempotent, so the second walk is safe.
+        let mut budget = SMALL_FORM_NODE_BUDGET;
+        if !self.intern_small_form_symbols(value, &mut budget) {
+            let mut seen = rustc_hash::FxHashSet::default();
+            self.intern_member_symbols_in_1(value, &mut seen);
+        }
+    }
+
+    /// Set-free walk of a form made only of symbols, conses and plain atoms.
+    /// Returns `false` when it met another object kind or ran out of budget.
+    fn intern_small_form_symbols(&mut self, mut value: Value, budget: &mut usize) -> bool {
+        loop {
+            match value.kind() {
+                ValueKind::Symbol(id) => {
+                    self.ensure_interned_global_id(id);
+                    return true;
+                }
+                ValueKind::Nil
+                | ValueKind::T
+                | ValueKind::Fixnum(_)
+                | ValueKind::String
+                | ValueKind::Float => return true,
+                ValueKind::Cons => {
+                    if *budget == 0 {
+                        return false;
+                    }
+                    *budget -= 1;
+                    if !self.intern_small_form_symbols(value.cons_car(), budget) {
+                        return false;
+                    }
+                    value = value.cons_cdr();
+                }
+                _ => return false,
+            }
+        }
     }
 
     fn intern_member_symbols_in_1(
@@ -1164,3 +1206,7 @@ impl ObarrayReadSymbolsExt for Obarray {
 #[cfg(test)]
 #[path = "tests/raw_bytes_test.rs"]
 mod raw_bytes_tests;
+
+#[cfg(test)]
+#[path = "tests/read_from_string_members_test.rs"]
+mod read_from_string_members_tests;
