@@ -238,6 +238,50 @@ fn read_from_buffer_applies_read_symbol_shorthands() {
 }
 
 #[test]
+fn read_from_buffer_is_the_same_with_the_gap_before_or_after_the_text() {
+    // A buffer whose text lies wholly before the gap is read through a
+    // borrowed slice; one with the gap inside the text takes the
+    // per-character path. Both must read the same forms and stop at the same
+    // points as `read-from-string`.
+    crate::test_utils::init_test_tracing();
+    let results = bootstrap_eval_all(
+        r##"(let* ((text ";; h\u00e9llo\n(a \"\u00e9\" 12 -7 5. ?x ?\\C-x 'q (b . c)) ; tail\n[1 2.5 \u00f1ame] #'f `(,x ,@y) last")
+                  (from-string
+                   (let ((pos 0) out)
+                     (condition-case nil
+                         (while t
+                           (let ((r (read-from-string text pos)))
+                             (push (car r) out)
+                             (setq pos (cdr r))))
+                       (end-of-file nil))
+                     (nreverse out)))
+                  (read-all
+                   (lambda (gap-at)
+                     (with-temp-buffer
+                       (insert text)
+                       (when gap-at
+                         (goto-char gap-at)
+                         (insert " ")
+                         (delete-char -1))
+                       (goto-char (point-min))
+                       (let (forms stops)
+                         (condition-case nil
+                             (while t
+                               (push (read (current-buffer)) forms)
+                               (push (point) stops))
+                           (end-of-file nil))
+                         (list (nreverse forms) (nreverse stops)))))))
+             (let ((after (funcall read-all nil))
+                   (inside (funcall read-all 30)))
+               (list (equal (car after) from-string)
+                     (equal (car inside) from-string)
+                     (equal (cadr after) (cadr inside))
+                     (length from-string))))"##,
+    );
+    assert_eq!(results, vec!["OK (t t t 5)"], "{results:?}");
+}
+
+#[test]
 fn read_positioning_symbols_reports_character_offsets_for_multibyte_strings() {
     crate::test_utils::init_test_tracing();
     let mut ev = crate::test_utils::runtime_startup_context();

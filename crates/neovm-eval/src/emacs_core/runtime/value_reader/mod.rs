@@ -1358,12 +1358,28 @@ impl<'a> Reader<'a> {
             end <= input_len,
             "buffer reader end {end} exceeds logical length {input_len}"
         );
+        // GNU's READCHAR walks the buffer's text through a pointer. When the
+        // text up to `end` sits before the gap, the reader can do the same:
+        // whitespace, comments and symbol runs are scanned in the slice, and
+        // only a non-ASCII character or a gap straddle takes the per-character
+        // `buffer_code_step`. The slice is indexed by absolute byte position,
+        // like the Lisp-string source's.
+        //
+        // SAFETY: the reader holds `input` shared for `'a` and only reads it:
+        // nothing it calls edits the text or moves the gap, and it is dropped
+        // before its caller touches the buffer again.
+        let source_bytes = unsafe {
+            input.gap_contiguous_emacs_bytes_unguarded(EmacsByteRange::new(
+                EmacsBytePos::new(0),
+                range.end(),
+            ))
+        };
         Self {
             source: ReaderSource::Buffer(input),
             source_semantics: ReaderSourceSemantics::for_lisp_object(input.get_multibyte()),
             pos: start,
             limit: end,
-            source_bytes: None,
+            source_bytes,
             character_cursor: SourceCharacterCursor::Bytes,
             original_string: OriginalStringCacheBinding::Uncached,
             dot_unread: Cell::new(None),

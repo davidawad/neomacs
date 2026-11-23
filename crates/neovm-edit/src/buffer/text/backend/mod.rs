@@ -270,6 +270,16 @@ impl TextBackend {
         }
     }
 
+    /// `range` as a borrowed slice, for the gap backend only: the chunked
+    /// backends cannot hand out a slice that outlives their own borrow.
+    #[doc(hidden)]
+    pub fn gap_contiguous_emacs_bytes(&self, range: EmacsByteRange) -> Option<&[u8]> {
+        match self {
+            TextBackend::Gap(gap) => gap.contiguous_emacs_bytes(range),
+            TextBackend::PieceTree(_) | TextBackend::Rope(_) => None,
+        }
+    }
+
     #[doc(hidden)]
     pub fn with_contiguous_emacs_byte_range<R>(
         &self,

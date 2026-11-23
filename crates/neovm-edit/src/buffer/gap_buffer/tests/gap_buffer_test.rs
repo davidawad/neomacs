@@ -731,6 +731,36 @@ fn contiguous_emacs_bytes_borrows_before_and_after_gap() {
 }
 
 #[test]
+fn borrowed_contiguous_emacs_bytes_match_the_closure_form_on_both_sides_of_the_gap() {
+    crate::test_utils::init_test_tracing();
+    let mut gb = GapBuffer::from_str("abcdef");
+    gb.move_gap_to(3);
+
+    assert_eq!(
+        gb.contiguous_emacs_bytes(EmacsByteRange::from_usize(0, 3)),
+        Some(&b"abc"[..])
+    );
+    assert_eq!(
+        gb.contiguous_emacs_bytes(EmacsByteRange::from_usize(3, 6)),
+        Some(&b"def"[..])
+    );
+    assert_eq!(
+        gb.contiguous_emacs_bytes(EmacsByteRange::from_usize(1, 5)),
+        None,
+        "a range holding the gap is not one slice"
+    );
+    assert_eq!(
+        gb.contiguous_emacs_bytes(EmacsByteRange::from_usize(0, 7)),
+        None,
+        "a range past the text is refused, not clamped"
+    );
+    assert_eq!(
+        gb.contiguous_emacs_bytes(EmacsByteRange::from_usize(2, 2)),
+        Some(&b""[..])
+    );
+}
+
+#[test]
 fn contiguous_emacs_bytes_rejects_gap_spanning_range() {
     crate::test_utils::init_test_tracing();
     let mut gb = GapBuffer::from_str("abcdef");

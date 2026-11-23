@@ -1333,6 +1333,25 @@ impl BufferText {
             .with_contiguous_emacs_byte_range(range, f)
     }
 
+    /// The text of `range` as a slice that does not hold the storage borrow,
+    /// when the gap backend keeps it on one side of the gap.
+    ///
+    /// # Safety
+    ///
+    /// The slice points into the storage with no `RefCell` guard behind it.
+    /// The caller must not let anything that mutates this text (an edit, or
+    /// `try_make_emacs_byte_range_contiguous` moving the gap) run while the
+    /// slice is alive.
+    #[doc(hidden)]
+    pub unsafe fn gap_contiguous_emacs_bytes_unguarded(
+        &self,
+        range: EmacsByteRange,
+    ) -> Option<&[u8]> {
+        // SAFETY: forwarded to the caller's contract above.
+        let storage = unsafe { self.storage.try_borrow_unguarded() }.ok()?;
+        storage.backend.gap_contiguous_emacs_bytes(range)
+    }
+
     fn emacs_byte_end_pos(&self) -> EmacsBytePos {
         EmacsBytePos::ZERO.add_len(self.storage.borrow().metrics.emacs_byte_len())
     }

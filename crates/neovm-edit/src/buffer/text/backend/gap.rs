@@ -203,6 +203,11 @@ impl GapTextBackend {
     }
 
     #[doc(hidden)]
+    pub fn contiguous_emacs_bytes(&self, range: EmacsByteRange) -> Option<&[u8]> {
+        self.gap.contiguous_emacs_bytes(range)
+    }
+
+    #[doc(hidden)]
     pub fn with_contiguous_emacs_byte_range<R>(
         &self,
         range: EmacsByteRange,

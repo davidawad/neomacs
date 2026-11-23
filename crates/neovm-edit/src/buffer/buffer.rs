@@ -4342,6 +4342,30 @@ impl Buffer {
             .with_contiguous_emacs_byte_range(self.clamped_emacs_byte_range(range), f)
     }
 
+    /// The emacs bytes of `range` as one slice borrowed from the buffer, or
+    /// `None` when the text is not a gap buffer or the gap lies inside
+    /// `range` (the caller then reads through
+    /// [`Self::with_contiguous_emacs_byte_range`] or byte by byte). Unlike
+    /// that method it moves nothing: a reader that alternates with edits
+    /// never pays a gap move for it.
+    ///
+    /// # Safety
+    ///
+    /// The slice has no storage guard behind it. While it is alive the caller
+    /// must not run anything that edits this buffer's text, or moves its gap
+    /// (e.g. [`Self::try_make_emacs_byte_range_contiguous`]).
+    #[doc(hidden)]
+    pub unsafe fn gap_contiguous_emacs_bytes_unguarded(
+        &self,
+        range: EmacsByteRange,
+    ) -> Option<&[u8]> {
+        // SAFETY: forwarded to the caller's contract above.
+        unsafe {
+            self.text
+                .gap_contiguous_emacs_bytes_unguarded(self.clamped_emacs_byte_range(range))
+        }
+    }
+
     /// First `\n` in logical emacs-byte range `[from, limit)`, scanned in
     /// place.  See [`BufferText::next_newline_emacs_byte`].
     pub(crate) fn next_newline_emacs_byte(

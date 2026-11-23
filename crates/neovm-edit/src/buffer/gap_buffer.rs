@@ -511,6 +511,24 @@ impl GapBuffer {
         None
     }
 
+    /// `range` as one borrowed slice when it lies on one side of the gap.
+    #[doc(hidden)]
+    pub fn contiguous_emacs_bytes(&self, range: EmacsByteRange) -> Option<&[u8]> {
+        let start = range.start().get();
+        let end = range.end().get();
+        if start > end || end > self.total_bytes {
+            return None;
+        }
+        if end <= self.gap_start_bytes {
+            return Some(&self.buf[start..end]);
+        }
+        if start >= self.gap_start_bytes {
+            let gap = self.gap_size();
+            return Some(&self.buf[start + gap..end + gap]);
+        }
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Mutation
     // -----------------------------------------------------------------------
