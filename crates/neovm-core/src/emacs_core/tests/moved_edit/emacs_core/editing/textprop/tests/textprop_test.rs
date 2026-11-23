@@ -105,6 +105,49 @@ fn buffer_substring_runs_access_fontify_functions_before_copying_properties() {
 }
 
 #[test]
+fn substring_of_a_propertized_string_tiles_the_overlapping_runs() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = eval_with_text("");
+    // Five runs of three properties each; slicing mid-run on both ends must
+    // clip the first and last run and keep every property of every run, with
+    // a gap (nil plist) preserved between runs.
+    let result = eval
+        .eval_str(
+            r#"(let* ((s (concat
+                          (propertize "aaaa" 'face 'bold 'x 1 'y 2)
+                          (propertize "bbbb" 'face 'italic 'x 2 'y 3)
+                          "gggg"
+                          (propertize "cccc" 'face 'bold 'x 3 'y 4)
+                          (propertize "dddd" 'face 'shadow 'x 4 'y 5)))
+                      (sub (substring s 2 18))
+                      (rows nil) (i 0))
+                 (while (< i (length sub))
+                   (setq rows (cons (list (string (aref sub i))
+                                      (get-text-property i 'face sub)
+                                      (get-text-property i 'x sub)
+                                      (get-text-property i 'y sub))
+                                rows))
+                   (setq i (1+ i)))
+                 (list (equal sub (substring-no-properties s 2 18))
+                       (nreverse rows)
+                       (next-property-change 0 sub)
+                       (next-single-property-change 0 'face sub)
+                       (text-properties-at 0 (substring s 0 1))
+                       (text-properties-at
+                        0 (substring (propertize "abc" 'face 'bold 'x 1) 1 3))))"#,
+        )
+        .expect("substring of a propertized string");
+
+    assert_eq!(
+        format!("{result}"),
+        "(t ((\"a\" bold 1 2) (\"a\" bold 1 2) (\"b\" italic 2 3) (\"b\" italic 2 3) (\"b\" italic 2 3) \
+         (\"b\" italic 2 3) (\"g\" nil nil nil) (\"g\" nil nil nil) (\"g\" nil nil nil) (\"g\" nil nil nil) \
+         (\"c\" bold 3 4) (\"c\" bold 3 4) (\"c\" bold 3 4) (\"c\" bold 3 4) (\"d\" shadow 4 5) (\"d\" shadow 4 5)) \
+         2 2 (face bold x 1 y 2) (x 1 face bold))"
+    );
+}
+
+#[test]
 fn get_text_property_out_of_range_signal_uses_gnu_point_range_payload() {
     crate::test_utils::init_test_tracing();
     let mut eval = eval_with_text("hello");

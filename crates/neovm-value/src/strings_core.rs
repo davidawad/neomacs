@@ -259,8 +259,12 @@ pub fn substring_impl(name: &'static str, args: &[Value], preserve_props: bool) 
                         .expect("validated storage substring bounds")
                 };
                 let sliced_props = if let Some(src_table) = src_props {
-                    let sliced = src_table
-                        .slice_copy_text_properties_char_range(string_char_range(from, to));
+                    // One run per overlapping interval, tiled in one pass
+                    // (GNU `copy_intervals`), as `buffer-substring` does; a
+                    // `put-property` per interval and property allocates per
+                    // property run.  Pairs keep the order GNU's copy leaves.
+                    let sliced =
+                        src_table.slice_char_range_for_string_copy(string_char_range(from, to));
                     (!sliced.is_empty()).then_some(sliced)
                 } else {
                     None

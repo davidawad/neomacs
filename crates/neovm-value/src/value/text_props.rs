@@ -233,6 +233,20 @@ fn plist_value_from_pairs(plist: &[(Value, Value)]) -> Value {
 /// rewrite of the copy cannot reach the original plist that may have been
 /// handed to Lisp by `text-properties-at`.
 fn copy_plist_value(plist: Value) -> Value {
+    copy_plist_value_in_order(plist, PairOrder::Source)
+}
+
+/// Which way a copied plist lists its `(KEY VALUE)` pairs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairOrder {
+    /// As in the source plist.
+    Source,
+    /// Last pair first: what GNU `copy_text_properties` leaves, because it
+    /// re-adds each source pair to the front of the copy's plist.
+    Reversed,
+}
+
+fn copy_plist_value_in_order(plist: Value, order: PairOrder) -> Value {
     if plist.is_nil() {
         return Value::NIL;
     }
@@ -252,6 +266,14 @@ fn copy_plist_value(plist: Value) -> Value {
         items.push(tail.cons_car());
         items.push(rest.cons_car());
         tail = rest.cons_cdr();
+    }
+    if order == PairOrder::Reversed {
+        let pairs = items.len() / 2;
+        for pair in 0..pairs / 2 {
+            let other = pairs - 1 - pair;
+            items.swap(2 * pair, 2 * other);
+            items.swap(2 * pair + 1, 2 * other + 1);
+        }
     }
     Value::list_from_slice(&items)
 }
@@ -4972,10 +4994,18 @@ impl TextPropertyTable {
     }
 
     pub fn slice_char_range(&self, range: CharRange) -> TextPropertyTable {
-        self.slice_raw(range)
+        self.slice_raw(range, PairOrder::Source)
     }
 
-    fn slice_raw(&self, range: CharRange) -> TextPropertyTable {
+    /// [`Self::slice_char_range`] for `substring`: each interval's plist lists
+    /// its pairs in the order GNU `copy_text_properties` leaves them (see
+    /// [`PairOrder::Reversed`]), so `text-properties-at` of the copy answers
+    /// what GNU answers.
+    pub(crate) fn slice_char_range_for_string_copy(&self, range: CharRange) -> TextPropertyTable {
+        self.slice_raw(range, PairOrder::Reversed)
+    }
+
+    fn slice_raw(&self, range: CharRange, order: PairOrder) -> TextPropertyTable {
         if range.is_empty() {
             return TextPropertyTable::new();
         }
@@ -5000,7 +5030,7 @@ impl TextPropertyTable {
                     node,
                     CharLen::new(new_end - new_start),
                 );
-                run.plist = copy_plist_value(node.plist);
+                run.plist = copy_plist_value_in_order(node.plist, order);
                 runs.push(run);
             }
         });
@@ -5010,38 +5040,6 @@ impl TextPropertyTable {
         // The slice's names are a subset of the source's: the conservative
         // summary (false positives allowed) is shared in O(1).
         Self::with_runs_and_names(runs, self.property_names.clone())
-    }
-
-    pub(crate) fn slice_copy_text_properties_char_range(
-        &self,
-        range: CharRange,
-    ) -> TextPropertyTable {
-        self.slice_copy_text_properties_raw(range)
-    }
-
-    fn slice_copy_text_properties_raw(&self, range: CharRange) -> TextPropertyTable {
-        if range.is_empty() {
-            return TextPropertyTable::new();
-        }
-        let start = range.start().get();
-        let end = range.end().get();
-
-        let mut table = TextPropertyTable::new();
-        self.for_each_interval_overlapping(range, |interval_start, node_end, node| {
-            let new_start = interval_start.max(start) - start;
-            let new_end = node_end.min(end) - start;
-            if new_start >= new_end {
-                return;
-            }
-            for (name, value) in plist_pairs(node.plist) {
-                table.put_property_in_char_range(
-                    CharRange::new(CharPos0::new(new_start), CharPos0::new(new_end)),
-                    name,
-                    value,
-                );
-            }
-        });
-        table
     }
 
     /// Append a clipped source range with the exact interval result of
