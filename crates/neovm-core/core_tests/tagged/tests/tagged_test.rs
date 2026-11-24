@@ -233,7 +233,7 @@ fn alloc_roundtrip_cost_probe() {
 /// this ceiling keeps the root from silently re-absorbing them.
 #[test]
 fn gc_root_stays_a_facade_after_the_domain_split() {
-    const CEILING: usize = 3_000;
+    const CEILING: usize = 3_006; // 3_000 + the parallel_sweep module and its test declaration (dot-nppp8.13)
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("the core crate lives under crates/")

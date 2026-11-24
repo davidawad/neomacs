@@ -2480,8 +2480,7 @@ fn add_feature_value_in_state(
     original: Value,
     mode: neovm_value::tagged::SymbolMode,
 ) {
-    // GNU `Fprovide` is `Fmemq` plus `Fcons`: a feature already on the live
-    // list needs no rebuild of the `Vec<SymId>` mirror.
+    // GNU `Fprovide` is `Fmemq` plus `Fcons`: no `Vec<SymId>` rebuild on a hit.
     let mut tail = vars.view().value_by_name("features").unwrap_or(Value::NIL);
     while tail.is_cons() {
         if tail.cons_car().as_symbol_id(mode) == Some(id) {
@@ -4278,10 +4277,9 @@ pub(crate) fn plan_require_in_state(
         )
     })?;
     // GNU `Frequire` (src/fns.c) answers a loaded feature with one
-    // allocation-free `Fmemq (feature, Vfeatures)`.  Walk the live list the
-    // same way before rebuilding the `Vec<SymId>` cache or allocating the
-    // feature's name: Doom calls `require` on loaded features thousands of
-    // times per session, and `features` holds ~1000 entries there.
+    // allocation-free `Fmemq (feature, Vfeatures)`; walk the live list the same
+    // way before rebuilding the `Vec<SymId>` cache or allocating the name:
+    // Doom calls `require` on loaded features thousands of times a session.
     let mut tail = vars.value_by_name("features").unwrap_or(Value::NIL);
     while tail.is_cons() {
         if tail.cons_car().as_symbol_id(mode) == Some(sym_id) {
