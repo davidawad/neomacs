@@ -2226,7 +2226,11 @@ impl TaggedHeap {
     }
 
     /// No cons block is swept ahead of the serial pass.
-    pub(super) fn presweep_cons_blocks(&mut self, _order: &[usize], _generational: bool) -> Option<Vec<PreSwept>> {
+    pub(super) fn presweep_cons_blocks(
+        &mut self,
+        _order: &[usize],
+        _generational: bool,
+    ) -> Option<Vec<super::incremental::PreSwept>> {
         None
     }
 }
